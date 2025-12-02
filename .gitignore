@@ -1,0 +1,105 @@
+# ===========================================
+# RIS MUSIC Pipeline - Git Ignore
+# ===========================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ---- Data (Large files - DO NOT COMMIT) ----
+data_shards_*/
+data_dcd_*/
+data_nfssn_*/
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# ---- Results & Checkpoints ----
+results_final/
+results_final_*/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ---- Logs ----
+*.log
+logs/
+wandb/
+mlruns/
+tensorboard/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*.ipynb
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- Temporary files ----
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# ---- HPO/Optuna ----
+*.db
+optuna_*.db
+hpo_study_*.db
+
+# ---- Backups ----
+backup_*/
+*_backup_*/
+
+# ---- Images (unless needed) ----
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
+# ---- LaTeX auxiliary ----
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+
+# ---- Misc ----
+*.csv
+*.xlsx
+*.json
+!package.json
+!tsconfig.json
+
+# ---- Old/Archive directories ----
+OldCode/
+AI-Subspace-Methods-Original/
+
+# ---- Slurm output ----
+slurm-*.out
+*.out
+
+AI-Subspace-Methods/

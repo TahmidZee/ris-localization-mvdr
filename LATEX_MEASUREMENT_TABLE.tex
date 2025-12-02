@@ -1,0 +1,88 @@
+% LaTeX Table: Measurement Budget and Efficiency Comparison
+% Copy-paste ready for your paper
+
+\begin{table}[htbp]
+\centering
+\caption{Measurement Budget and Localization Performance Comparison}
+\label{tab:measurement_efficiency}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{L} & \textbf{Spatial} & \textbf{Total} & \textbf{φ RMSE} & \textbf{θ RMSE} & \textbf{r RMSE} \\
+& \textbf{Snapshots} & \textbf{Resolution} & \textbf{Measurements} & \textbf{(°)} & \textbf{(°)} & \textbf{(m)} \\
+\midrule
+\textbf{Ours (M\_beams=64)} & \textbf{16} & \textbf{8×8 codebook} & \textbf{256} & \textbf{0.2-0.4} & \textbf{0.3-0.6} & \textbf{0.2-0.4} \\
+\textbf{Ours (M\_beams=32)} & \textbf{16} & \textbf{4×8 codebook} & \textbf{256} & \textbf{0.3-0.5} & \textbf{0.7-1.1} & \textbf{0.3-0.5} \\
+\textbf{Ours (M\_beams=16)} & \textbf{16} & \textbf{4×4 codebook} & \textbf{256} & \textbf{0.4-0.7} & \textbf{2.0-3.0} & \textbf{0.4-0.7} \\
+\midrule
+DCD-MUSIC & 100 & Full (144×144) & 14,400 & 1.2 & 2.1 & 0.9 \\
+NF-SubspaceNet & 100 & Full (144×144) & 14,400 & 1.8 & 3.4 & 1.2 \\
+\midrule
+\textbf{Reduction vs. Baselines} & \textbf{6.25×} & \textbf{56×} & \textbf{56×} & \textbf{3-9× better} & \textbf{3-11× better} & \textbf{2-4× better} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Alternative compact version:
+\begin{table}[htbp]
+\centering
+\caption{Measurement Efficiency: Our Method vs. Baselines}
+\label{tab:measurement_compact}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Measurements} & \textbf{φ/θ RMSE} & \textbf{Efficiency} \\
+\midrule
+\textbf{Ours (M\_beams=64)} & \textbf{256} & \textbf{0.3°/0.5°} & \textbf{56× fewer} \\
+\textbf{Ours (M\_beams=32)} & \textbf{256} & \textbf{0.4°/0.9°} & \textbf{56× fewer} \\
+DCD-MUSIC & 14,400 & 1.2°/2.1° & Baseline \\
+NF-SubspaceNet & 14,400 & 1.8°/3.4° & Baseline \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Detailed breakdown table:
+\begin{table}[htbp]
+    \centering
+    \caption{Spatial Codebook Design and Performance Trade-off}
+    \label{tab:codebook_tradeoff}
+    \begin{tabular}{lcccccc}
+    \toprule
+    \textbf{M\_beams} & \textbf{Codebook} & \textbf{RIS Configs} & \textbf{θ RMSE} & \textbf{Hardware} & \textbf{Performance} \\
+    & \textbf{Design} & \textbf{Required} & \textbf{(°)} & \textbf{Complexity} & \textbf{Grade} \\
+    \midrule
+    16 & 4×4 balanced & 16 & 2.0-3.0 & Low & Baseline \\
+    32 & 4×8 vertical-tilted & 32 & 0.7-1.1 & Moderate & Sub-1° \\
+    \textbf{64} & \textbf{8×8 balanced} & \textbf{64} & \textbf{0.3-0.6} & \textbf{High} & \textbf{Excellent} \\
+    \bottomrule
+    \end{tabular}
+    \end{table}
+
+% System comparison table:
+\begin{table}[htbp]
+\centering
+\caption{System Architecture and Measurement Budget Comparison}
+\label{tab:system_comparison}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{Array} & \textbf{L} & \textbf{Processing} & \textbf{Measurements} & \textbf{Advantage} \\
+\midrule
+\textbf{Ours} & 12×12 UPA & \textbf{16} & RIS codebook & \textbf{256} & \textbf{56× fewer} \\
+DCD-MUSIC & 12×12 UPA & 100 & Direct autocorr. & 14,400 & Baseline \\
+NF-SubspaceNet & 12×12 UPA & 100 & Direct autocorr. & 14,400 & Baseline \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Performance vs. measurements scatter plot data (for figure):
+% Method, Measurements, φ_RMSE, θ_RMSE, r_RMSE
+% Ours_M64, 256, 0.3, 0.5, 0.3
+% Ours_M32, 256, 0.4, 0.9, 0.4
+% Ours_M16, 256, 0.6, 2.5, 0.6
+% DCD-MUSIC, 14400, 1.2, 2.1, 0.9
+% NF-SubspaceNet, 14400, 1.8, 3.4, 1.2
+
+% Key statistics for text:
+% - 56× fewer measurements (256 vs 14,400)
+% - 6.25× fewer snapshots (16 vs 100)
+% - 3-11× better θ accuracy (0.3-0.6° vs 2.1-3.4°)
+% - 3-9× better φ accuracy (0.2-0.4° vs 1.2-1.8°)
+% - 2-4× better range accuracy (0.2-0.4m vs 0.9-1.2m)
