@@ -666,39 +666,6 @@ class Trainer:
         else:
             return torch.utils.data.TensorDataset(y, H, C, pr, K, R, snr)
 
-
-    def _build_loaders_gpu_cache_train_only(self, n_train: Optional[int], n_val: Optional[int]):
-        """Build GPU cache for train only, use regular DataLoader for val to avoid OOM-killer"""
-        tr_dir, va_dir = _resolve_shards_train_val()
-        ds_tr_full = ShardNPZDataset(tr_dir)
-        ds_va_full = ShardNPZDataset(va_dir)
-
-        ds_tr = self._subset(ds_tr_full, n_train)
-        ds_va = self._subset(ds_va_full, n_val)
-
-        print(f"[GPU cache] train subset={len(ds_tr)}  val subset={len(ds_va)}")
-
-        # CRITICAL FIX: Only cache train data to avoid OOM-killer
-        # Skip expensive GPU aggregation for validation
-        bs = int(getattr(mdl_cfg, "BATCH_SIZE", 32))  # Smaller batch size for HPO
-        
-        # CRITICAL FIX: Use pad+mask collate for GPU cache too
-        from .collate_fn import collate_pad_to_kmax_with_snr
-        
-        # Use original datasets with pad+mask collate
-        tr_loader = DataLoader(ds_tr, batch_size=bs, shuffle=True, drop_last=True,
-                               collate_fn=lambda batch: collate_pad_to_kmax_with_snr(batch, cfg.K_MAX),
-                               num_workers=0, pin_memory=False)
-        va_loader = DataLoader(ds_va, batch_size=bs, shuffle=False, drop_last=False,
-                               collate_fn=lambda batch: collate_pad_to_kmax_with_snr(batch, cfg.K_MAX),
-                               num_workers=0, pin_memory=False)
-        
-        # CRITICAL: Log validation loader info to debug infinite loops
-        print(f"[VAL LOADER GPU] len(val_ds)={len(ds_va)}, batches per epoch={len(va_loader)}")
-        print(f"[VAL LOADER GPU] batch_size={bs}, drop_last=False")
-        
-        return tr_loader, va_loader
-
     def _build_loaders_gpu_cache(self, n_train: Optional[int], n_val: Optional[int]):
         tr_dir, va_dir = _resolve_shards_train_val()
         ds_tr_full = ShardNPZDataset(tr_dir)
