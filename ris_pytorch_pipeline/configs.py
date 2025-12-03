@@ -214,10 +214,23 @@ class SysConfig:
         self.HYBRID_COV_DEBUG = True          # Set True for hybrid covariance diagnostics (ONE-TIME PRINT)
         
         # === Validation & Checkpointing Strategy ===
-        self.VAL_PRIMARY = "k_loc"            # Primary validation metric: "loss", "k_loc", or "k_acc"
-                                               # - "loss": legacy, NMSE-driven (not recommended for production)
-                                               # - "k_loc": composite K̂ + AoA/Range accuracy (RECOMMENDED)
-                                               # - "k_acc": pure K̂ accuracy (useful for K-head tuning)
+        # VAL_PRIMARY options:
+        # - "loss": legacy, NMSE-driven (not recommended for production)
+        # - "k_loc": composite K̂ + AoA/Range via MUSIC (SLOW, for final eval only)
+        # - "surrogate": K̂ accuracy + aux angle/range RMSE (FAST, for training/HPO)
+        self.VAL_PRIMARY = "surrogate"        # DEFAULT: Use surrogate metrics for training/HPO
+        
+        # Whether to run full MUSIC-based metrics inside validation
+        # This should be False for training/HPO, True only for offline eval scripts.
+        self.USE_MUSIC_METRICS_IN_VAL = False
+        
+        # Weights for surrogate validation score (when VAL_PRIMARY="surrogate")
+        self.SURROGATE_METRIC_WEIGHTS = {
+            "w_k_acc": 1.0,       # Weight for K accuracy (maximize)
+            "w_aux_ang": 0.01,    # Penalty for aux angle RMSE (deg)
+            "w_aux_r": 0.01,      # Penalty for aux range RMSE (m)
+        }
+        
         self.K_CONF_THRESH = 0.65             # Confidence threshold for K-head vs MDL fallback (tune on val)
         
         # === PHASE 2 CRITICAL FIXES: Joint Newton & Hungarian ===

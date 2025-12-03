@@ -50,7 +50,7 @@ def _study(storage_path: str, name: str, seed: int = 42):
     return optuna.create_study(
         study_name=name,
         storage=storage,
-        direction="minimize",  # Minimize composite penalty: (1-K_acc) + RMSE_norm - success
+        direction="minimize",  # Minimize -score (since surrogate score is higher-is-better)
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(
             multivariate=True, group=True, seed=seed
@@ -184,9 +184,11 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
             mdl_cfg.SOFTMAX_TAU = s["softmax_tau"]
 
             # Now create Trainer (after setting USE_SWA=False)
-            # Ensure HPO optimizes the metric-driven objective (K/loc composite)
-            cfg.VAL_PRIMARY = "k_loc"
-            print(f"[HPO Trial {trial.number}] Creating Trainer (VAL_PRIMARY={cfg.VAL_PRIMARY})...", flush=True)
+            # CRITICAL: Use SURROGATE mode for HPO (no MUSIC in validation loop)
+            # This makes HPO fast, stable, and well-behaved
+            cfg.VAL_PRIMARY = "surrogate"
+            cfg.USE_MUSIC_METRICS_IN_VAL = False  # No MUSIC during HPO!
+            print(f"[HPO Trial {trial.number}] Creating Trainer (VAL_PRIMARY={cfg.VAL_PRIMARY}, MUSIC={cfg.USE_MUSIC_METRICS_IN_VAL})...", flush=True)
             t = Trainer(from_hpo=False)
             print(f"[HPO Trial {trial.number}] Trainer created successfully", flush=True)
             
@@ -230,8 +232,8 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
                 gpu_cache=True,         # Critical for HPO speed
                 grad_accumulation=1,    # REDUCED from 2 (was 256 effective batch, too smooth)
                 early_stop_patience=early_stop_patience,  # Stop if no improvement for N epochs
-                val_every=2,            # Run validation every 2 epochs (balance speed vs metric tracking)
-                skip_music_val=False,   # KEEP MUSIC! Use GPU MUSIC (10-20x faster) to optimize real metrics
+                val_every=1,            # Validate every epoch (surrogate is fast!)
+                skip_music_val=True,    # NO MUSIC during HPO - use surrogate metrics only
             )
             # CRITICAL FIX: Handle None/inf values in print
             if best_val is None or not np.isfinite(best_val):
@@ -282,7 +284,9 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
     try:
         if study.best_trial is not None:
             _save_hpo_winner(study.best_trial)
-            print(f"[HPO] best value={study.best_value:.6f} trial={study.best_trial.number}")
+            # Note: best_value is -score (since Optuna minimizes and surrogate score is higher-is-better)
+            actual_score = -study.best_value
+            print(f"[HPO] Best surrogate score={actual_score:.4f} (trial={study.best_trial.number})")
     except Exception as e:
         print(f"[HPO] No completed trials yet: {e}")
 

@@ -1178,6 +1178,170 @@ class Trainer:
         return avg_loss
 
     # ----------------------------
+    # Surrogate validation (NO MUSIC)
+    # ----------------------------
+    def _validate_surrogate_epoch(self, loader, max_batches: Optional[int] = None):
+        """
+        MUSIC-FREE validation using surrogate metrics.
+        
+        This is the RECOMMENDED validation method for training/HPO because:
+        1. No MUSIC calls → fast, stable, no gating/penalty artifacts
+        2. Metrics are directly tied to what we train on
+        3. Highly correlated with final MUSIC performance
+        
+        Metrics computed:
+        - K accuracy (from k_logits)
+        - Aux angle/range RMSE (from phi_theta_r head)
+        - Composite score for model selection
+        """
+        self.model.eval()
+        total_loss = 0.0
+        n_samples = 0
+        
+        # K metrics
+        k_correct = 0
+        k_under = 0
+        k_over = 0
+        
+        # Aux angle/range errors (direct head vs GT, no MUSIC)
+        aux_phi_err = []
+        aux_theta_err = []
+        aux_r_err = []
+        
+        iters = len(loader) if max_batches is None else min(len(loader), max_batches)
+        
+        with torch.no_grad():
+            for bi, batch in enumerate(loader):
+                if bi >= iters:
+                    break
+                
+                y, H, C, ptr, K, R_in, snr, H_full, R_samp = self._unpack_any_batch(batch)
+                B = y.size(0)
+                n_samples += B
+                
+                # Prepare labels
+                R_true_c = _ri_to_c(R_in)
+                R_true_c = 0.5 * (R_true_c + R_true_c.conj().transpose(-2, -1))
+                R_true = _c_to_ri(R_true_c).float()
+                labels = {"R_true": R_true, "ptr": ptr, "K": K, "snr_db": snr}
+                
+                # Forward pass
+                with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
+                    preds_half = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
+                
+                # Loss in FP32
+                with torch.amp.autocast('cuda', enabled=False):
+                    preds = {}
+                    for k, v in preds_half.items():
+                        if isinstance(v, torch.Tensor):
+                            if v.dtype == torch.float16:
+                                preds[k] = v.float()
+                            elif v.dtype == torch.complex32:
+                                preds[k] = v.to(torch.complex64)
+                            else:
+                                preds[k] = v
+                        else:
+                            preds[k] = v
+                    
+                    labels_fp32 = {}
+                    for k, v in labels.items():
+                        if isinstance(v, torch.Tensor):
+                            if v.dtype == torch.float16:
+                                labels_fp32[k] = v.float()
+                            elif v.dtype == torch.complex32:
+                                labels_fp32[k] = v.to(torch.complex64)
+                            else:
+                                labels_fp32[k] = v
+                        else:
+                            labels_fp32[k] = v
+                    
+                    loss = self.loss_fn(preds, labels_fp32)
+                    if not torch.isfinite(loss):
+                        loss = torch.nan_to_num(loss, nan=1e6, posinf=1e6, neginf=1e6)
+                
+                total_loss += float(loss.detach().item()) * B
+                
+                # ---------- K metrics (internal, no MUSIC) ----------
+                if "k_logits" in preds:
+                    k_logits = preds["k_logits"].float()  # [B, K_max]
+                    k_pred = torch.argmax(k_logits, dim=1) + 1  # 1-based
+                    k_true = K.cpu()
+                    k_pred_cpu = k_pred.cpu()
+                    k_correct += (k_pred_cpu == k_true).sum().item()
+                    k_under += (k_pred_cpu < k_true).sum().item()
+                    k_over += (k_pred_cpu > k_true).sum().item()
+                
+                # ---------- Aux angle/range metrics (direct head vs GT) ----------
+                if "phi_theta_r" in preds:
+                    phi_theta_r_pred = preds["phi_theta_r"].float().cpu()  # [B, 3*K_max]
+                    ptr_gt = ptr.float().cpu()  # [B, 3*K_max]
+                    K_true_list = K.cpu().tolist()
+                    
+                    for i in range(B):
+                        k_i = int(K_true_list[i])
+                        if k_i <= 0:
+                            continue
+                        
+                        # Extract GT and pred for first k_i sources
+                        # ptr format: [phi1, theta1, r1, phi2, theta2, r2, ...]
+                        gt_i = ptr_gt[i, :3*k_i].view(k_i, 3)  # [k_i, 3]
+                        pr_i = phi_theta_r_pred[i, :3*k_i].view(k_i, 3)  # [k_i, 3]
+                        
+                        # Absolute errors per source
+                        d = torch.abs(pr_i - gt_i)  # [k_i, 3]
+                        aux_phi_err.extend(d[:, 0].tolist())
+                        aux_theta_err.extend(d[:, 1].tolist())
+                        aux_r_err.extend(d[:, 2].tolist())
+        
+        # Compute summary metrics
+        avg_loss = total_loss / max(1, n_samples)
+        k_acc = k_correct / max(1, n_samples)
+        k_under_rate = k_under / max(1, n_samples)
+        k_over_rate = k_over / max(1, n_samples)
+        
+        phi_rmse = float(np.sqrt(np.mean(np.square(aux_phi_err)))) if aux_phi_err else 0.0
+        theta_rmse = float(np.sqrt(np.mean(np.square(aux_theta_err)))) if aux_theta_err else 0.0
+        r_rmse = float(np.sqrt(np.mean(np.square(aux_r_err)))) if aux_r_err else 0.0
+        
+        # Composite score (higher is better)
+        w = getattr(cfg, "SURROGATE_METRIC_WEIGHTS", None) or {
+            "w_k_acc": 1.0,
+            "w_aux_ang": 0.01,
+            "w_aux_r": 0.01,
+        }
+        score = (
+            k_acc
+            - w["w_aux_ang"] * (phi_rmse + theta_rmse) / 2.0
+            - w["w_aux_r"] * r_rmse
+        )
+        
+        metrics = {
+            "loss": avg_loss,
+            "k_acc": k_acc,
+            "k_under": k_under_rate,
+            "k_over": k_over_rate,
+            "aux_phi_rmse": phi_rmse,
+            "aux_theta_rmse": theta_rmse,
+            "aux_r_rmse": r_rmse,
+            "score": score,
+        }
+        
+        print(
+            f"[VAL SURROGATE] loss={avg_loss:.4f}, k_acc={k_acc:.3f}, "
+            f"under={k_under_rate:.3f}, over={k_over_rate:.3f}, "
+            f"aux_φ_rmse={phi_rmse:.2f}°, aux_θ_rmse={theta_rmse:.2f}°, "
+            f"aux_r_rmse={r_rmse:.2f}m, score={score:.4f}",
+            flush=True
+        )
+        
+        # Cleanup
+        import gc; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return metrics
+
+    # ----------------------------
     # Phase curriculum (3-stage)
     # ----------------------------
     def _apply_phase_weights(self, phase: int, epoch: int = 0, total_epochs: int = 60):
@@ -1888,9 +2052,13 @@ class Trainer:
 
         # training loop with early stopping
         best_val = float("inf")
-        # New: primary metric can be 'loss' or 'k_loc' (K/localization composite)
-        val_primary = str(getattr(cfg, "VAL_PRIMARY", "loss")).lower()
-        best_score = float("inf")
+        # Validation mode: "surrogate" (MUSIC-free, fast), "k_loc" (MUSIC-based, slow), or "loss"
+        val_primary = str(getattr(cfg, "VAL_PRIMARY", "surrogate")).lower()
+        use_music_in_val = bool(getattr(cfg, "USE_MUSIC_METRICS_IN_VAL", False))
+        
+        # For surrogate mode, higher score is better (maximize)
+        # For k_loc/loss mode, lower is better (minimize)
+        best_score = float("-inf") if val_primary == "surrogate" else float("inf")
         best_path = Path(cfg.CKPT_DIR) / "best.pt"
         last_path = Path(cfg.CKPT_DIR) / "last.pt"
         patience_counter = 0
@@ -1976,54 +2144,74 @@ class Trainer:
                 val_loss = val_result
                 debug_terms = None
 
-            # New: Run inference-like validation metrics (Hungarian; limited batches)
-            # Skip MUSIC-based metrics if skip_music_val=True (for faster HPO)
+            # Run validation metrics based on config
             metrics = None
-            if not skip_music_val and ((ep + 1) % val_every == 0 or ep == epochs - 1):
-                try:
-                    # Limit validation batches for speed (GPU MUSIC makes this fast)
-                    # Use 20 batches (~20 samples with BS=1 or ~1600 with BS=80) for good metrics
-                    hpo_max_batches = max_val_batches or 20
-                    if self.swa_started:
-                        self._swa_swap_in()
-                        metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
-                        self._swa_swap_out()
-                    else:
-                        self._ema_swap_in()
-                        metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
-                        self._ema_swap_out()
-                except Exception as e:
-                    print(f"[VAL METRICS] Skipped due to error: {e}", flush=True)
-            elif skip_music_val and ep == 0:
-                print(f"[VAL METRICS] Skipping MUSIC-based metrics (skip_music_val=True)", flush=True)
-
-            # Compose primary metric if requested
-            if metrics is not None and val_primary in ("k_loc", "metrics"):
-                # Lower is better
-                phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
-                theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))
-                r_norm = float(getattr(cfg, "VAL_NORM_R_M", 1.0))
-                k_acc = float(metrics.get("k_acc", 0.0))
-                succ = float(metrics.get("success_rate", 0.0))
-                rmse_phi = metrics.get("rmse_phi_mean", None)
-                rmse_theta = metrics.get("rmse_theta_mean", None)
-                rmse_r = metrics.get("rmse_r_mean", None)
-                # Use conservative defaults if RMSE unavailable
-                rmse_phi = float(rmse_phi) if rmse_phi is not None else phi_norm
-                rmse_theta = float(rmse_theta) if rmse_theta is not None else theta_norm
-                rmse_r = float(rmse_r) if rmse_r is not None else r_norm
-                val_score = (1.0 - k_acc) + (rmse_phi / phi_norm) + (rmse_theta / theta_norm) + (rmse_r / r_norm) - succ
-            else:
-                # Default to loss as score
-                val_score = float(val_loss)
+            val_score = float(val_loss)  # Default to loss
+            
+            if val_primary == "surrogate":
+                # SURROGATE MODE: Fast, MUSIC-free validation (RECOMMENDED for training/HPO)
+                if (ep + 1) % val_every == 0 or ep == epochs - 1:
+                    try:
+                        hpo_max_batches = max_val_batches or 20
+                        if self.swa_started:
+                            self._swa_swap_in()
+                            metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
+                            self._swa_swap_out()
+                        else:
+                            self._ema_swap_in()
+                            metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
+                            self._ema_swap_out()
+                        # Surrogate score: higher is better
+                        val_score = float(metrics.get("score", 0.0))
+                    except Exception as e:
+                        print(f"[VAL SURROGATE] Error: {e}", flush=True)
+                        import traceback; traceback.print_exc()
+                        val_score = 0.0  # Neutral score on error
+                        
+            elif val_primary in ("k_loc", "metrics") and use_music_in_val:
+                # MUSIC MODE: Full MUSIC-based validation (for final evaluation only)
+                if not skip_music_val and ((ep + 1) % val_every == 0 or ep == epochs - 1):
+                    try:
+                        hpo_max_batches = max_val_batches or 20
+                        if self.swa_started:
+                            self._swa_swap_in()
+                            metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
+                            self._swa_swap_out()
+                        else:
+                            self._ema_swap_in()
+                            metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
+                            self._ema_swap_out()
+                        # MUSIC score: lower is better
+                        phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
+                        theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))
+                        r_norm = float(getattr(cfg, "VAL_NORM_R_M", 1.0))
+                        k_acc = float(metrics.get("k_acc", 0.0))
+                        succ = float(metrics.get("success_rate", 0.0))
+                        rmse_phi = float(metrics.get("rmse_phi_mean") or phi_norm)
+                        rmse_theta = float(metrics.get("rmse_theta_mean") or theta_norm)
+                        rmse_r = float(metrics.get("rmse_r_mean") or r_norm)
+                        val_score = (1.0 - k_acc) + (rmse_phi / phi_norm) + (rmse_theta / theta_norm) + (rmse_r / r_norm) - succ
+                    except Exception as e:
+                        print(f"[VAL MUSIC] Error: {e}", flush=True)
+                        val_score = float("inf")  # Worst score on error
+                elif skip_music_val and ep == 0:
+                    print(f"[VAL] Skipping MUSIC-based metrics (skip_music_val=True)", flush=True)
+            # else: val_primary == "loss", use val_loss directly
             
             # Update best checkpoint by primary metric
             improved = False
-            if val_primary in ("k_loc", "metrics"):
+            if val_primary == "surrogate":
+                # Surrogate: higher score is better (maximize)
+                if val_score > best_score:
+                    best_score = float(val_score)
+                    improved = True
+            elif val_primary in ("k_loc", "metrics"):
+                # MUSIC-based: lower score is better (minimize)
                 if val_score < best_score:
                     best_score = float(val_score)
                     improved = True
             else:
+                # Loss-based: lower is better
                 if val_loss < best_val:
                     best_val = float(val_loss)
                     improved = True
@@ -2043,18 +2231,29 @@ class Trainer:
                 f"lam_K={getattr(self.loss_fn,'lam_K',0):.2f})",
                 flush=True
             )
-            # Print key K/localization metrics if available
+            # Print key metrics if available
             if metrics is not None:
-                print(f"  🧭 Metrics: K_acc={metrics.get('k_acc', 0.0):.3f}, "
-                      f"K_mdl_acc={metrics.get('k_mdl_acc', 0.0):.3f}, "
-                      f"succ_rate={metrics.get('success_rate', 0.0):.3f}, "
-                      f"φ_med={metrics.get('med_phi', float('nan')):.2f}°, "
-                      f"θ_med={metrics.get('med_theta', float('nan')):.2f}°, "
-                      f"r_med={metrics.get('med_r', float('nan')):.2f}m, "
-                      f"φ_RMSE≈{metrics.get('rmse_phi_mean', float('nan')):.2f}°, "
-                      f"θ_RMSE≈{metrics.get('rmse_theta_mean', float('nan')):.2f}°, "
-                      f"r_RMSE≈{metrics.get('rmse_r_mean', float('nan')):.2f}m, "
-                      f"score={val_score:.3f}", flush=True)
+                if val_primary == "surrogate":
+                    # Surrogate metrics (no MUSIC)
+                    print(f"  🎯 Surrogate: K_acc={metrics.get('k_acc', 0.0):.3f}, "
+                          f"K_under={metrics.get('k_under', 0.0):.3f}, "
+                          f"K_over={metrics.get('k_over', 0.0):.3f}, "
+                          f"aux_φ={metrics.get('aux_phi_rmse', float('nan')):.2f}°, "
+                          f"aux_θ={metrics.get('aux_theta_rmse', float('nan')):.2f}°, "
+                          f"aux_r={metrics.get('aux_r_rmse', float('nan')):.2f}m, "
+                          f"score={val_score:.4f}", flush=True)
+                else:
+                    # MUSIC-based metrics
+                    print(f"  🧭 MUSIC: K_acc={metrics.get('k_acc', 0.0):.3f}, "
+                          f"K_mdl_acc={metrics.get('k_mdl_acc', 0.0):.3f}, "
+                          f"succ_rate={metrics.get('success_rate', 0.0):.3f}, "
+                          f"φ_med={metrics.get('med_phi', float('nan')):.2f}°, "
+                          f"θ_med={metrics.get('med_theta', float('nan')):.2f}°, "
+                          f"r_med={metrics.get('med_r', float('nan')):.2f}m, "
+                          f"φ_RMSE≈{metrics.get('rmse_phi_mean', float('nan')):.2f}°, "
+                          f"θ_RMSE≈{metrics.get('rmse_theta_mean', float('nan')):.2f}°, "
+                          f"r_RMSE≈{metrics.get('rmse_r_mean', float('nan')):.2f}m, "
+                          f"score={val_score:.3f}", flush=True)
 
             # Early stopping by patience on chosen primary metric
             if (early_stop_patience is not None) and (early_stop_patience > 0) and (patience_counter >= early_stop_patience):
@@ -2324,9 +2523,15 @@ class Trainer:
             print(f"⚠️ K calibration skipped due to error: {e}")
         
         # Return objective for outer loops (HPO/automation)
-        # - If VAL_PRIMARY is metric-driven ('k_loc'/'metrics'), return best composite score
-        # - Otherwise return best validation loss
-        if str(getattr(cfg, "VAL_PRIMARY", "loss")).lower() in ("k_loc", "metrics"):
+        # - "surrogate": return best surrogate score (higher is better, negate for Optuna minimize)
+        # - "k_loc"/"metrics": return best composite score (lower is better)
+        # - "loss": return best validation loss (lower is better)
+        val_primary_final = str(getattr(cfg, "VAL_PRIMARY", "surrogate")).lower()
+        if val_primary_final == "surrogate":
+            # Surrogate: higher is better, but Optuna minimizes
+            # Return negative score so Optuna can minimize
+            return -float(best_score)
+        elif val_primary_final in ("k_loc", "metrics"):
             return float(best_score)
         return float(best_val)
 
