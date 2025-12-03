@@ -585,15 +585,23 @@ def angle_pipeline_gpu(cov_factor_or_R, K_est, cfg,
     # CRITICAL: Use the canonical builder to prepare R_eff
     # This is the SAME R_eff that K-head sees during training
     # Builder handles: hybrid blending, hermitization, trace-norm, shrink, diag-load
+    use_hybrid = (R_samp is not None and beta is not None and beta > 0)
     R_eff = build_effective_cov_np(
         R_pred,
-        R_samp=R_samp,
-        beta=beta if (R_samp is not None and beta is not None and beta > 0) else None,
+        R_samp=R_samp if use_hybrid else None,
+        beta=beta if use_hybrid else None,
         diag_load=True,
         apply_shrink=True,  # Builder owns shrinkage
         snr_db=None,  # Use adaptive shrinkage
         target_trace=float(N),
     )
+    
+    # Debug: print hybrid status for first call
+    if not hasattr(angle_pipeline_gpu, '_debug_printed'):
+        angle_pipeline_gpu._debug_printed = True
+        print(f"[GPU MUSIC] R_pred shape: {R_pred.shape}, R_samp: {'provided' if R_samp is not None else 'None'}, beta: {beta}, use_hybrid: {use_hybrid}", flush=True)
+        if use_hybrid:
+            print(f"[GPU MUSIC] R_samp shape: {R_samp.shape}, ||R_pred||_F: {np.linalg.norm(R_pred, 'fro'):.2f}, ||R_samp||_F: {np.linalg.norm(R_samp, 'fro'):.2f}", flush=True)
     
     # Get GPU estimator
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
