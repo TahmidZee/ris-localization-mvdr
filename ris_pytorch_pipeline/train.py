@@ -1424,6 +1424,9 @@ class Trainer:
                     # Inference-like evaluation: always use unified angle pipeline when factors available
                     # Use GPU MUSIC if available for 10-20x speedup
                     if "cov_fact_angle" in preds:
+                        # Debug: print first sample to verify MUSIC is being called
+                        if i == 0 and bi == 0:
+                            print(f"[VAL MUSIC] Entering MUSIC block for sample 0, batch 0", flush=True)
                         try:
                             from .angle_pipeline import angle_pipeline, angle_pipeline_gpu, _GPU_MUSIC_AVAILABLE
                             
@@ -1511,6 +1514,7 @@ class Trainer:
                                 # GPU path: fast MUSIC with consistent R_eff (prepared=True)
                                 # angle_pipeline_gpu uses build_effective_cov_np internally
                                 # This ensures K-head and MUSIC see the SAME R_eff
+                                hybrid_beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.3))
                                 phi_music, theta_music, _ = angle_pipeline_gpu(
                                     cf_ang_complex, K_hat, cfg,
                                     use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
@@ -1520,7 +1524,7 @@ class Trainer:
                                     peak_refine=True,
                                     use_newton=False,  # Skip Newton for speed
                                     R_samp=R_samp_np,  # Pass R_samp for hybrid blending
-                                    beta=blend_beta,   # Same beta as training
+                                    beta=hybrid_beta,  # Use cfg.HYBRID_COV_BETA (not blend_beta which may be 0)
                                 )
                             else:
                                 # CPU fallback with full pipeline
