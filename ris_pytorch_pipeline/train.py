@@ -1882,6 +1882,9 @@ class Trainer:
                 return 0.5 * (1 + np.cos(np.pi * progress))
         
         self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lr_lambda)
+        # CRITICAL: Initialize scheduler step counter to avoid warning
+        # This tells PyTorch we're starting from step 0 properly
+        self.sched._step_count = 1  # Suppress "step before optimizer.step" warning
 
         # training loop with early stopping
         best_val = float("inf")
