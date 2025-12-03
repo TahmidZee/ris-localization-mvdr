@@ -99,9 +99,13 @@ def _hungarian_assign(C):
         return (np.array([p[0] for p in pairs]), np.array([p[1] for p in pairs]))
 
 
-def eval_scene_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_gt):
+def eval_scene_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_gt,
+                              success_tol_phi=5.0, success_tol_theta=5.0, success_tol_r=1.0):
     """
-    Evaluate angle and range estimation using Hungarian matching
+    Evaluate angle and range estimation using Hungarian matching.
+    
+    CRITICAL FIX: Returns BOTH raw errors (no gating) and success-gated metrics.
+    This allows tracking actual MUSIC performance even when success rate is 0.
     
     Args:
         phi_pred: Predicted azimuth angles (degrees), shape [K_pred]
@@ -110,9 +114,15 @@ def eval_scene_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_g
         phi_gt: Ground truth azimuth angles (degrees), shape [K_gt]
         theta_gt: Ground truth elevation angles (degrees), shape [K_gt]
         r_gt: Ground truth ranges (meters), shape [K_gt]
+        success_tol_phi: Tolerance for "success" (degrees)
+        success_tol_theta: Tolerance for "success" (degrees)
+        success_tol_r: Tolerance for "success" (meters)
     
     Returns:
-        dict with RMSE and median errors for phi, theta, r
+        dict with:
+        - RAW metrics (med_phi, rmse_phi, etc): computed on ALL matched pairs, no gating
+        - SUCCESS metrics (success_flag): whether ALL sources are within tolerance
+        - num_matched: number of Hungarian-matched pairs
     """
     Kp, Kg = len(phi_pred), len(phi_gt)
     
@@ -120,7 +130,10 @@ def eval_scene_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_g
         return {
             "rmse_phi": None, "rmse_theta": None, "rmse_r": None,
             "med_phi": None, "med_theta": None, "med_r": None,
-            "num_pred": Kp, "num_gt": Kg,
+            "num_pred": Kp, "num_gt": Kg, "num_matched": 0,
+            "success_flag": False,
+            # Raw errors (empty)
+            "raw_phi_errors": [], "raw_theta_errors": [], "raw_r_errors": [],
         }
     
     # Hungarian assignment based on normalized cost (includes range!)
@@ -132,14 +145,17 @@ def eval_scene_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_g
         return {
             "rmse_phi": None, "rmse_theta": None, "rmse_r": None,
             "med_phi": None, "med_theta": None, "med_r": None,
-            "num_pred": Kp, "num_gt": Kg,
+            "num_pred": Kp, "num_gt": Kg, "num_matched": 0,
+            "success_flag": False,
+            "raw_phi_errors": [], "raw_theta_errors": [], "raw_r_errors": [],
         }
     
-    # FOV-CRITICAL FIX: Compute matched errors with gating for bounded FOV
-    # Reject matches with large errors (treat as FP/FN instead of forcing 90°/10m penalty)
-    dphi = []
-    dth = []
-    dr = []
+    # Compute RAW errors for ALL matched pairs (no gating!)
+    dphi_raw = []
+    dth_raw = []
+    dr_raw = []
+    all_within_tol = True  # For success flag
+    
     for i in range(m):
         if r_idx[i] < len(phi_pred) and c_idx[i] < len(phi_gt):
             # Plain absolute difference (no wrap!) for bounded FOV
@@ -147,37 +163,45 @@ def eval_scene_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_g
             err_theta = abs(theta_pred[r_idx[i]] - theta_gt[c_idx[i]])
             err_r = abs(r_pred[r_idx[i]] - r_gt[c_idx[i]])
             
-            # Gating: Only accept match if errors are within reasonable bounds
-            # RELAXED for early training: 60°/40°/8m (was 30°/20°/5m)
-            # This allows metrics to be computed even for untrained models
-            # Final evaluation should use stricter thresholds
-            if err_phi <= 60.0 and err_theta <= 40.0 and err_r <= 8.0:
-                dphi.append(err_phi)
-                dth.append(err_theta)
-                dr.append(err_r)
-            # else: skip this "match" - it's really a FP/FN, not a bad match
+            # Store RAW errors (no gating)
+            dphi_raw.append(err_phi)
+            dth_raw.append(err_theta)
+            dr_raw.append(err_r)
+            
+            # Check success tolerance
+            if err_phi > success_tol_phi or err_theta > success_tol_theta or err_r > success_tol_r:
+                all_within_tol = False
     
-    if len(dphi) == 0:
+    if len(dphi_raw) == 0:
         return {
             "rmse_phi": None, "rmse_theta": None, "rmse_r": None,
             "med_phi": None, "med_theta": None, "med_r": None,
             "num_pred": Kp, "num_gt": Kg, "num_matched": 0,
+            "success_flag": False,
+            "raw_phi_errors": [], "raw_theta_errors": [], "raw_r_errors": [],
         }
     
-    dphi = np.array(dphi)
-    dth = np.array(dth)
-    dr = np.array(dr)
+    dphi_raw = np.array(dphi_raw)
+    dth_raw = np.array(dth_raw)
+    dr_raw = np.array(dr_raw)
     
     return {
-        "rmse_phi": float(np.sqrt(np.mean(dphi**2))),
-        "rmse_theta": float(np.sqrt(np.mean(dth**2))),
-        "rmse_r": float(np.sqrt(np.mean(dr**2))),
-        "med_phi": float(np.median(dphi)),
-        "med_theta": float(np.median(dth)),
-        "med_r": float(np.median(dr)),
+        # RAW metrics (no gating, no penalties) - use these for tracking progress
+        "rmse_phi": float(np.sqrt(np.mean(dphi_raw**2))),
+        "rmse_theta": float(np.sqrt(np.mean(dth_raw**2))),
+        "rmse_r": float(np.sqrt(np.mean(dr_raw**2))),
+        "med_phi": float(np.median(dphi_raw)),
+        "med_theta": float(np.median(dth_raw)),
+        "med_r": float(np.median(dr_raw)),
         "num_pred": Kp,
         "num_gt": Kg,
-        "num_matched": m,
+        "num_matched": len(dphi_raw),
+        # Success flag (strict: ALL sources within tolerance)
+        "success_flag": all_within_tol and len(dphi_raw) == Kg,
+        # Raw error arrays for aggregation
+        "raw_phi_errors": dphi_raw.tolist(),
+        "raw_theta_errors": dth_raw.tolist(),
+        "raw_r_errors": dr_raw.tolist(),
     }
 
 

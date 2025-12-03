@@ -1359,11 +1359,13 @@ class Trainer:
         self.model.eval()
         
         # Collect predictions and ground truth
+        # CRITICAL: all_errors now contains RAW errors (no penalties), one per matched source
         all_errors = {"phi": [], "theta": [], "r": [], "snr": []}
-        # New: track per-scene RMSEs and K metrics
+        # Track per-scene RMSEs and K metrics
         rmse_phi_list, rmse_theta_list, rmse_r_list = [], [], []
         k_true_all, k_hat_all = [], []
-        success_count = 0
+        success_count = 0  # Scenes where ALL sources are within tolerance
+        n_scenes_with_matches = 0  # Scenes with at least one Hungarian match
         k_mdl_correct = 0  # Track MDL baseline accuracy
         # Success thresholds (configurable)
         succ_phi_thr = float(getattr(cfg, "SUCCESS_THR_PHI_DEG", 3.0))
@@ -1600,41 +1602,39 @@ class Trainer:
                         if getattr(cfg, "MUSIC_DEBUG", False):
                             print(f"[MDL] baseline failed: {e}")
                     
-                    # Hungarian matching across ALL slots (permutation-agnostic)
-                    metrics = eval_scene_angles_ranges(phi_all_deg, theta_all_deg, r_all_np,
-                                                      phi_gt, theta_gt, r_gt)
+                    # K metrics (compute first for success check)
+                    k_hat = int(np.clip(np.argmax(preds["k_logits"][i].detach().cpu().numpy()) + 1, 1, cfg.K_MAX)) if "k_logits" in preds else int(min(max(1, k_true), cfg.K_MAX))
+                    k_true_all.append(k_true)
+                    k_hat_all.append(k_hat)
                     
-                    # ICC CRITICAL FIX: Count ALL scenes, don't drop any!
-                    # If matching fails (med_phi is None), assign large penalty
-                    if metrics["med_phi"] is not None:
-                        all_errors["phi"].append(metrics["med_phi"])
-                        all_errors["theta"].append(metrics["med_theta"])
-                        all_errors["r"].append(metrics["med_r"])
-                        all_errors["snr"].append(snr_np[i])
-                        # Track RMSEs when available (scene-level)
+                    # Hungarian matching across ALL slots (permutation-agnostic)
+                    # Now returns RAW errors (no gating) + success flag
+                    metrics = eval_scene_angles_ranges(phi_all_deg, theta_all_deg, r_all_np,
+                                                      phi_gt, theta_gt, r_gt,
+                                                      success_tol_phi=succ_phi_thr,
+                                                      success_tol_theta=succ_theta_thr,
+                                                      success_tol_r=succ_r_thr)
+                    
+                    # CRITICAL FIX: Use RAW errors for metrics (no penalties!)
+                    # This allows tracking actual MUSIC performance even when success rate is 0
+                    if metrics.get("raw_phi_errors") and len(metrics["raw_phi_errors"]) > 0:
+                        n_scenes_with_matches += 1
+                        # Extend with all raw errors from this scene
+                        all_errors["phi"].extend(metrics["raw_phi_errors"])
+                        all_errors["theta"].extend(metrics["raw_theta_errors"])
+                        all_errors["r"].extend(metrics["raw_r_errors"])
+                        all_errors["snr"].extend([snr_np[i]] * len(metrics["raw_phi_errors"]))
+                        # Track scene-level RMSEs
                         if metrics.get("rmse_phi") is not None:
                             rmse_phi_list.append(metrics["rmse_phi"])
                         if metrics.get("rmse_theta") is not None:
                             rmse_theta_list.append(metrics["rmse_theta"])
                         if metrics.get("rmse_r") is not None:
                             rmse_r_list.append(metrics["rmse_r"])
-                    else:
-                        # Scene failed - assign max penalty (90° for angles, 10m for range)
-                        # This ensures HPO sees the failure and penalizes bad configs
-                        all_errors["phi"].append(90.0)
-                        all_errors["theta"].append(90.0)
-                        all_errors["r"].append(10.0)
-                        all_errors["snr"].append(snr_np[i])
-                    
-                    # K metrics
-                    k_hat = int(np.clip(np.argmax(preds["k_logits"][i].detach().cpu().numpy()) + 1, 1, cfg.K_MAX)) if "k_logits" in preds else int(min(max(1, k_true), cfg.K_MAX))
-                    k_true_all.append(k_true)
-                    k_hat_all.append(k_hat)
-                    
-                    # Success criterion (proxy): K correct AND medians under thresholds
-                    if (k_hat == k_true) and (metrics["med_phi"] is not None):
-                        if (metrics["med_phi"] <= succ_phi_thr) and (metrics["med_theta"] <= succ_theta_thr) and (metrics["med_r"] <= succ_r_thr):
+                        # Track success (strict: all sources within tolerance AND K correct)
+                        if metrics.get("success_flag", False) and (k_hat == k_true):
                             success_count += 1
+                    # Note: We no longer add 90°/10m penalties - raw errors only!
         
         if len(all_errors["phi"]) == 0:
             print("⚠️  No valid samples for Hungarian evaluation")
@@ -1654,9 +1654,9 @@ class Trainer:
         
         # Note: During HPO, we use subsets (e.g., 1000 samples instead of full 10K)
         # So we don't assert a fixed count, just log what we got
-        print(f"[VAL METRICS] Processed {actual_count} samples", flush=True)
+        print(f"[VAL METRICS] Processed {actual_count} source-level errors from {n_scenes_with_matches} scenes", flush=True)
         
-        # Overall statistics
+        # Overall statistics (RAW errors, no penalties!)
         med_phi = np.median(phi_err)
         med_theta = np.median(theta_err)
         med_r = np.median(r_err)
@@ -1665,10 +1665,12 @@ class Trainer:
         rmse_theta_mean = float(np.mean(rmse_theta_list)) if len(rmse_theta_list) > 0 else None
         rmse_r_mean = float(np.mean(rmse_r_list)) if len(rmse_r_list) > 0 else None
         
-        print(f"\n📊 Overall Angle/Range Errors (Hungarian-matched, N={len(phi_err)}):")
-        print(f"  Azimuth (φ):     median={med_phi:.3f}°,   95th={np.percentile(phi_err, 95):.3f}°")
-        print(f"  Elevation (θ):   median={med_theta:.3f}°,   95th={np.percentile(theta_err, 95):.3f}°")
-        print(f"  Range (r):       median={med_r:.3f}m,   95th={np.percentile(r_err, 95):.3f}m")
+        # CRITICAL: These are RAW errors (no 90°/10m penalties!)
+        # This shows actual MUSIC performance, not gating artifacts
+        print(f"\n📊 RAW Angle/Range Errors (no penalties, N={len(phi_err)} source-pairs from {n_scenes_with_matches} scenes):")
+        print(f"  Azimuth (φ):     median={med_phi:.2f}°,   95th={np.percentile(phi_err, 95):.2f}°,   RMSE={np.sqrt(np.mean(phi_err**2)):.2f}°")
+        print(f"  Elevation (θ):   median={med_theta:.2f}°,   95th={np.percentile(theta_err, 95):.2f}°,   RMSE={np.sqrt(np.mean(theta_err**2)):.2f}°")
+        print(f"  Range (r):       median={med_r:.2f}m,   95th={np.percentile(r_err, 95):.2f}m,   RMSE={np.sqrt(np.mean(r_err**2)):.2f}m")
         
         # SNR-binned statistics
         snr_bins = [(-np.inf, 0), (0, 10), (10, np.inf)]
