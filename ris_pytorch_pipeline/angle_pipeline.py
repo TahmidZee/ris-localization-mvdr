@@ -530,23 +530,31 @@ def angle_pipeline(cov_factor_or_R, K_est, cfg,
 def angle_pipeline_gpu(cov_factor_or_R, K_est, cfg,
                        use_fba=True, use_2_5d=False,
                        r_planes=None, grid_phi=121, grid_theta=81,
-                       peak_refine=True, use_newton=False):
+                       peak_refine=True, use_newton=False,
+                       R_samp=None, beta=None):
     """
     GPU-accelerated angle estimation pipeline (10-20x faster than CPU).
     
     This is optimized for validation where speed matters. Uses the GPU MUSIC
     implementation for the coarse scan, with optional Newton refinement.
     
+    SHRINKAGE CONSISTENCY (Option B):
+    - This function uses build_effective_cov_np to prepare R_eff
+    - R_eff is then passed to GPU MUSIC with prepared=True
+    - This ensures K-head and MUSIC see the SAME R_eff (no double-shrink)
+    
     Args:
         cov_factor_or_R: Covariance factor [N, K_MAX] or R [N, N] complex
         K_est: Number of sources (int)
         cfg: Config object
-        use_fba: Forward-Backward Averaging (default: True)
+        use_fba: Forward-Backward Averaging (applied by builder, not MUSIC)
         use_2_5d: 2.5D range-aware steering (default: False for speed)
         r_planes: Range planes for 2.5D
         grid_phi, grid_theta: Grid resolution (coarser for speed)
         peak_refine: Parabolic refinement (default: True)
         use_newton: Newton refinement (default: False for speed)
+        R_samp: Optional sample covariance for hybrid blending [N, N] complex
+        beta: Hybrid blending weight (0 = pure R_pred, 1 = pure R_samp)
     
     Returns:
         phi_deg [K_est], theta_deg [K_est], info dict
@@ -561,37 +569,52 @@ def angle_pipeline_gpu(cov_factor_or_R, K_est, cfg,
     
     # Sanity check
     K_est = int(np.clip(K_est, 1, getattr(cfg, "K_MAX", 5)))
+    N = cfg.N_H * cfg.N_V
     
-    # Reconstruct R if needed
+    # Reconstruct R_pred if needed
     if cov_factor_or_R.shape[0] != cov_factor_or_R.shape[1]:
         cf = cov_factor_or_R
         if isinstance(cf, torch.Tensor):
             cf = cf.cpu().numpy()
-        R = cf @ cf.conj().T
+        R_pred = cf @ cf.conj().T
     else:
-        R = cov_factor_or_R
-        if isinstance(R, torch.Tensor):
-            R = R.cpu().numpy()
+        R_pred = cov_factor_or_R
+        if isinstance(R_pred, torch.Tensor):
+            R_pred = R_pred.cpu().numpy()
+    
+    # CRITICAL: Use the canonical builder to prepare R_eff
+    # This is the SAME R_eff that K-head sees during training
+    # Builder handles: hybrid blending, hermitization, trace-norm, shrink, diag-load
+    R_eff = build_effective_cov_np(
+        R_pred,
+        R_samp=R_samp,
+        beta=beta if (R_samp is not None and beta is not None and beta > 0) else None,
+        diag_load=True,
+        apply_shrink=True,  # Builder owns shrinkage
+        snr_db=None,  # Use adaptive shrinkage
+        target_trace=float(N),
+    )
     
     # Get GPU estimator
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     estimator = get_gpu_estimator(cfg, device=device)
     
-    # Run GPU MUSIC
+    # Run GPU MUSIC with prepared=True (skip MUSIC's own shrink/diag-load)
     phi_deg, theta_deg, r_m, spectrum = estimator.estimate_single(
-        R, K_est,
-        use_fba=use_fba,
+        R_eff, K_est,
+        use_fba=False,  # FBA already applied by builder if needed
         use_2_5d=use_2_5d,
         r_planes=r_planes,
         grid_phi=grid_phi,
         grid_theta=grid_theta,
-        peak_refine=peak_refine
+        peak_refine=peak_refine,
+        prepared=True,  # CRITICAL: R_eff is already processed
     )
     
     # Optional Newton refinement (on GPU)
     if use_newton and len(phi_deg) > 0:
         phi_deg, theta_deg, r_m = estimator.newton_refine(
-            phi_deg, theta_deg, r_m, R, K_est, max_iters=5, lr=0.3
+            phi_deg, theta_deg, r_m, R_eff, K_est, max_iters=5, lr=0.3
         )
     
     info = {
@@ -601,8 +624,10 @@ def angle_pipeline_gpu(cov_factor_or_R, K_est, cfg,
         "theta_refined": theta_deg,
         "r_est": r_m,
         "spectrum": spectrum,
-        "R": R,
+        "R": R_eff,
+        "R_pred": R_pred,
         "gpu_accelerated": True,
+        "prepared": True,
     }
     
     return phi_deg, theta_deg, info

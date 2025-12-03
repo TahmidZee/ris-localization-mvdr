@@ -404,18 +404,22 @@ class GPUMusicEstimator:
                         r_planes: Optional[List[float]] = None,
                         grid_phi: int = 181,
                         grid_theta: int = 121,
-                        peak_refine: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                        peak_refine: bool = True,
+                        prepared: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Estimate DoA and range for a single covariance matrix.
         
         Args:
             R: Covariance [N, N] complex
             K: Number of sources
-            use_fba: Forward-Backward Averaging
+            use_fba: Forward-Backward Averaging (skipped if prepared=True)
             use_2_5d: 2.5D range-aware steering
             r_planes: Range planes for 2.5D
             grid_phi, grid_theta: Grid resolution
             peak_refine: Parabolic refinement
+            prepared: If True, R is already processed by build_effective_cov_*
+                      (trace-normalized, shrunk, diag-loaded). Skip those steps.
+                      This ensures K-head and MUSIC see the SAME R_eff.
             
         Returns:
             phi_deg [K], theta_deg [K], r_m [K], spectrum [grid_phi, grid_theta]
@@ -428,21 +432,29 @@ class GPUMusicEstimator:
         
         N = R.shape[0]
         
-        # Trace normalization
-        trace_R = torch.real(torch.trace(R))
-        if trace_R > 1e-8:
-            R = R * (N / trace_R)
-        
-        # FBA
-        if use_fba:
-            R = self._forward_backward_average(R)
-        
-        # Adaptive shrinkage
-        R, _ = self._adaptive_shrinkage(R)
-        
-        # Diagonal loading
-        eps = 1e-3 * torch.real(torch.trace(R)) / N
-        R = R + eps * torch.eye(N, dtype=torch.complex64, device=self.device)
+        if not prepared:
+            # MUSIC owns preprocessing: trace-norm, FBA, shrink, diag-load
+            # Use this path for standalone testing or when R is raw
+            
+            # Trace normalization
+            trace_R = torch.real(torch.trace(R))
+            if trace_R > 1e-8:
+                R = R * (N / trace_R)
+            
+            # FBA
+            if use_fba:
+                R = self._forward_backward_average(R)
+            
+            # Adaptive shrinkage
+            R, _ = self._adaptive_shrinkage(R)
+            
+            # Diagonal loading
+            eps = 1e-3 * torch.real(torch.trace(R)) / N
+            R = R + eps * torch.eye(N, dtype=torch.complex64, device=self.device)
+        else:
+            # R is already prepared by build_effective_cov_*
+            # Only ensure Hermitian symmetry (should already be, but safety)
+            R = 0.5 * (R + R.conj().T)
         
         # Noise projector
         G = self._compute_noise_projector(R, K)
@@ -502,6 +514,7 @@ class GPUMusicEstimator:
                        grid_phi: int = 91,  # Coarser for batch
                        grid_theta: int = 61,
                        peak_refine: bool = True,
+                       prepared: bool = False,
                        K_max: int = 5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Batch estimation for validation (optimized for speed).
@@ -510,6 +523,7 @@ class GPUMusicEstimator:
             R_batch: [B, N, N] complex
             K_batch: [B] number of sources
             use_fba, use_2_5d, r_planes, grid_phi, grid_theta, peak_refine: Options
+            prepared: If True, R_batch is already processed by build_effective_cov_*
             K_max: Maximum K for output padding
             
         Returns:
@@ -535,7 +549,8 @@ class GPUMusicEstimator:
             phi, theta, r, _ = self.estimate_single(
                 R_batch[b], K,
                 use_fba=use_fba, use_2_5d=use_2_5d, r_planes=r_planes,
-                grid_phi=grid_phi, grid_theta=grid_theta, peak_refine=peak_refine
+                grid_phi=grid_phi, grid_theta=grid_theta, peak_refine=peak_refine,
+                prepared=prepared
             )
             
             n = min(len(phi), K_max)

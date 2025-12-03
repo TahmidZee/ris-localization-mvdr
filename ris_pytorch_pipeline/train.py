@@ -1500,8 +1500,16 @@ class Trainer:
                             # Use GPU MUSIC if available (10-20x faster), else fall back to CPU
                             use_gpu_music = _GPU_MUSIC_AVAILABLE and torch.cuda.is_available()
                             
+                            # Get R_samp for hybrid blending (same as used by K-head)
+                            R_samp_np = None
+                            if R_samp is not None:
+                                Ri = R_samp[i].detach().cpu().numpy()
+                                R_samp_np = Ri[..., 0] + 1j * Ri[..., 1] if (Ri.ndim == 3 and Ri.shape[-1] == 2) else Ri.astype(np.complex64)
+                            
                             if use_gpu_music:
-                                # GPU path: fast MUSIC, skip Newton for speed during validation
+                                # GPU path: fast MUSIC with consistent R_eff (prepared=True)
+                                # angle_pipeline_gpu uses build_effective_cov_np internally
+                                # This ensures K-head and MUSIC see the SAME R_eff
                                 phi_music, theta_music, _ = angle_pipeline_gpu(
                                     cf_ang_complex, K_hat, cfg,
                                     use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
@@ -1510,6 +1518,8 @@ class Trainer:
                                     grid_theta=61,
                                     peak_refine=True,
                                     use_newton=False,  # Skip Newton for speed
+                                    R_samp=R_samp_np,  # Pass R_samp for hybrid blending
+                                    beta=blend_beta,   # Same beta as training
                                 )
                             else:
                                 # CPU fallback with full pipeline
