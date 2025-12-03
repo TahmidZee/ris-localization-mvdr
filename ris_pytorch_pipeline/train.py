@@ -1421,9 +1421,10 @@ class Trainer:
                     r_all_np = r_all.detach().cpu().numpy() if isinstance(r_all, torch.Tensor) else np.array(r_all)
                     
                     # Inference-like evaluation: always use unified angle pipeline when factors available
+                    # Use GPU MUSIC if available for 10-20x speedup
                     if "cov_fact_angle" in preds:
                         try:
-                            from .angle_pipeline import angle_pipeline
+                            from .angle_pipeline import angle_pipeline, angle_pipeline_gpu, _GPU_MUSIC_AVAILABLE
                             
                             cf_ang = preds["cov_fact_angle"][i].detach().cpu().numpy()  # [N*K_MAX*2]
                             # NN K (with optional calibration)
@@ -1496,19 +1497,34 @@ class Trainer:
                             thr = float(getattr(cfg, "K_CONF_THRESH", 0.65))
                             K_hat = K_mdl if (nn_conf < thr) else K_nn
                             
-                            # Use unified pipeline: MUSIC → Parabolic → Newton (with hybrid blending!)
-                            phi_music, theta_music, _ = angle_pipeline(
-                                cf_ang_complex, K_hat, cfg,
-                                use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
-                                use_adaptive_shrink=True,
-                                use_parabolic=getattr(cfg, "MUSIC_PEAK_REFINE", True),
-                                use_newton=getattr(cfg, "USE_NEWTON_REFINE", True),
-                                device="cuda" if torch.cuda.is_available() else "cpu",
-                                y_snapshots=y_snaps,
-                                H_snapshots=H_snaps,
-                                codes_snapshots=codes_snaps,
-                                blend_beta=blend_beta
-                            )
+                            # Use GPU MUSIC if available (10-20x faster), else fall back to CPU
+                            use_gpu_music = _GPU_MUSIC_AVAILABLE and torch.cuda.is_available()
+                            
+                            if use_gpu_music:
+                                # GPU path: fast MUSIC, skip Newton for speed during validation
+                                phi_music, theta_music, _ = angle_pipeline_gpu(
+                                    cf_ang_complex, K_hat, cfg,
+                                    use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
+                                    use_2_5d=False,  # 2D only for speed
+                                    grid_phi=91,     # Coarser grid for validation speed
+                                    grid_theta=61,
+                                    peak_refine=True,
+                                    use_newton=False,  # Skip Newton for speed
+                                )
+                            else:
+                                # CPU fallback with full pipeline
+                                phi_music, theta_music, _ = angle_pipeline(
+                                    cf_ang_complex, K_hat, cfg,
+                                    use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
+                                    use_adaptive_shrink=True,
+                                    use_parabolic=getattr(cfg, "MUSIC_PEAK_REFINE", True),
+                                    use_newton=getattr(cfg, "USE_NEWTON_REFINE", True),
+                                    device="cpu",
+                                    y_snapshots=y_snaps,
+                                    H_snapshots=H_snaps,
+                                    codes_snapshots=codes_snaps,
+                                    blend_beta=blend_beta
+                                )
                             # Use MUSIC+Newton refined estimates directly
                             phi_all_deg = np.array(phi_music, dtype=np.float32)
                             theta_all_deg = np.array(theta_music, dtype=np.float32)
