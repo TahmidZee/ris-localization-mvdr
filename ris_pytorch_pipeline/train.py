@@ -1364,6 +1364,7 @@ class Trainer:
         rmse_phi_list, rmse_theta_list, rmse_r_list = [], [], []
         k_true_all, k_hat_all = [], []
         success_count = 0
+        k_mdl_correct = 0  # Track MDL baseline accuracy
         # Success thresholds (configurable)
         succ_phi_thr = float(getattr(cfg, "SUCCESS_THR_PHI_DEG", 3.0))
         succ_theta_thr = float(getattr(cfg, "SUCCESS_THR_THETA_DEG", 3.0))
@@ -1539,9 +1540,18 @@ class Trainer:
                             phi_all_deg = np.array(phi_music, dtype=np.float32)
                             theta_all_deg = np.array(theta_music, dtype=np.float32)
                             
+                            # Debug: print first sample's MUSIC output
+                            if i == 0:
+                                print(f"[MUSIC DEBUG] Sample 0: K_hat={K_hat}, phi={phi_all_deg}, theta={theta_all_deg}", flush=True)
+                                print(f"[MUSIC DEBUG] GT: K={k_true}, phi_gt={phi_gt[:k_true]}, theta_gt={theta_gt[:k_true]}", flush=True)
+                            
                         except Exception as e:
-                            if getattr(cfg, "MUSIC_DEBUG", False):
-                                print(f"[MUSIC] Warning: angle_pipeline failed: {e}")
+                            # ALWAYS print first failure to help debug
+                            if i == 0 or getattr(cfg, "MUSIC_DEBUG", False):
+                                import traceback
+                                print(f"[MUSIC] Warning: angle_pipeline failed for sample {i}: {e}")
+                                if i == 0:
+                                    traceback.print_exc()
                     # MDL baseline on effective covariance (same path used by inference)
                     try:
                         # Build R_pred from factors if available
