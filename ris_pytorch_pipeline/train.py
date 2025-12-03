@@ -257,6 +257,55 @@ class Trainer:
         self._batches_seen = 0
 
     # ----------------------------
+    # Reproducibility
+    # ----------------------------
+    def _save_run_config(self, epochs, n_train, n_val, grad_accumulation, early_stop_patience):
+        """Save run configuration for reproducibility."""
+        import json
+        import subprocess
+        
+        # Get git commit hash if available
+        try:
+            commit_hash = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).parent.parent),
+                stderr=subprocess.DEVNULL
+            ).decode().strip()[:8]
+        except:
+            commit_hash = "unknown"
+        
+        run_config = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "git_commit": commit_hash,
+            "seed": int(getattr(mdl_cfg, "SEED", 42)),
+            "epochs": epochs,
+            "n_train": n_train,
+            "n_val": n_val,
+            "grad_accumulation": grad_accumulation,
+            "early_stop_patience": early_stop_patience,
+            "val_primary": str(getattr(cfg, "VAL_PRIMARY", "surrogate")),
+            "use_music_in_val": bool(getattr(cfg, "USE_MUSIC_METRICS_IN_VAL", False)),
+            "model_config": {
+                "D_MODEL": mdl_cfg.D_MODEL,
+                "NUM_HEADS": mdl_cfg.NUM_HEADS,
+                "DROPOUT": mdl_cfg.DROPOUT,
+                "LR_INIT": mdl_cfg.LR_INIT,
+                "BATCH_SIZE": mdl_cfg.BATCH_SIZE,
+            },
+            "system_config": {
+                "N_H": cfg.N_H,
+                "N_V": cfg.N_V,
+                "K_MAX": cfg.K_MAX,
+                "HYBRID_COV_BETA": getattr(cfg, "HYBRID_COV_BETA", 0.0),
+            }
+        }
+        
+        config_path = Path(cfg.CKPT_DIR) / "run_config.json"
+        with open(config_path, "w") as f:
+            json.dump(run_config, f, indent=2)
+        print(f"📋 Run config saved to: {config_path}")
+        print(f"   Git commit: {commit_hash}, Seed: {run_config['seed']}, VAL_PRIMARY: {run_config['val_primary']}")
+
+    # ----------------------------
     # HPO integration
     # ----------------------------
     def _apply_hpo_to_mdl_cfg(self, best: Dict[str, Any]):
@@ -1729,18 +1778,9 @@ class Trainer:
                                 print(f"[MUSIC] Warning: angle_pipeline failed for sample {i}: {e}")
                                 if i == 0:
                                     traceback.print_exc()
-                    # MDL baseline on effective covariance (same path used by inference)
+                    # MDL baseline on PURE R_samp (classical baseline, no network)
+                    # This shows what MDL achieves without any neural network help
                     try:
-                        # Build R_pred from factors if available
-                        R_pred = None
-                        if "cov_fact_angle" in preds:
-                            N = cfg.N_H * cfg.N_V
-                            cf_ang = preds["cov_fact_angle"][i].detach().cpu().numpy()
-                            cf_ang_real = cf_ang[:N * cfg.K_MAX].reshape(N, cfg.K_MAX)
-                            cf_ang_imag = cf_ang[N * cfg.K_MAX:].reshape(N, cfg.K_MAX)
-                            cf_cplx = cf_ang_real + 1j * cf_ang_imag
-                            R_pred = cf_cplx @ cf_cplx.conj().T  # [N, N]
-                        # Optional R_samp from dataset
                         R_samp_raw = None
                         if R_samp is not None:
                             Ri = R_samp[i].detach().cpu().numpy()
@@ -1748,20 +1788,22 @@ class Trainer:
                                 R_samp_raw = Ri[..., 0] + 1j * Ri[..., 1]
                             else:
                                 R_samp_raw = Ri.astype(np.complex64)
-                        beta = getattr(cfg, "HYBRID_COV_BETA", 0.0)
-                        R_eff = build_effective_cov_np(
-                            R_pred if R_pred is not None else (R_samp_raw if R_samp_raw is not None else None),
-                            R_samp=R_samp_raw if (R_pred is not None and R_samp_raw is not None and beta > 0.0) else None,
-                            beta=float(beta) if (R_pred is not None and R_samp_raw is not None and beta > 0.0) else None,
-                            diag_load=True, apply_shrink=False, snr_db=None,
-                            target_trace=float(cfg.N_H * cfg.N_V),
-                        )
-                        T_snap = int(C[i].shape[0]) if isinstance(C, torch.Tensor) else int(C[i].shape[0])
-                        k_mdl = estimate_k_ic_from_cov(R_eff, T_snap, method="mdl", kmax=cfg.K_MAX)
-                        if (k_mdl is None) or (k_mdl <= 0):
-                            k_mdl = estimate_k_ic_from_cov(R_eff, T_snap, method="aic", kmax=cfg.K_MAX)
-                        if int(k_mdl) == int(k_true):
-                            k_mdl_correct += 1
+                        
+                        if R_samp_raw is not None:
+                            # Build R_eff from PURE R_samp (no network R_pred!)
+                            R_eff_mdl = build_effective_cov_np(
+                                R_samp_raw,  # Use R_samp directly, not R_pred
+                                R_samp=None,  # No blending
+                                beta=None,
+                                diag_load=True, apply_shrink=False, snr_db=None,
+                                target_trace=float(cfg.N_H * cfg.N_V),
+                            )
+                            T_snap = int(C[i].shape[0]) if isinstance(C, torch.Tensor) else int(C[i].shape[0])
+                            k_mdl = estimate_k_ic_from_cov(R_eff_mdl, T_snap, method="mdl", kmax=cfg.K_MAX)
+                            if (k_mdl is None) or (k_mdl <= 0):
+                                k_mdl = estimate_k_ic_from_cov(R_eff_mdl, T_snap, method="aic", kmax=cfg.K_MAX)
+                            if int(k_mdl) == int(k_true):
+                                k_mdl_correct += 1
                     except Exception as e:
                         if getattr(cfg, "MUSIC_DEBUG", False):
                             print(f"[MDL] baseline failed: {e}")
@@ -2011,6 +2053,9 @@ class Trainer:
 
         if not use_shards:
             raise RuntimeError("This pipeline requires pregenerated shards.")
+        
+        # Save reproducibility info
+        self._save_run_config(epochs, n_train, n_val, grad_accumulation, early_stop_patience)
         
         # Set beta warmup based on total epochs (20% warmup)
         self.beta_warmup_epochs = max(2, int(0.2 * epochs))
