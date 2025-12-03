@@ -72,18 +72,24 @@ class GPUMusicEstimator:
         self.r_min = float(getattr(cfg, "R_MIN", 0.5))
         self.r_max = float(getattr(cfg, "R_MAX", 10.0))
         
-        # Pre-compute element positions (centered UPA, in wavelengths)
+        # Pre-compute element positions (centered UPA), in BOTH wavelengths and meters
         # Matches physics.py convention exactly
-        h_idx = torch.arange(-(self.N_H - 1)//2, (self.N_H + 1)//2, dtype=torch.float32) * self.d_h
-        v_idx = torch.arange(-(self.N_V - 1)//2, (self.N_V + 1)//2, dtype=torch.float32) * self.d_v
+        h_idx_wl = torch.arange(-(self.N_H - 1)//2, (self.N_H + 1)//2, dtype=torch.float32) * self.d_h  # wavelengths
+        v_idx_wl = torch.arange(-(self.N_V - 1)//2, (self.N_V + 1)//2, dtype=torch.float32) * self.d_v  # wavelengths
+        h_idx_m  = h_idx_wl * self.lam  # meters
+        v_idx_m  = v_idx_wl * self.lam  # meters
         
         # Mesh grid with xy indexing (matches physics.py)
-        h_mesh, v_mesh = torch.meshgrid(h_idx, v_idx, indexing='xy')
-        self.h_flat = h_mesh.reshape(-1).to(self.device)  # [N]
-        self.v_flat = v_mesh.reshape(-1).to(self.device)  # [N]
+        h_mesh_wl, v_mesh_wl = torch.meshgrid(h_idx_wl, v_idx_wl, indexing='xy')
+        h_mesh_m,  v_mesh_m  = torch.meshgrid(h_idx_m,  v_idx_m,  indexing='xy')
+        # Flatten
+        self.h_flat = h_mesh_wl.reshape(-1).to(self.device)  # [N] wavelengths (for far-field)
+        self.v_flat = v_mesh_wl.reshape(-1).to(self.device)  # [N] wavelengths
+        self.h_flat_m = h_mesh_m.reshape(-1).to(self.device)  # [N] meters (for near-field)
+        self.v_flat_m = v_mesh_m.reshape(-1).to(self.device)  # [N] meters
         
-        # Pre-compute h^2 + v^2 for near-field (avoid recomputation)
-        self.hv_sq = (self.h_flat**2 + self.v_flat**2).to(self.device)  # [N]
+        # Pre-compute h^2 + v^2 for near-field (meters^2)
+        self.hv_sq_m = (self.h_flat_m**2 + self.v_flat_m**2).to(self.device)  # [N]
         
         # Pre-compute exchange matrices for FBA
         self._J = self._build_exchange_matrix().to(self.device)
@@ -171,14 +177,14 @@ class GPUMusicEstimator:
         cos_theta = torch.cos(theta_rad)  # [G_theta]
         sin_theta = torch.sin(theta_rad)  # [G_theta]
         
-        # Planar term: h * sin_phi * cos_theta + v * sin_theta
+        # Planar term IN METERS: h * sin_phi * cos_theta + v * sin_theta
         phi_theta = sin_phi[:, None] * cos_theta[None, :]  # [G_phi, G_theta]
-        h_term = phi_theta[:, :, None] * self.h_flat[None, None, :]  # [G_phi, G_theta, N]
-        v_term = sin_theta[None, :, None] * self.v_flat[None, None, :]  # [1, G_theta, N]
-        planar = h_term + v_term  # [G_phi, G_theta, N]
+        h_term = phi_theta[:, :, None] * self.h_flat_m[None, None, :]  # [G_phi, G_theta, N]
+        v_term = sin_theta[None, :, None] * self.v_flat_m[None, None, :]  # [1, G_theta, N]
+        planar = h_term + v_term  # [G_phi, G_theta, N] (meters)
         
-        # Near-field curvature term: (h^2 + v^2) / (2*r)
-        curvature = self.hv_sq[None, None, :] / (2 * r_eff)  # [1, 1, N]
+        # Near-field curvature term IN METERS: (h^2 + v^2) / (2*r)
+        curvature = self.hv_sq_m[None, None, :] / (2 * r_eff)  # [1, 1, N]
         
         # dist = r - planar + curvature
         # phase = k0 * (r - dist) = k0 * (planar - curvature)
@@ -207,13 +213,13 @@ class GPUMusicEstimator:
         cos_theta = torch.cos(theta_rad)[:, None]  # [B, 1]
         sin_theta = torch.sin(theta_rad)[:, None]  # [B, 1]
         
-        # h_flat, v_flat: [N]
-        h = self.h_flat[None, :]  # [1, N]
-        v = self.v_flat[None, :]  # [1, N]
+        # h_flat_m, v_flat_m: [N] in meters
+        h_m = self.h_flat_m[None, :]  # [1, N]
+        v_m = self.v_flat_m[None, :]  # [1, N]
         
-        # Planar + curvature
-        planar = h * sin_phi * cos_theta + v * sin_theta  # [B, N]
-        curvature = self.hv_sq[None, :] / (2 * r_eff)  # [B, N]
+        # Planar + curvature (both in meters)
+        planar = h_m * sin_phi * cos_theta + v_m * sin_theta  # [B, N]
+        curvature = self.hv_sq_m[None, :] / (2 * r_eff)  # [B, N]
         
         phase = self.k0 * (planar - curvature)  # [B, N]
         A = torch.exp(1j * phase) / np.sqrt(self.N)
