@@ -1944,8 +1944,9 @@ class Trainer:
             metrics = None
             if not skip_music_val and ((ep + 1) % val_every == 0 or ep == epochs - 1):
                 try:
-                    # Limit to fewer samples for HPO speed (50 samples max)
-                    hpo_max_batches = min(max_val_batches or 50, 10) if skip_music_val else (max_val_batches or 50)
+                    # Limit validation batches for speed (GPU MUSIC makes this fast)
+                    # Use 20 batches (~20 samples with BS=1 or ~1600 with BS=80) for good metrics
+                    hpo_max_batches = max_val_batches or 20
                     if self.swa_started:
                         self._swa_swap_in()
                         metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)

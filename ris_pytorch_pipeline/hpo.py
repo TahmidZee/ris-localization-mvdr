@@ -230,8 +230,8 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
                 gpu_cache=True,         # Critical for HPO speed
                 grad_accumulation=1,    # REDUCED from 2 (was 256 effective batch, too smooth)
                 early_stop_patience=early_stop_patience,  # Stop if no improvement for N epochs
-                val_every=3,            # Only run full validation every 3 epochs (faster HPO)
-                skip_music_val=True,    # Skip slow MUSIC-based metrics during HPO
+                val_every=2,            # Run validation every 2 epochs (balance speed vs metric tracking)
+                skip_music_val=False,   # KEEP MUSIC! Use GPU MUSIC (10-20x faster) to optimize real metrics
             )
             # CRITICAL FIX: Handle None/inf values in print
             if best_val is None or not np.isfinite(best_val):
