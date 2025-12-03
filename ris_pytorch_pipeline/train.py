@@ -1515,10 +1515,11 @@ class Trainer:
                                 # angle_pipeline_gpu uses build_effective_cov_np internally
                                 # This ensures K-head and MUSIC see the SAME R_eff
                                 hybrid_beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.3))
-                                phi_music, theta_music, _ = angle_pipeline_gpu(
+                                phi_music, theta_music, info_music = angle_pipeline_gpu(
                                     cf_ang_complex, K_hat, cfg,
                                     use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
-                                    use_2_5d=False,  # 2D only for speed
+                                    use_2_5d=True,  # Enable 2.5D so range is estimated for gating
+                                    r_planes=getattr(cfg, "MUSIC_R_PLANES", None),
                                     grid_phi=91,     # Coarser grid for validation speed
                                     grid_theta=61,
                                     peak_refine=True,
@@ -1543,6 +1544,12 @@ class Trainer:
                             # Use MUSIC+Newton refined estimates directly
                             phi_all_deg = np.array(phi_music, dtype=np.float32)
                             theta_all_deg = np.array(theta_music, dtype=np.float32)
+                            # If GPU MUSIC provided range estimates, use them for gating (instead of network r)
+                            try:
+                                if use_gpu_music and (info_music is not None) and ("r_est" in info_music):
+                                    r_all_np = np.array(info_music["r_est"], dtype=np.float32)
+                            except Exception:
+                                pass
                             
                             # Debug: print first sample's MUSIC output
                             if i == 0:
