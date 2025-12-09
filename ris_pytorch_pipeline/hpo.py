@@ -119,7 +119,7 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
         lam_cov    = trial.suggest_float("lam_cov", 0.10, 0.25)     # Covariance learning weight (keep)
         lam_ang    = trial.suggest_float("lam_ang", 0.50, 1.00)     # Angle weight (keep)
         lam_rng    = trial.suggest_float("lam_rng", 0.30, 0.60)     # Range weight (keep)
-        lam_K      = trial.suggest_float("lam_K", 0.05, 0.25)       # K-head: allow higher top-end to fight underestimation
+        lam_K      = trial.suggest_float("lam_K", 0.05, 0.30)       # widen top-end to 0.30 to reduce K_under if needed
         # lam_cross, lam_gap computed from lam_cov in no-curriculum path (train.py)
         # Target: lam_cross ≈ (2-3)e-3 * lam_cov, lam_gap ≈ (0.05-0.08) * lam_cov
         shrink_alpha = trial.suggest_float("shrink_alpha", 0.10, 0.20)  # Tightened from [0.10, 0.25]

@@ -23,22 +23,22 @@ def main():
     print("=" * 80)
     print()
     
-    # Configuration
+    # Configuration (jittered dataset for robustness; clean set preserved as data_shards_M64_L16_clean)
     SHARD_DIR = Path("data_shards_M64_L16")
     N_TRAIN = 100000
     N_VAL = 10000
     N_TEST = 10000
     SHARD_SIZE = 25000
     SEED = 42
-    ETA = 0.0  # No element perturbation
+    ETA = 0.0  # keep element perturbation off; use domain randomization instead
     L = 16     # L=16 snapshots
     
-    # Robust training ranges
+    # Robust training ranges (wider low-SNR tail)
     PHI_FOV = 60.0
     THETA_FOV = 30.0
     R_MIN = 0.5
     R_MAX = 10.0
-    SNR_MIN = -5.0
+    SNR_MIN = -8.0
     SNR_MAX = 20.0
     
     print("Configuration:")
@@ -77,14 +77,23 @@ def main():
     print()
     
     # Step 3: Set sampling overrides
-    print("Step 3: Configuring sampling parameters...")
+    print("Step 3: Configuring sampling parameters (with domain randomization)...")
     mdl_cfg.TRAIN_PHI_FOV_DEG = PHI_FOV
     mdl_cfg.TRAIN_THETA_FOV_DEG = THETA_FOV
     mdl_cfg.TRAIN_R_MIN_MAX = (R_MIN, R_MAX)
     mdl_cfg.SNR_DB_RANGE = (SNR_MIN, SNR_MAX)
     mdl_cfg.SNR_TARGETED = True
+    # Domain randomization / jitter
+    mdl_cfg.DR_ENABLED = True
+    mdl_cfg.DR_PHASE_SIGMA = 0.04        # ~2.3 deg phase jitter
+    mdl_cfg.DR_AMP_JITTER = 0.05         # ±5% amplitude jitter
+    mdl_cfg.DR_DROPOUT_P = 0.03          # 3% element dropout
+    mdl_cfg.DR_WAVELEN_JITTER = 0.002    # small wavelength jitter
+    mdl_cfg.DR_DSPACING_JITTER = 0.005   # small spacing jitter
+    mdl_cfg.GRID_OFFSET_ENABLED = True   # small codebook phase offsets
+    mdl_cfg.GRID_OFFSET_FRAC = 0.5
     set_sampling_overrides_from_cfg(mdl_cfg)
-    print("  ✓ Sampling overrides configured")
+    print("  ✓ Sampling overrides configured (DR + grid offset enabled)")
     print()
     
     # Step 4: Generate shards
