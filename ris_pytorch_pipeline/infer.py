@@ -9,7 +9,7 @@ import json
 
 def _load_hpo_best_dict(p=None):
     if p is None:
-        p = getattr(cfg, 'HPO_BEST_JSON', "results_final/hpo/best.json")
+        p = getattr(cfg, 'HPO_BEST_JSON', str(Path(getattr(cfg, "HPO_DIR", cfg.RESULTS_DIR)) / "best.json"))
     p = Path(p)
     if not p.exists():
         return {}
@@ -32,7 +32,7 @@ def _infer_knobs_from_hpo(hpo_json=None):
     
     return knobs
 
-def _load_model_arch_from_hpo(hpo_json="results_final/hpo/best.json"):
+def _load_model_arch_from_hpo(hpo_json=None):
     """Load model architecture parameters from HPO results"""
     best = _load_hpo_best_dict(hpo_json)
     params = best.get("params", {})
@@ -169,7 +169,7 @@ def newton_refine(phi0, theta0, r0, Un, iters=None, lr=None):
     return float(phi), float(theta), float(r)
 
 def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
-                         do_newton=True, use_hpo_knobs=True, hpo_json="results_final/hpo/best.json",
+                         do_newton=True, use_hpo_knobs=True, hpo_json=None,
                          prefer_logits=True):
     # --- HPO knobs (safe for inference only) ---
     knobs = _infer_knobs_from_hpo(hpo_json) if use_hpo_knobs else dict(
@@ -234,21 +234,42 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     Rhat /= (np.trace(Rhat).real + 1e-9)
     Rhat = shrink(Rhat, sample.get("snr_db", 10.0), base=mdl_cfg.SHRINK_BASE_ALPHA)
 
-    # --- prefer model's own K logits if present (with calibration) ---
-    if "k_logits" in pred:
+    # --- prefer model's own K logits if present ---
+    k_from_logits, nn_conf = None, 0.0
+    k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
+    if k_mode == "ordinal" and ("k_ord_logits" in pred):
+        ord_logits = pred["k_ord_logits"][0].detach().cpu()  # [K_MAX-1]
+        probs = torch.sigmoid(ord_logits)
+        thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
+        k_from_logits = int(1 + int((probs > thr).sum().item()))
+        # confidence heuristic in [0,1]: 1 means far from 0.5 thresholds
+        nn_conf = float((torch.mean(torch.abs(probs - 0.5)) * 2.0).clamp(0.0, 1.0).item())
+    elif "k_logits" in pred:
         k_temp = getattr(model, '_k_calibration_temp', 1.0)
-        k_logits_scaled = pred["k_logits"][0].detach().cpu() / k_temp
+        k_logits_scaled = pred["k_logits"][0].detach().cpu() / max(float(k_temp), 1e-6)
         pK = torch.softmax(k_logits_scaled, -1).numpy()
         k_from_logits = int(np.argmax(pK)) + 1  # Map from class index (0-4) to K (1-5)
         nn_conf = float(np.max(pK))
-    else:
-        k_from_logits, nn_conf = None, 0.0
 
     T_snap = int(sample["codes"].shape[0])
-    # Compute MDL/AIC baseline K on Rhat (same object used for IC)
-    K_mdl = estimate_k_ic_from_cov(Rhat, T_snap, method="mdl", kmax=cfg.K_MAX)
-    if K_mdl == 0:
-        K_mdl = estimate_k_ic_from_cov(Rhat, T_snap, method="aic", kmax=cfg.K_MAX)
+    # Prefer MDL/AIC on measurement-domain covariance (M×M) — much more stable when L is small.
+    K_mdl = None
+    try:
+        # y is torch complex [1, L, M]
+        y_np = y.detach().cpu().numpy()[0]  # [L, M] complex
+        Ryy = (y_np.conj().T @ y_np) / max(T_snap, 1)  # [M, M]
+        Ryy = 0.5 * (Ryy + Ryy.conj().T)
+        # Apply shrinkage like other inference covariances
+        Ryy = shrink(Ryy, sample.get("snr_db", 10.0), base=mdl_cfg.SHRINK_BASE_ALPHA)
+        kmax_eff = min(int(cfg.K_MAX), int(Ryy.shape[0]) - 1)
+        K_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="mdl", kmax=kmax_eff)
+        if K_mdl == 0:
+            K_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="aic", kmax=kmax_eff)
+    except Exception:
+        # Fallback to old behavior if anything goes wrong
+        K_mdl = estimate_k_ic_from_cov(Rhat, T_snap, method="mdl", kmax=cfg.K_MAX)
+        if K_mdl == 0:
+            K_mdl = estimate_k_ic_from_cov(Rhat, T_snap, method="aic", kmax=cfg.K_MAX)
     K_mdl = int(max(1, min(K_mdl, cfg.K_MAX, int(cfg.L)-1)))
 
     if force_K is not None:
@@ -360,15 +381,21 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
     with torch.no_grad():
         pred = model(to_ri_t(y), to_ri_t(H), to_ri_t(codes), R_samp=R_samp_t)
 
-    # K from logits
+    # K from model head (match K_HEAD_MODE; keep softmax fallback for legacy checkpoints)
     if force_K is not None:
         K_hat = int(force_K)
     else:
-        if "k_logits" in pred:
+        k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
+        if k_mode == "ordinal" and ("k_ord_logits" in pred):
+            probs = torch.sigmoid(pred["k_ord_logits"][0].detach().cpu())
+            thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
+            k_from_head = int(1 + int((probs > thr).sum().item()))
+            K_hat = int(np.clip(k_from_head, 1, cfg.K_MAX))
+        elif "k_logits" in pred:
             k_temp = getattr(model, '_k_calibration_temp', 1.0)
-            pK = torch.softmax(pred["k_logits"][0] / k_temp, -1)
+            pK = torch.softmax(pred["k_logits"][0] / max(float(k_temp), 1e-6), -1)
             k_from_logits = int(torch.argmax(pK).item()) + 1  # Map from class index to K
-            K_hat = min(max(1, k_from_logits), cfg.K_MAX) if prefer_logits else max(1, int(cfg.K_MAX/2))
+            K_hat = int(np.clip(k_from_logits, 1, cfg.K_MAX)) if prefer_logits else max(1, int(cfg.K_MAX/2))
         else:
             K_hat = 1
 

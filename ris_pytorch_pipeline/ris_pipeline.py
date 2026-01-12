@@ -15,7 +15,7 @@ def main():
     g1.add_argument("--eta", type=float, default=0.05)
     g1.add_argument("--L", type=int, default=None)
     g1.add_argument("--seed", type=int, default=42)
-    g1.add_argument("--out_dir", type=str, default="results_final/data/shards")
+    g1.add_argument("--out_dir", type=str, default=str(getattr(cfg, "DATA_SHARDS_DIR", "results_final/data/shards")))
 
     # robust-track knobs for pregen
     for g in (g1,):
@@ -43,7 +43,7 @@ def main():
     g1s.add_argument("--eta", type=float, default=0.05)
     g1s.add_argument("--L", type=int, default=None)
     g1s.add_argument("--seed", type=int, default=42)
-    g1s.add_argument("--out_dir", type=str, default="results_final/data/shards")
+    g1s.add_argument("--out_dir", type=str, default=str(getattr(cfg, "DATA_SHARDS_DIR", "results_final/data/shards")))
     # same robust args
     for g in (g1s,):
         g.add_argument("--phi-fov-deg", type=float, default=60.0)
@@ -105,9 +105,10 @@ def main():
 
     args = parser.parse_args()
     Path(cfg.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    Path("results_final/models").mkdir(parents=True, exist_ok=True)
-    Path("results_final/benches").mkdir(parents=True, exist_ok=True)
-    Path("results_final/figs").mkdir(parents=True, exist_ok=True)
+    # Keep all pipeline artifacts under cfg.RESULTS_DIR for consistency.
+    Path(cfg.RESULTS_DIR, "models").mkdir(parents=True, exist_ok=True)
+    Path(cfg.RESULTS_DIR, "benches").mkdir(parents=True, exist_ok=True)
+    Path(cfg.RESULTS_DIR, "figs").mkdir(parents=True, exist_ok=True)
 
     # ---- command router ----
     if args.cmd in ("pregen","pregen-split"):
@@ -156,7 +157,7 @@ def main():
         from .infer import load_model
         from .benchmark import run_bench_csv
         m = load_model()
-        out_csv = Path("results_final/benches") / f"{args.tag}.csv"
+        out_csv = Path(cfg.RESULTS_DIR) / "benches" / f"{args.tag}.csv"
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         run_bench_csv(m, n=args.n, oracle=False, outf=str(out_csv))
 

@@ -658,40 +658,76 @@ class UltimateHybridLoss(nn.Module):
         loss_margin = self._subspace_margin_regularizer(R_hat, K_true) if (self.lam_margin > 0.0) else torch.tensor(0.0, device=device)
 
         loss_K = torch.tensor(0.0, device=device)
-        if self.lam_K > 0.0 and ("k_logits" in y_pred):
+        k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
+        if self.lam_K > 0.0 and k_mode == "ordinal" and ("k_ord_logits" in y_pred):
+            # Ordinal / cumulative K: logits for P(K>t), t=1..K_MAX-1
+            ord_logits = y_pred["k_ord_logits"].to(device)  # [B, K_MAX-1]
+            assert ord_logits.shape[-1] == cfg.K_MAX - 1, f"Expected k_ord_logits dim {cfg.K_MAX-1}, got {ord_logits.shape}"
+            assert K_true.min() >= 1 and K_true.max() <= cfg.K_MAX, \
+                f"K labels out of range: min={K_true.min()}, max={K_true.max()}, expected [1, {cfg.K_MAX}]"
+
+            # targets: y_t = 1 if K_true > t else 0, for t=1..K_MAX-1
+            t_grid = torch.arange(1, cfg.K_MAX, device=device).view(1, -1)  # [1, K_MAX-1]
+            tgt_ord = (K_true.view(-1, 1) > t_grid).float()  # [B, K_MAX-1]
+
+            # Cost-sensitive weighting: underestimation == false negatives on these ordinal tasks.
+            w_under = float(getattr(mdl_cfg, "K_UNDER_WEIGHT", 2.0))
+            w_over = float(getattr(mdl_cfg, "K_OVER_WEIGHT", 1.0))
+            bce = F.binary_cross_entropy_with_logits(ord_logits, tgt_ord, reduction="none")  # [B, K_MAX-1]
+            weights = tgt_ord * w_under + (1.0 - tgt_ord) * w_over
+            loss_K = (weights * bce).mean()
+
+            if not hasattr(self, '_k_loss_debug_printed'):
+                with torch.no_grad():
+                    probs = torch.sigmoid(ord_logits)
+                    thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
+                    k_pred = 1 + (probs > thr).sum(dim=-1)
+                print(f"[K-LOSS DEBUG][ordinal] lam_K={self.lam_K:.3f}, BCE_w={loss_K.item():.4f}, lam_K*BCE={self.lam_K*loss_K.item():.4f}")
+                print(f"[K-LOSS DEBUG][ordinal] K_true dist: {[int((K_true==k).sum()) for k in range(1, cfg.K_MAX+1)]}")
+                print(f"[K-LOSS DEBUG][ordinal] K_pred dist: {[int((k_pred==k).sum()) for k in range(1, cfg.K_MAX+1)]}")
+                self._k_loss_debug_printed = True
+
+        elif self.lam_K > 0.0 and ("k_logits" in y_pred):
+            # Softmax K (legacy): 5-way classification over K in {1..K_MAX}
             logits = y_pred["k_logits"].to(device)
             C = logits.shape[-1]
-            
+
             # CRITICAL UNIT TEST: Verify K labels and head dimensions match
             assert C == cfg.K_MAX, f"K-head output ({C}) != K_MAX ({cfg.K_MAX})"
             assert K_true.min() >= 1 and K_true.max() <= cfg.K_MAX, \
                 f"K labels out of range: min={K_true.min()}, max={K_true.max()}, expected [1, {cfg.K_MAX}]"
-            
+
             # K ranges from 1 to K_MAX, so we map to 0-indexed classes: K-1
             tgt = (K_true - 1).clamp_min(0).clamp_max(C - 1)
-            
+
             # Phase 2: Add label smoothing (0.05) for better K-head generalization
             label_smoothing = getattr(mdl_cfg, "K_LABEL_SMOOTHING", 0.05)
-            
+
             # COST-SENSITIVE K LOSS: Penalize underestimation more than overestimation
-            # Underestimation (K_hat < K_true) causes missed sources → worse than false alarms
             w_under = float(getattr(mdl_cfg, "K_UNDER_WEIGHT", 2.0))  # default 2x penalty
             w_over = float(getattr(mdl_cfg, "K_OVER_WEIGHT", 1.0))    # default 1x (no extra penalty)
-            
+
             # Compute per-sample CE (no reduction)
             ce_per_sample = F.cross_entropy(logits, tgt, label_smoothing=label_smoothing, reduction='none')  # [B]
-            
-            # Compute K_hat from logits (no grad needed)
+
             with torch.no_grad():
                 k_pred = logits.argmax(dim=-1)  # 0-indexed
-                # Compare with 0-indexed target
-                under_mask = (k_pred < tgt).float()  # underestimation
-                over_mask = (k_pred > tgt).float()   # overestimation
+                under_mask = (k_pred < tgt).float()
+                over_mask = (k_pred > tgt).float()
                 correct_mask = (k_pred == tgt).float()
-                # Weight vector: 1.0 for correct, w_under for under, w_over for over
                 sample_weights = correct_mask + w_under * under_mask + w_over * over_mask
-            
+
             loss_K = (sample_weights * ce_per_sample).mean()
+
+            if not hasattr(self, '_k_loss_debug_printed'):
+                ce_raw = F.cross_entropy(logits, tgt, reduction='mean').item()
+                print(f"[K-LOSS DEBUG] lam_K={self.lam_K:.3f}, CE_raw={ce_raw:.4f}, "
+                      f"CE_weighted={loss_K.item():.4f}, lam_K*CE={self.lam_K * loss_K.item():.4f}")
+                print(f"[K-LOSS DEBUG] K_true dist: {[int((K_true==k).sum()) for k in range(1, cfg.K_MAX+1)]}")
+                print(f"[K-LOSS DEBUG] K_pred dist: {[int((k_pred==k).sum()) for k in range(cfg.K_MAX)]}")
+                print(f"[K-LOSS DEBUG] logits mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
+                print(f"[K-LOSS DEBUG] sample_weights mean={sample_weights.mean().item():.4f}")
+                self._k_loss_debug_printed = True
 
         # Aux: wrapped Huber on angles + Huber on log-range
         phi_huber = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
@@ -765,6 +801,19 @@ class UltimateHybridLoss(nn.Module):
             + self.lam_subspace_align * loss_subspace_align  # NEW: Subspace alignment loss
             + self.lam_peak_contrast * loss_peak_contrast     # NEW: Peak contrast loss
         )
+        
+        # CRITICAL DEBUG: Log loss breakdown (once per run)
+        if not hasattr(self, '_loss_breakdown_printed'):
+            k_contrib = self.lam_K * loss_K.item() if isinstance(loss_K, torch.Tensor) else 0
+            aux_contrib = self.lam_aux * aux_l2.item() if isinstance(aux_l2, torch.Tensor) else 0
+            cov_contrib = self.lam_cov * loss_nmse.item() if isinstance(loss_nmse, torch.Tensor) else 0
+            print(f"[LOSS BREAKDOWN] total={total.item():.4f}")
+            print(f"  lam_cov*nmse    = {self.lam_cov:.3f} * {loss_nmse.item():.4f} = {cov_contrib:.4f}")
+            print(f"  lam_K*loss_K    = {self.lam_K:.3f} * {loss_K.item():.4f} = {k_contrib:.4f}")
+            print(f"  lam_aux*aux_l2  = {self.lam_aux:.3f} * {aux_l2.item():.4f} = {aux_contrib:.4f}")
+            print(f"  Expected K-contrib at chance: {self.lam_K:.3f} * ln(5) ≈ {self.lam_K * 1.609:.4f}")
+            self._loss_breakdown_printed = True
+        
         return total
 
     @torch.no_grad()

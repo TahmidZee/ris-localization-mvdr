@@ -13,8 +13,8 @@ from .baseline import (
 )
 from .configs import cfg
 
-TEST_DIR = Path("results_final/data/shards/test")
-BENCH_DIR = Path("results_final/benches")
+TEST_DIR = Path(getattr(cfg, "DATA_SHARDS_TEST", "results_final/data/shards/test"))
+BENCH_DIR = Path(cfg.RESULTS_DIR) / "benches"
 BENCH_DIR.mkdir(parents=True, exist_ok=True)
 
 

@@ -44,6 +44,9 @@ def collate_pad_to_kmax(batch: List[Dict[str, Any]], K_max: int) -> Dict[str, to
         elif key == "K":
             # K values and mask
             Ks = torch.as_tensor([sample["K"] for sample in batch], dtype=torch.long)  # [B]
+            # CRITICAL: enforce 1-based K (1..K_max) to match loss expectations
+            if torch.any(Ks < 1) or torch.any(Ks > K_max):
+                raise ValueError(f"K out of range in collate: min={Ks.min().item()}, max={Ks.max().item()}, expected [1,{K_max}]")
             out["K"] = Ks
             
             # Create mask: True for valid sources, False for padding
@@ -91,6 +94,9 @@ def collate_pad_to_kmax_with_snr(batch: List[Dict[str, Any]], K_max: int) -> Dic
         elif key == "K":
             # K values and mask
             Ks = torch.as_tensor([sample["K"] for sample in batch], dtype=torch.long)  # [B]
+            # CRITICAL: enforce 1-based K (1..K_max) to match loss expectations
+            if torch.any(Ks < 1) or torch.any(Ks > K_max):
+                raise ValueError(f"K out of range in collate: min={Ks.min().item()}, max={Ks.max().item()}, expected [1,{K_max}]")
             out["K"] = Ks
             
             # Create mask: True for valid sources, False for padding

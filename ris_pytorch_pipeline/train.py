@@ -131,6 +131,30 @@ class Trainer:
         # 2) Build model / loss / optimizer
         self.device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model    = HybridModel().to(self.device)
+        # Optional warm-start (weights-only). This is intentionally *before* any phase freezing
+        # so that all modules load consistently, then we apply requires_grad masks.
+        ckpt = str(getattr(cfg, "INIT_CKPT", "")).strip()
+        if ckpt:
+            from pathlib import Path
+            p = Path(ckpt)
+            if p.exists():
+                sd = torch.load(str(p), map_location="cpu")
+                if isinstance(sd, dict) and "model" in sd:
+                    sd = sd["model"]
+                missing, unexpected = self.model.load_state_dict(sd, strict=False)
+                print(f"✅ Loaded INIT_CKPT: {p} | missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+            else:
+                print(f"⚠️ INIT_CKPT not found: {p}", flush=True)
+        self.phase    = str(getattr(cfg, "TRAIN_PHASE", "geom")).lower()
+        # Apply phase-specific freezing before optimizer construction
+        if hasattr(self.model, "set_trainable_for_phase"):
+            freeze_backbone = bool(getattr(cfg, "FREEZE_BACKBONE_FOR_K_PHASE", False)) if self.phase == "k_only" else False
+            freeze_aux = bool(getattr(cfg, "FREEZE_AUX_IN_K_PHASE", False)) if self.phase == "k_only" else False
+            self.model.set_trainable_for_phase(
+                freeze_backbone=freeze_backbone,
+                freeze_aux=freeze_aux,
+                freeze_k=False,
+            )
         # Initialize loss with config values (will be updated by schedule)
         self.loss_fn = UltimateHybridLoss(
             lam_cov=1.0,  # CRITICAL: Main covariance NMSE weight (will be scaled by HPO if needed)
@@ -150,6 +174,8 @@ class Trainer:
         # Apply HPO loss weights if they were loaded
         if self._hpo_loss_weights:
             self._apply_hpo_loss_weights()
+        # Apply phase-specific loss weights (overrides defaults/HPO for the chosen phase)
+        self._apply_phase_loss_weights(self.phase)
         lr_init       = float(getattr(mdl_cfg, "LR_INIT", 3e-4))
         opt_name      = str(getattr(mdl_cfg, "OPT", "adamw")).lower()
         wd            = float(getattr(mdl_cfg, "WEIGHT_DECAY", 1e-4))
@@ -159,14 +185,24 @@ class Trainer:
         self.model.train()
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
+                # Allow intentional freezing in K-only phase
+                if self.phase == "k_only":
+                    continue
                 print(f"⚠️  Re-enabling gradients for: {n}")
                 p.requires_grad_(True)
         
         # Robust parameter grouping by name prefix
         backbone_params = []
         head_params = []
-        HEAD_KEYS = ('k_head', 'k_mlp', 'head', 'classifier', 'aux_angles', 'aux_range',
-                     'cov_fact_angle', 'cov_fact_range', 'logits_gg')
+        # Head keys used for optimizer grouping (head gets higher LR than backbone).
+        # IMPORTANT: include *all* K-head components, including the direct path and logit scale.
+        HEAD_KEYS = (
+            'k_head', 'k_mlp', 'k_direct_mlp',
+            'k_ord', 'k_direct_ord',  # ordinal heads: k_ord_mlp, k_direct_ord_mlp
+            'k_spec_proj', 'k_fuse', 'k_logit',  # K head components
+            'head', 'classifier', 'aux_angles', 'aux_range',
+            'cov_fact_angle', 'cov_fact_range', 'logits_gg'
+        )
         
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
@@ -191,9 +227,10 @@ class Trainer:
         print(f"   Head: {n_head:,} params ({n_head/1e6:.1f}M) @ LR={head_lr:.2e} ({head_lr_multiplier}×)")
         print(f"   Total trainable: {n_tot:,}")
         
-        # CRITICAL ASSERTS - catch dead groups immediately
-        assert n_back > 1_000_000, f"❌ Backbone param count too small: {n_back:,}"
-        assert n_head > 1_000_000, f"❌ Head param count too small: {n_head:,}"
+        # CRITICAL ASSERTS - catch dead groups immediately (relaxed for frozen phases)
+        if self.phase != "k_only":
+            assert n_back > 1_000_000, f"❌ Backbone param count too small: {n_back:,}"
+        assert n_head > 0, f"❌ Head param count too small: {n_head:,}"
         assert n_back + n_head == n_tot, f"❌ Group sum ({n_back + n_head:,}) != total ({n_tot:,})"
         print("   ✅ Parameter grouping verified!")
         
@@ -371,6 +408,36 @@ class Trainer:
               f"lam_off={getattr(self.loss_fn, 'lam_off', 'N/A'):.3f}, "
               f"lam_aux={getattr(self.loss_fn, 'lam_aux', 'N/A'):.3f}, "
               f"lam_K={getattr(self.loss_fn, 'lam_K', 'N/A'):.3f}")
+
+    def _apply_phase_loss_weights(self, phase: str):
+        """Apply per-phase loss weights from cfg.PHASE_LOSS if provided."""
+        phase_loss = getattr(cfg, "PHASE_LOSS", {}) or {}
+        weights = phase_loss.get(str(phase).lower(), None)
+        if not weights:
+            return
+        if "lam_cov" in weights:
+            self.loss_fn.lam_cov = float(weights["lam_cov"])
+        if "lam_subspace_align" in weights:
+            self.loss_fn.lam_subspace_align = float(weights["lam_subspace_align"])
+        if "lam_aux" in weights:
+            self.loss_fn.lam_aux = float(weights["lam_aux"])
+        if "lam_K" in weights:
+            self.loss_fn.lam_K = float(weights["lam_K"])
+        if "lam_peak_contrast" in weights:
+            self.loss_fn.lam_peak_contrast = float(weights["lam_peak_contrast"])
+        # CRITICAL: Also apply SVD-based loss weights to prevent NaN gradients
+        if "lam_gap" in weights:
+            self.loss_fn.lam_gap = float(weights["lam_gap"])
+        if "lam_margin" in weights:
+            self.loss_fn.lam_margin = float(weights["lam_margin"])
+        print(f"🎯 Applied phase '{phase}' loss weights: "
+              f"lam_cov={self.loss_fn.lam_cov:.3f}, "
+              f"lam_subspace_align={self.loss_fn.lam_subspace_align:.3f}, "
+              f"lam_aux={self.loss_fn.lam_aux:.3f}, "
+              f"lam_K={self.loss_fn.lam_K:.3f}, "
+              f"lam_peak_contrast={self.loss_fn.lam_peak_contrast:.3f}, "
+              f"lam_gap={getattr(self.loss_fn, 'lam_gap', 0):.3f}, "
+              f"lam_margin={getattr(self.loss_fn, 'lam_margin', 0):.3f}")
 
     # ----------------------------
     # EMA helpers
@@ -742,10 +809,37 @@ class Trainer:
         # Expert debug: Print LR every epoch
         lrs = [g['lr'] for g in self.opt.param_groups]
         print(f"[LR] epoch={epoch} groups={['backbone','head']} lr={lrs}", flush=True)
+        print(f"[EPOCH DEBUG] epoch={epoch} iters={iters} len(loader)={len(loader)}", flush=True)
+        print(f"[EPOCH DEBUG] entering for loop over loader...", flush=True)
+        import sys; sys.stdout.flush(); sys.stderr.flush()
 
+        # DEBUG: Try to manually get first batch
+        try:
+            print(f"[EPOCH DEBUG] testing manual iter(loader)...", flush=True)
+            test_iter = iter(loader)
+            print(f"[EPOCH DEBUG] iter() succeeded, calling next()...", flush=True)
+            test_batch = next(test_iter)
+            print(f"[EPOCH DEBUG] next() succeeded, got batch with keys: {list(test_batch.keys()) if isinstance(test_batch, dict) else 'not a dict'}", flush=True)
+            del test_iter, test_batch
+        except StopIteration:
+            print(f"[EPOCH DEBUG] StopIteration - loader is EMPTY!", flush=True)
+            return 0.0
+        except Exception as e:
+            print(f"[EPOCH DEBUG] EXCEPTION during manual iter: {type(e).__name__}: {e}", flush=True)
+            import traceback; traceback.print_exc()
+            return 0.0
+        
+        print(f"[EPOCH DEBUG] manual test passed, now doing real for loop...", flush=True)
+
+        batch_count = 0
         for bi, batch in enumerate(loader):
+            batch_count += 1
+            if batch_count == 1:
+                print(f"[EPOCH DEBUG] got first batch in for loop, bi={bi}", flush=True)
             if bi >= iters: break
             self._batches_seen += 1  # Expert fix: Track batch counter
+            if bi == 0:
+                print(f"[EPOCH DEBUG] epoch={epoch} fetching batch 0", flush=True)
             y, H, C, ptr, K, R_in, snr, H_full, R_samp = self._unpack_any_batch(batch)
             
             # CRITICAL FIX: Clear batch references to prevent memory leaks
@@ -826,14 +920,15 @@ class Trainer:
                     B = preds_fp32['cov_fact_angle'].size(0)
                     
                     # Hard assertions to catch future shape regressions fast:
-                    assert cfg.N_H * cfg.N_V == 144, "config mismatch: N != 144"
-                    assert preds_fp32['cov_fact_angle'].numel() % (B * 144) == 0
-                    assert preds_fp32['cov_fact_range'].numel() % (B * 144) == 0
+                    # Avoid hard-coding 12x12 (144). Production code should respect cfg.N.
+                    assert cfg.N_H * cfg.N_V == cfg.N, f"config mismatch: N_H*N_V={cfg.N_H*cfg.N_V} != cfg.N={cfg.N}"
+                    assert preds_fp32['cov_fact_angle'].numel() % (B * cfg.N) == 0
+                    assert preds_fp32['cov_fact_range'].numel() % (B * cfg.N) == 0
                     
                     # EXPERT FIX: Build R_pred robustly to prevent shape bugs
                     def build_R_pred_from_factors(preds, cfg):
                         B = preds['cov_fact_angle'].size(0)
-                        N = cfg.N_H * cfg.N_V  # 12*12 = 144
+                        N = cfg.N_H * cfg.N_V
                         K_MAX = cfg.K_MAX
 
                         # cov_fact_angle/range are [B, 2*N*K_MAX] with interleaved real/imag
@@ -945,6 +1040,11 @@ class Trainer:
 
         self.scaler.scale(loss).backward()
         
+        # CRITICAL: Accumulate loss for EVERY batch BEFORE optimizer step
+        batch_loss_val = float(loss.detach().item()) * grad_accumulation
+        running += batch_loss_val
+        print(f"[BATCH] ep={epoch} bi={bi} batch_loss={batch_loss_val:.4f} running={running:.4f}", flush=True)
+        
         # Only step optimizer every grad_accumulation steps
         if (bi + 1) % grad_accumulation == 0 or (bi + 1) == iters:
             # Unscale ONCE right before step
@@ -989,8 +1089,14 @@ class Trainer:
             
             # Expert fix: Improved gradient flow instrumentation
             import math
-            HEAD_KEYS = ('k_head', 'k_mlp', 'head', 'classifier', 'aux_angles', 'aux_range',
-                         'cov_fact_angle', 'cov_fact_range', 'logits_gg')
+            # Keep consistent with optimizer grouping HEAD_KEYS above.
+            HEAD_KEYS = (
+                'k_head', 'k_mlp', 'k_direct_mlp',
+                'k_ord', 'k_direct_ord',
+                'k_spec_proj', 'k_fuse', 'k_logit',
+                'head', 'classifier', 'aux_angles', 'aux_range',
+                'cov_fact_angle', 'cov_fact_range', 'logits_gg'
+            )
             
             def _group_grad_norm(params):
                 vals = [p.grad.norm(2).item() for p in params if p.grad is not None and torch.isfinite(p.grad).all()]
@@ -1019,8 +1125,9 @@ class Trainer:
             ok = (not overflow) and math.isfinite(g_total) and (g_total > 1e-12)
 
             # Expert fix: Log gradient status for ALL batches in first epoch
-            if epoch == 1:
-                print(f"[GRAD] batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow={overflow} (grads={grad_count}, none={none_count})", flush=True)
+            # DEBUG: Print for EVERY batch, not just epoch 1
+            print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow={overflow}", flush=True)
+            import sys; sys.stdout.flush(); sys.stderr.flush()
             
             # Initialize stepped flag
             stepped = False
@@ -1061,23 +1168,24 @@ class Trainer:
                 if self.swa_started:
                     self._swa_update()
 
-        running += float(loss.detach().item()) * grad_accumulation  # Undo the scaling for logging
-        
-        # CRITICAL FIX: Clear intermediate tensors to prevent memory leaks
-        del y, H, C, ptr, K, R_in, snr, R_true_c, R_true, labels, loss
+            # CRITICAL FIX: Clear intermediate tensors to prevent memory leaks
+            # NOTE: running is already accumulated BEFORE this block
+            del y, H, C, ptr, K, R_in, snr, R_true_c, R_true, labels, loss
+
+        # DEBUG: Print how many batches were processed (OUTSIDE for loop)
+        print(f"[EPOCH DEBUG] epoch={epoch} processed {batch_count} batches", flush=True)
 
         # Expert fix: Update schedulers only after actual steps
-        if stepped:
-            if self.swa_started and self.swa_scheduler is not None:
-                self.swa_scheduler.step()
-            elif self.sched is not None:
-                self.sched.step()
+        # NOTE: 'stepped' is only valid for the last batch - scheduler step happens once per epoch
+        if self.sched is not None:
+            self.sched.step()
         
         # CRITICAL FIX: Force garbage collection at end of epoch
         import gc; gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
+        print(f"[EPOCH DEBUG] epoch={epoch} done, avg_loss={running / max(1, iters):.4f}", flush=True)
         return running / max(1, iters)
 
     @torch.no_grad()
@@ -1278,9 +1386,17 @@ class Trainer:
                 total_loss += float(loss.detach().item()) * B
                 
                 # ---------- K metrics (internal, no MUSIC) ----------
-                if "k_logits" in preds:
+                k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
+                if k_mode == "ordinal" and ("k_ord_logits" in preds):
+                    probs = torch.sigmoid(preds["k_ord_logits"].float())  # [B, K_max-1]
+                    thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
+                    k_pred = 1 + (probs > thr).sum(dim=1)
+                elif "k_logits" in preds:
                     k_logits = preds["k_logits"].float()  # [B, K_max]
                     k_pred = torch.argmax(k_logits, dim=1) + 1  # 1-based
+                else:
+                    k_pred = None
+                if k_pred is not None:
                     k_true = K.cpu()
                     k_pred_cpu = k_pred.cpu()
                     k_correct += (k_pred_cpu == k_true).sum().item()
@@ -1613,8 +1729,14 @@ class Trainer:
                             from .angle_pipeline import angle_pipeline, angle_pipeline_gpu, _GPU_MUSIC_AVAILABLE
                             
                             cf_ang = preds["cov_fact_angle"][i].detach().cpu().numpy()  # [N*K_MAX*2]
-                            # NN K (with optional calibration)
-                            if "k_logits" in preds:
+                            # NN K (ordinal or softmax)
+                            k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
+                            if k_mode == "ordinal" and ("k_ord_logits" in preds):
+                                probs_i = torch.sigmoid(preds["k_ord_logits"][i]).detach().cpu().numpy()  # [K_MAX-1]
+                                thr_ord = float(getattr(cfg, "K_ORD_THRESH", 0.5))
+                                K_nn = 1 + int((probs_i > thr_ord).sum())
+                                nn_conf = float(np.mean(np.abs(probs_i - 0.5)) * 2.0)  # 0..1
+                            elif "k_logits" in preds:
                                 k_temp = float(getattr(self.model, "_k_calibration_temp", 1.0))
                                 logits_i = preds["k_logits"][i].detach().cpu().numpy() / max(k_temp, 1e-6)
                                 pK = np.exp(logits_i - np.max(logits_i)); pK = pK / np.sum(pK)
@@ -1656,27 +1778,21 @@ class Trainer:
                             cf_ang_imag = cf_ang[N * cfg.K_MAX:].reshape(N, cfg.K_MAX)
                             cf_ang_complex = cf_ang_real + 1j * cf_ang_imag
                             
-                            # MDL baseline on R_eff (same as inference) for gating
+                            # MDL baseline for gating (measurement-domain Ryy, like inference)
                             try:
-                                from .covariance_utils import build_effective_cov_np
-                                R_pred_eval = cf_ang_complex @ cf_ang_complex.conj().T
-                                R_samp_raw = None
-                                if R_samp is not None:
-                                    Ri = R_samp[i].detach().cpu().numpy()
-                                    R_samp_raw = Ri[..., 0] + 1j * Ri[..., 1] if (Ri.ndim == 3 and Ri.shape[-1] == 2) else Ri.astype(np.complex64)
-                                beta = getattr(cfg, "HYBRID_COV_BETA", 0.0)
-                                R_eff_np = build_effective_cov_np(
-                                    R_pred_eval,
-                                    R_samp=R_samp_raw if (R_samp_raw is not None and beta > 0.0) else None,
-                                    beta=float(beta) if (R_samp_raw is not None and beta > 0.0) else None,
-                                    diag_load=True, apply_shrink=False, snr_db=None,
-                                    target_trace=float(N),
-                                )
                                 from .infer import estimate_k_ic_from_cov
-                                T_snap = int(C.shape[1]) if hasattr(C, "shape") else int(cfg.L)
-                                K_mdl = estimate_k_ic_from_cov(R_eff_np, T_snap, method="mdl", kmax=cfg.K_MAX)
+                                from .physics import shrink
+                                y_i = y[i].detach().cpu().numpy()  # [L, M, 2]
+                                y_c = y_i[..., 0] + 1j * y_i[..., 1]  # [L, M]
+                                T_snap = int(y_c.shape[0])
+                                Ryy = (y_c.conj().T @ y_c) / max(T_snap, 1)
+                                Ryy = 0.5 * (Ryy + Ryy.conj().T)
+                                snr_i = float(snr[i].item()) if (snr is not None) else 10.0
+                                Ryy = shrink(Ryy, snr_i, base=getattr(mdl_cfg, "SHRINK_BASE_ALPHA", 1e-3))
+                                kmax_eff = min(int(cfg.K_MAX), int(Ryy.shape[0]) - 1)
+                                K_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="mdl", kmax=kmax_eff)
                                 if (K_mdl is None) or (K_mdl <= 0):
-                                    K_mdl = estimate_k_ic_from_cov(R_eff_np, T_snap, method="aic", kmax=cfg.K_MAX)
+                                    K_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="aic", kmax=kmax_eff)
                                 K_mdl = int(np.clip(K_mdl, 1, cfg.K_MAX))
                             except Exception:
                                 K_mdl = int(K_nn)
@@ -1745,38 +1861,38 @@ class Trainer:
                                 print(f"[MUSIC] Warning: angle_pipeline failed for sample {i}: {e}")
                                 if i == 0:
                                     traceback.print_exc()
-                    # MDL baseline on PURE R_samp (classical baseline, no network)
-                    # This shows what MDL achieves without any neural network help
+                    # MDL/AIC baseline in the MEASUREMENT domain (Ryy) — stable reference at small L.
+                    # This is the baseline we should trust for L=16 (not RIS-domain 144×144 MDL).
                     try:
-                        R_samp_raw = None
-                        if R_samp is not None:
-                            Ri = R_samp[i].detach().cpu().numpy()
-                            if Ri.ndim == 3 and Ri.shape[-1] == 2:
-                                R_samp_raw = Ri[..., 0] + 1j * Ri[..., 1]
-                            else:
-                                R_samp_raw = Ri.astype(np.complex64)
-                        
-                        if R_samp_raw is not None:
-                            # Build R_eff from PURE R_samp (no network R_pred!)
-                            R_eff_mdl = build_effective_cov_np(
-                                R_samp_raw,  # Use R_samp directly, not R_pred
-                                R_samp=None,  # No blending
-                                beta=None,
-                                diag_load=True, apply_shrink=False, snr_db=None,
-                                target_trace=float(cfg.N_H * cfg.N_V),
-                            )
-                            T_snap = int(C[i].shape[0]) if isinstance(C, torch.Tensor) else int(C[i].shape[0])
-                            k_mdl = estimate_k_ic_from_cov(R_eff_mdl, T_snap, method="mdl", kmax=cfg.K_MAX)
-                            if (k_mdl is None) or (k_mdl <= 0):
-                                k_mdl = estimate_k_ic_from_cov(R_eff_mdl, T_snap, method="aic", kmax=cfg.K_MAX)
-                            if int(k_mdl) == int(k_true):
-                                k_mdl_correct += 1
+                        from .physics import shrink
+                        y_i = y[i].detach().cpu().numpy()  # [L, M, 2]
+                        y_c = y_i[..., 0] + 1j * y_i[..., 1]  # [L, M]
+                        T_snap = int(y_c.shape[0])
+                        Ryy = (y_c.conj().T @ y_c) / max(T_snap, 1)  # [M, M]
+                        Ryy = 0.5 * (Ryy + Ryy.conj().T)
+                        snr_i = float(snr[i].item()) if (snr is not None) else 10.0
+                        Ryy = shrink(Ryy, snr_i, base=getattr(mdl_cfg, "SHRINK_BASE_ALPHA", 1e-3))
+                        kmax_eff = min(int(cfg.K_MAX), int(Ryy.shape[0]) - 1)
+                        k_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="mdl", kmax=kmax_eff)
+                        if (k_mdl is None) or (k_mdl <= 0):
+                            k_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="aic", kmax=kmax_eff)
+                        if int(k_mdl) == int(k_true):
+                            k_mdl_correct += 1
                     except Exception as e:
                         if getattr(cfg, "MUSIC_DEBUG", False):
                             print(f"[MDL] baseline failed: {e}")
                     
-                    # K metrics (compute first for success check)
-                    k_hat = int(np.clip(np.argmax(preds["k_logits"][i].detach().cpu().numpy()) + 1, 1, cfg.K_MAX)) if "k_logits" in preds else int(min(max(1, k_true), cfg.K_MAX))
+                    # K metrics (compute first for success check) — match current K_HEAD_MODE
+                    k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
+                    if k_mode == "ordinal" and ("k_ord_logits" in preds):
+                        probs_i = torch.sigmoid(preds["k_ord_logits"][i]).detach().cpu().numpy()
+                        thr_ord = float(getattr(cfg, "K_ORD_THRESH", 0.5))
+                        k_hat = int(1 + int((probs_i > thr_ord).sum()))
+                        k_hat = int(np.clip(k_hat, 1, cfg.K_MAX))
+                    elif "k_logits" in preds:
+                        k_hat = int(np.clip(np.argmax(preds["k_logits"][i].detach().cpu().numpy()) + 1, 1, cfg.K_MAX))
+                    else:
+                        k_hat = int(min(max(1, k_true), cfg.K_MAX))
                     k_true_all.append(k_true)
                     k_hat_all.append(k_hat)
                     
@@ -1895,6 +2011,11 @@ class Trainer:
         Finds optimal temperature T such that softmax(logits/T) is well-calibrated.
         """
         import torch.nn.functional as F
+
+        # Ordinal mode: we don't temperature-scale sigmoid thresholds here (different calibration).
+        if str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower() == "ordinal":
+            print("ℹ️ K_HEAD_MODE=ordinal: skipping softmax temperature calibration", flush=True)
+            return 1.0
         
         def golden_section_search(f, a, b, tol=1e-5):
             """Simple golden section search to replace scipy dependency"""
@@ -2041,6 +2162,13 @@ class Trainer:
         else:
             tr_loader, va_loader = self._build_loaders_cpu_io(n_train, n_val)
 
+        if len(tr_loader) == 0:
+            print("[TRAIN DEBUG] train loader length is 0 - aborting epoch loop", flush=True)
+            return float("inf")
+        if len(va_loader) == 0:
+            print("[TRAIN DEBUG] val loader length is 0 - aborting epoch loop", flush=True)
+            return float("inf")
+
 
         # scheduler (cosine with warmup for stability)
         train_iters = len(tr_loader) if max_train_batches is None else min(len(tr_loader), max_train_batches)
@@ -2084,34 +2212,40 @@ class Trainer:
             else:
                 phase = -1  # No curriculum phase
                 
-                # ICC CRITICAL FIX: When curriculum is OFF (HPO), set lam_cross and lam_gap explicitly
-                # Use HPO base weights with STRONGER cross/gap regularization for proper subspace structure
-                if hasattr(self, '_hpo_loss_weights'):
-                    hpo_lam_cov = self._hpo_loss_weights.get("lam_cov", 1.0)
-                    self.loss_fn.lam_cov = hpo_lam_cov  # CRITICAL: Set main covariance weight!
-                    
-                    # PURE OVERFIT: Disable structural losses when OVERFIT_NMSE_PURE is set
-                    if getattr(mdl_cfg, "OVERFIT_NMSE_PURE", False):
-                        self.loss_fn.lam_cross = 0.0
-                        self.loss_fn.lam_gap = 0.0
-                        self.loss_fn.lam_ortho = 0.0
-                        self.loss_fn.lam_peak = 0.0
-                    else:
-                        self.loss_fn.lam_cross = 2.5e-3 * hpo_lam_cov  # INCREASED from 1.5e-3: (2-3)e-3 * lam_cov for subspace shaping
-                        self.loss_fn.lam_gap = 0.065 * hpo_lam_cov     # INCREASED from 0.04: (0.05-0.08) * lam_cov for gap penalty
-                else:
-                    # No HPO weights - use default values
-                    self.loss_fn.lam_cov = 1.0  # CRITICAL: Ensure main covariance weight is set!
-                    
-                    # PURE OVERFIT: Disable structural losses when OVERFIT_NMSE_PURE is set
-                    if getattr(mdl_cfg, "OVERFIT_NMSE_PURE", False):
-                        self.loss_fn.lam_cross = 0.0
-                        self.loss_fn.lam_gap = 0.0
-                        self.loss_fn.lam_ortho = 0.0
-                        self.loss_fn.lam_peak = 0.0
+                # CRITICAL: Skip HPO overrides if we're in a phase-controlled training run
+                # Phase settings (lam_gap=0, lam_margin=0 for k_only) must be respected!
+                phase_controlled = str(getattr(cfg, "TRAIN_PHASE", "")).lower() in ("geom", "k_only", "joint")
                 
-                # Update structure loss weights (subspace align + peak contrast) based on phase
-                self._update_structure_loss_weights(ep, epochs)
+                if not phase_controlled:
+                    # ICC CRITICAL FIX: When curriculum is OFF (HPO), set lam_cross and lam_gap explicitly
+                    # Use HPO base weights with STRONGER cross/gap regularization for proper subspace structure
+                    # FIX: Check if dict is non-empty, not just if attribute exists
+                    if self._hpo_loss_weights:
+                        hpo_lam_cov = self._hpo_loss_weights.get("lam_cov", 1.0)
+                        self.loss_fn.lam_cov = hpo_lam_cov  # CRITICAL: Set main covariance weight!
+                        
+                        # PURE OVERFIT: Disable structural losses when OVERFIT_NMSE_PURE is set
+                        if getattr(mdl_cfg, "OVERFIT_NMSE_PURE", False):
+                            self.loss_fn.lam_cross = 0.0
+                            self.loss_fn.lam_gap = 0.0
+                            self.loss_fn.lam_ortho = 0.0
+                            self.loss_fn.lam_peak = 0.0
+                        else:
+                            self.loss_fn.lam_cross = 2.5e-3 * hpo_lam_cov  # INCREASED from 1.5e-3: (2-3)e-3 * lam_cov for subspace shaping
+                            self.loss_fn.lam_gap = 0.065 * hpo_lam_cov     # INCREASED from 0.04: (0.05-0.08) * lam_cov for gap penalty
+                    else:
+                        # No HPO weights - use default values
+                        self.loss_fn.lam_cov = 1.0  # CRITICAL: Ensure main covariance weight is set!
+                        
+                        # PURE OVERFIT: Disable structural losses when OVERFIT_NMSE_PURE is set
+                        if getattr(mdl_cfg, "OVERFIT_NMSE_PURE", False):
+                            self.loss_fn.lam_cross = 0.0
+                            self.loss_fn.lam_gap = 0.0
+                            self.loss_fn.lam_ortho = 0.0
+                            self.loss_fn.lam_peak = 0.0
+                    
+                    # Update structure loss weights (subspace align + peak contrast) based on phase
+                    self._update_structure_loss_weights(ep, epochs)
             
             # Phase 2: Ramp K-weight gradually (ONLY when curriculum is ON)
             # ICC FIX: Disable K-ramp during HPO for stationary objective
@@ -2132,7 +2266,9 @@ class Trainer:
             if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', True):
                 self._apply_curriculum(ep, epochs)
 
+            print(f"[EPOCH DEBUG] calling _train_one_epoch ep={ep+1}", flush=True)
             tr_loss = self._train_one_epoch(tr_loader, ep + 1, epochs, max_train_batches, grad_accumulation)
+            print(f"[EPOCH DEBUG] finished _train_one_epoch ep={ep+1} train_loss={tr_loss}", flush=True)
 
             # validate with best available model (SWA > EMA > regular)
             # Log per-term debug info every 3 epochs or last epoch
@@ -2443,10 +2579,12 @@ class Trainer:
                                 print(f"       R_samp  (rank {rank_samp}/{N}): λ₁={eigs_samp[0]/eigs_samp.sum():.3f}, top-5={eigs_samp[:5].sum()/eigs_samp.sum():.1%}", flush=True)
                                 print(f"       R_blend (rank {rank_blend}/{N}): λ₁={eigs_blend[0]/eigs_blend.sum():.3f}, top-5={eigs_blend[:5].sum()/eigs_blend.sum():.1%}", flush=True)
                                 
-                                if rank_blend > cfg.K_MAX:
+                                if blend_beta <= 0.0:
+                                    print(f"     ℹ️  Hybrid blending DISABLED (β={blend_beta:.2f}) → rank expected to stay ≤ {cfg.K_MAX}.", flush=True)
+                                elif rank_blend > cfg.K_MAX:
                                     print(f"     ✅ Hybrid blending WORKING! Rank increased from {rank_estimate} → {rank_blend}", flush=True)
                                 else:
-                                    print(f"     ❌ Hybrid blending FAILED! Rank still {rank_blend} (should be >{cfg.K_MAX})", flush=True)
+                                    print(f"     ❌ Hybrid blending INEFFECTIVE at β={blend_beta:.2f}: rank still {rank_blend} (want >{cfg.K_MAX})", flush=True)
                                     
                             except Exception as e:
                                 print(f"     ❌ Hybrid blending ERROR: {e}", flush=True)

@@ -676,12 +676,14 @@ def _chunked_music_spectrum(G, phi_grid, theta_grid, geom, chunk=4096, device="c
             phis = phi_grid[start:end]
             
             # Build steering matrix A: [batch, N]
-            # CRITICAL FIX: Use near-field steering for 0.5m-10m ranges
-            # TODO: This needs range-aware handling for multi-source scenarios
-            # For now, use a default range - this should be improved for multi-source
-            r_default = 2.0  # Default range for near-field steering
+            # NOTE:
+            # - This is the *2D* MUSIC path and is intentionally range-agnostic.
+            # - For near-field multi-source localization, use the 2.5D path
+            #   (_chunked_music_spectrum_2_5d), which searches over range planes.
+            #
+            # Therefore, in 2D mode we use a planar (far-field) steering model.
             A = np.stack([
-                _nearfield_steering(phi, theta, r_default, N_H, N_V, d_h, d_v, lam)
+                _planar_steering(phi, theta, N_H, N_V, d_h, d_v, lam)
                 for phi in phis
             ], axis=0)
             At = torch.as_tensor(A, dtype=torch.complex64, device=device)
@@ -891,7 +893,8 @@ def music2d_from_cov_factor(cf_ang, K, cfg, *, shrink=None, grid_phi=181, grid_t
             print(f"[MUSIC] 2.5D: True, range planes=[{','.join([f'{r:.1f}' for r in r_planes])}]", flush=True)
             print(f"[MUSIC] BASELINE LOCKDOWN: 2.5D ON, joint NF-Newton per peak", flush=True)
     else:
-        # 2D: Single range (legacy)
+        # 2D: Range-agnostic planar steering (far-field approximation).
+        # For near-field, keep use_2_5d=True.
         S = _chunked_music_spectrum(G_np, phi_grid_rad, theta_grid_rad, (N_H, N_V, d_h, d_v, lam), 
                                      chunk=4096, device=device)
         winning_ranges = None

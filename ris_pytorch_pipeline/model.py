@@ -206,6 +206,15 @@ class HybridModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(128, cfg.K_MAX)
         )
+
+        # Ordinal K head (recommended): logits for P(K > t), t=1..K_MAX-1
+        # Shape: [B, K_MAX-1] (for K_MAX=5 → 4 logits)
+        self.k_ord_mlp = nn.Sequential(
+            nn.LayerNorm(k_feat_dim),
+            nn.Linear(k_feat_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, cfg.K_MAX - 1)
+        )
         
         # SOTA FIX: Direct K-MLP bypass from main features (ensemble with spectral)
         # This gives K-head a direct gradient path that works from step 1
@@ -216,6 +225,13 @@ class HybridModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(128, cfg.K_MAX)
         )
+
+        self.k_direct_ord_mlp = nn.Sequential(
+            nn.LayerNorm(D),
+            nn.Linear(D, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, cfg.K_MAX - 1)
+        )
         
         # Learnable logit scale for K-head
         self.k_logit_scale = nn.Parameter(torch.ones(1))
@@ -225,11 +241,19 @@ class HybridModel(nn.Module):
         nn.init.xavier_uniform_(self.k_mlp[3].weight, gain=1.0)
         nn.init.xavier_uniform_(self.k_direct_mlp[1].weight, gain=1.0)
         nn.init.xavier_uniform_(self.k_direct_mlp[3].weight, gain=1.0)
+        nn.init.xavier_uniform_(self.k_ord_mlp[1].weight, gain=1.0)
+        nn.init.xavier_uniform_(self.k_ord_mlp[3].weight, gain=1.0)
+        nn.init.xavier_uniform_(self.k_direct_ord_mlp[1].weight, gain=1.0)
+        nn.init.xavier_uniform_(self.k_direct_ord_mlp[3].weight, gain=1.0)
         # FIXED: Initialize bias with small positive values for class priors
         nn.init.constant_(self.k_mlp[1].bias, 0.1)
         nn.init.constant_(self.k_mlp[3].bias, 0.1)
         nn.init.constant_(self.k_direct_mlp[1].bias, 0.1)
         nn.init.constant_(self.k_direct_mlp[3].bias, 0.1)
+        nn.init.constant_(self.k_ord_mlp[1].bias, 0.1)
+        nn.init.constant_(self.k_ord_mlp[3].bias, 0.1)
+        nn.init.constant_(self.k_direct_ord_mlp[1].bias, 0.1)
+        nn.init.constant_(self.k_direct_ord_mlp[3].bias, 0.1)
 
         # --- soft-argmax grid head for angles ---
         G = getattr(mdl_cfg, 'INFERENCE_GRID_SIZE_COARSE', 61)
@@ -252,6 +276,77 @@ class HybridModel(nn.Module):
     def set_tau(self, tau):
         """Update softmax temperature for annealing"""
         self.soft_argmax.set_tau(tau)
+    
+    # ----------------------------
+    # Phase-aware freezing helper
+    # ----------------------------
+    def set_trainable_for_phase(
+        self,
+        freeze_backbone: bool = False,
+        freeze_aux: bool = False,
+        freeze_k: bool = False,
+    ):
+        """
+        Control which parts of the model are trainable for phase-specific runs.
+        - freeze_backbone: freeze feature extractor + covariance predictors
+        - freeze_aux: freeze auxiliary angle/range heads
+        - freeze_k: freeze K classification head
+        """
+        def _set(mods, flag: bool):
+            for m in mods:
+                for p in m.parameters():
+                    p.requires_grad = not flag
+
+        # Backbone: feature stacks and covariance factor predictors
+        backbone_modules = [
+            m for m in [
+                getattr(self, "y_conv1", None),
+                getattr(self, "y_dw", None),
+                getattr(self, "y_conv2", None),
+                getattr(self, "transformer", None),
+                getattr(self, "H_proj", None),
+                getattr(self, "codes_conv", None),
+                getattr(self, "fusion", None),
+                getattr(self, "fusion_with_antidiag", None),
+                getattr(self, "antidiag_pool", None),
+            ] if m is not None
+        ]
+
+        # Covariance factor heads (should remain trainable even if backbone is frozen in K-only phase)
+        factor_modules = [
+            m for m in [
+                getattr(self, "cov_fact_angle", None),
+                getattr(self, "cov_fact_range", None),
+            ] if m is not None
+        ]
+
+        # Aux heads
+        aux_modules = [
+            m for m in [
+                getattr(self, "logits_gg", None),
+                getattr(self, "aux_angles", None),
+                getattr(self, "aux_range", None),
+            ] if m is not None
+        ]
+
+        # K head
+        k_modules = [
+            m for m in [
+                getattr(self, "k_spec_proj", None),
+                getattr(self, "k_fuse", None),
+                getattr(self, "k_mlp", None),
+                getattr(self, "k_direct_mlp", None),
+            ] if m is not None
+        ]
+
+        _set(backbone_modules, freeze_backbone)
+        # Keep factor modules tied to k freeze flag (trainable in K-only phase)
+        _set(factor_modules, freeze_k)
+        _set(aux_modules, freeze_aux)
+        _set(k_modules, freeze_k)
+        # k_logit_scale is a parameter tensor (not in a module list)
+        if hasattr(self, "k_logit_scale"):
+            self.k_logit_scale.requires_grad = not freeze_k
     
     def _hermitize_trace_norm(self, R):
         """Hermitize and trace-normalize covariance matrix"""
@@ -366,78 +461,63 @@ class HybridModel(nn.Module):
         aux_ptr    = torch.cat([aux_angles, aux_range], dim=1)             # [B, 3K]
 
         # --- Enhanced K-head with stable spectral features ---
-        # CRITICAL FIX: Build R_eff (same as inference) for K-head eigenfeatures (hybrid when available)
-        # This aligns K-head with what MUSIC sees at inference time
+        # =========================
+        # Measurement-domain K features (MxM) — more statistically stable at small L
+        # =========================
+        # y: [B,L,M,2] RI → complex [B,L,M]
+        y_c = torch.complex(y[..., 0].float(), y[..., 1].float())  # [B, L, M]
+        # Ryy = (1/L) y^H y  (M×M)
+        # NOTE: y_c is [B,L,M] so y^H is [B,M,L]
+        # Use actual snapshot count from the batch (safer if L changes later).
+        L_eff = float(y_c.shape[1])
+        Ryy = (y_c.conj().transpose(-2, -1) @ y_c) / max(L_eff, 1.0)  # [B, M, M]
+        Ryy = 0.5 * (Ryy + Ryy.conj().transpose(-2, -1))
+
+        # =========================
+        # RIS-domain K features (NxN) — kept as auxiliary, but NOT used for MDL decisions at L=16
+        # =========================
         def _vec2c_k(v):
             v = v.float()
             xr, xi = v[:, ::2], v[:, 1::2]
             return torch.complex(xr.view(-1, cfg.N, cfg.K_MAX), xi.view(-1, cfg.N, cfg.K_MAX))
-        
+
         A_for_k = _vec2c_k(cf_ang)  # [B, N, K]
         R_pred_k = A_for_k @ A_for_k.conj().transpose(-2, -1)  # [B, N, N]
         
         # Enhanced eigenvalue features for K-head (stable vectorized approach)
         with torch.amp.autocast('cuda', enabled=False):
-            # Prepare optional R_samp for hybrid (accept complex or RI)
-            R_samp_c = None
-            if R_samp is not None:
-                if torch.is_complex(R_samp):
-                    R_samp_c = R_samp.to(dtype=torch.complex64)
-                else:
-                    # Expect RI format [B,N,N,2]
-                    if R_samp.dim() == 4 and R_samp.shape[-1] == 2:
-                        R_samp_c = torch.complex(R_samp[..., 0].float(), R_samp[..., 1].float())
-                    elif R_samp.dim() == 3:
-                        R_samp_c = R_samp.float().to(dtype=torch.complex64)
-            beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
-            use_hybrid = (R_samp_c is not None) and (beta > 0.0)
-            # Build R_eff using the same path as inference/loss (hermitize + trace-norm + shrink + optional hybrid)
-            R_eff_k = build_effective_cov_torch(
-                R_pred_k,
-                snr_db=snr_db,
-                R_samp=R_samp_c if use_hybrid else None,
-                beta=beta if use_hybrid else None,
-                diag_load=True,
-                apply_shrink=(snr_db is not None),
-                target_trace=float(cfg.N),
-            )
-            
-            # Extract eigenvalues (descending) - SINGLE eigendecomposition for memory efficiency
-            evals, _ = torch.linalg.eigh(R_eff_k)
-            evals = torch.flip(evals.real, dims=[-1])  # descending [λ1..λN]
-            
-            # (i) Use regular eigengaps (skip whitened to save memory)
-            gaps = evals[:, :cfg.K_MAX] - evals[:, 1:cfg.K_MAX+1]
-            
-            # (ii) Energy ratios (signal vs noise)
-            csum = torch.cumsum(evals, dim=-1)
-            total = csum[:, -1].unsqueeze(-1).clamp_min(1e-9)
-            ratios = csum[:, :cfg.K_MAX] / total
-            
-            # (iii) LOG-EIGENVALUE SLOPES (SNR-stable)
-            log_evals = torch.log(torch.clamp(evals, min=1e-12))
-            log_slopes = log_evals[:, :cfg.K_MAX] - log_evals[:, 1:cfg.K_MAX+1]
-            
-            # (iv) MDL scores (vectorized, no nested loops)
-            N = evals.shape[-1]
+            # --- eigenfeatures from MEASUREMENT DOMAIN (M×M) ---
+            evals_yy = torch.linalg.eigvalsh(Ryy.detach()).real  # ascending
+            evals_yy = torch.flip(evals_yy, dims=[-1])           # descending [B,M]
+            # Pad to length K_MAX+1 indexing convenience (M is 16 so this is fine)
+            gaps_yy = evals_yy[:, :cfg.K_MAX] - evals_yy[:, 1:cfg.K_MAX+1]
+            csum_yy = torch.cumsum(evals_yy, dim=-1)
+            total_yy = csum_yy[:, -1].unsqueeze(-1).clamp_min(1e-9)
+            ratios_yy = csum_yy[:, :cfg.K_MAX] / total_yy
+            log_evals_yy = torch.log(torch.clamp(evals_yy, min=1e-12))
+            log_slopes_yy = log_evals_yy[:, :cfg.K_MAX] - log_evals_yy[:, 1:cfg.K_MAX+1]
+
+            # MDL scores on M×M covariance (more stable at small L)
+            Mdim = evals_yy.shape[-1]
             T = int(cfg.L)
-            mdl = torch.zeros(evals.shape[0], cfg.K_MAX, device=evals.device)
-            
+            mdl_yy = torch.zeros(evals_yy.shape[0], cfg.K_MAX, device=evals_yy.device)
+            logT = torch.log(torch.tensor(float(max(T, 2)), device=evals_yy.device))
             for k in range(1, cfg.K_MAX + 1):
                 k_idx = k - 1
-                noise = evals[:, k:].clamp_min(1e-12)
+                noise = evals_yy[:, k:].clamp_min(1e-12)
                 gm = torch.exp(torch.mean(torch.log(noise), dim=-1))
                 am = torch.mean(noise, dim=-1)
-                Lk = (T * (N - k)) * torch.log(am / gm + 1e-12)
-                mdl[:, k_idx] = Lk + 0.5 * k * (2*N - k) * torch.log(torch.tensor(T, device=evals.device))
-            
-            # (v) MDL argmin as one-hot (decision-level fusion)
-            # This lets the network learn residual corrections to MDL
-            k_mdl_idx = torch.argmin(mdl, dim=-1)  # [B] - 0-indexed K estimate from MDL
-            k_mdl_onehot = F.one_hot(k_mdl_idx, num_classes=cfg.K_MAX).float()  # [B, K_MAX]
-            
-            # Enhanced features: [gaps, ratios, log_slopes, mdl, mdl_onehot, λ1, λN]
-            k_feats = torch.cat([gaps, ratios, log_slopes, mdl, k_mdl_onehot, evals[:, :1], evals[:, -1:]], dim=-1)
+                Lk = (T * (Mdim - k)) * torch.log(am / gm + 1e-12)
+                mdl_yy[:, k_idx] = Lk + 0.5 * k * (2 * Mdim - k) * logT
+
+            k_mdl_idx_yy = torch.argmin(mdl_yy, dim=-1)  # 0-indexed
+            k_mdl_onehot_yy = F.one_hot(k_mdl_idx_yy, num_classes=cfg.K_MAX).float()
+
+            # Feature vector: measurement-domain spectrum stats + mdl info
+            k_feats = torch.cat(
+                [gaps_yy, ratios_yy, log_slopes_yy, mdl_yy, k_mdl_onehot_yy, evals_yy[:, :1], evals_yy[:, -1:]],
+                dim=-1
+            )
             
             # PHASE 1 FIX: Removed per-sample normalization (was killing gradients when std≈0)
             # The k_mlp has LayerNorm internally, so this normalization is redundant AND harmful.
@@ -447,9 +527,14 @@ class HybridModel(nn.Module):
         # Direct path: from main feature vector (works even when eigvals are messy)
         k_logits_spectral = self.k_mlp(k_feats)
         k_logits_direct = self.k_direct_mlp(feats_enhanced)
+
+        # Ordinal K logits (recommended decoding)
+        k_ord_logits_spectral = self.k_ord_mlp(k_feats)
+        k_ord_logits_direct = self.k_direct_ord_mlp(feats_enhanced)
         
         # Ensemble: average both paths (could also be learned weights)
         k_logits = (0.5 * k_logits_spectral + 0.5 * k_logits_direct) * self.k_logit_scale
+        k_ord_logits = (0.5 * k_ord_logits_spectral + 0.5 * k_ord_logits_direct) * self.k_logit_scale
 
         return {
             "cov_fact_angle": cf_ang,
@@ -458,4 +543,5 @@ class HybridModel(nn.Module):
             "phi_soft":       phi_soft,
             "theta_soft":     theta_soft,
             "k_logits":       k_logits,
+            "k_ord_logits":   k_ord_logits,
         }

@@ -15,9 +15,9 @@ from .baseline import (
     incident_cov_from_snaps,
 )
 
-BENCH_DIR = Path("results_final/benches")
+BENCH_DIR = Path(cfg.RESULTS_DIR) / "benches"
 BENCH_DIR.mkdir(parents=True, exist_ok=True)
-TEST_DIR = Path("results_final/data/shards/test")
+TEST_DIR = Path(getattr(cfg, "DATA_SHARDS_TEST", "results_final/data/shards/test"))
 
 
 # --------------- Matching & GT (same as benchmark.py) ---------------

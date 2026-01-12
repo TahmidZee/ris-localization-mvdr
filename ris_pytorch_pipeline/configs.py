@@ -230,8 +230,57 @@ class SysConfig:
             "w_aux_ang": 0.01,    # Penalty for aux angle RMSE (deg)
             "w_aux_r": 0.01,      # Penalty for aux range RMSE (m)
         }
+
+        # --- Phase-aware training knobs (3-phase plan) ---
+        # TRAIN_PHASE options:
+        #   - "geom"   : geometry/covariance warm-up (short)
+        #   - "k_only" : K-centric fine-tune (backbone frozen)
+        #   - "joint"  : final joint refinement (full model)
+        # Default to joint training so the backbone can learn K-correlated features immediately.
+        # (k_only is only meaningful as a warm-started fine-tune.)
+        self.TRAIN_PHASE = "joint"
+        # Freezing behaviour during K-only phase
+        # Safer default: if you do run k_only, don’t accidentally freeze the backbone “from scratch”.
+        self.FREEZE_BACKBONE_FOR_K_PHASE = False
+        self.FREEZE_AUX_IN_K_PHASE = False
+        # Optional warm-start checkpoint path (weights-only). If empty, no warm-start is applied.
+        self.INIT_CKPT = ""
+        # Recommended loss weights per phase (used by Trainer when present)
+        self.PHASE_LOSS = {
+            "geom": {
+                "lam_cov": 0.5,
+                "lam_subspace_align": 0.5,
+                "lam_aux": 1.0,
+                "lam_K": 0.1,
+                "lam_peak_contrast": 0.0,
+            },
+            "k_only": {
+                "lam_cov": 0.1,
+                "lam_subspace_align": 0.0,
+                "lam_aux": 0.5,
+                "lam_K": 1.5,
+                "lam_peak_contrast": 0.0,
+                # CRITICAL: Disable SVD-based losses to prevent NaN gradients
+                "lam_gap": 0.0,
+                "lam_margin": 0.0,
+            },
+            "joint": {
+                "lam_cov": 0.1,
+                "lam_subspace_align": 0.5,
+                "lam_aux": 1.0,
+                # Boost K weight to unstick K learning in joint training.
+                "lam_K": 1.0,
+                "lam_peak_contrast": 0.1,
+            },
+        }
         
         self.K_CONF_THRESH = 0.65             # Confidence threshold for K-head vs MDL fallback (tune on val)
+
+        # --- K-head mode ---
+        # "softmax": 5-way classification over K in {1..K_MAX}
+        # "ordinal": predict 4 logits for P(K>t), t=1..K_MAX-1; decode by thresholding and summing.
+        self.K_HEAD_MODE = "ordinal"
+        self.K_ORD_THRESH = 0.5
         
         # === PHASE 2 CRITICAL FIXES: Joint Newton & Hungarian ===
         self.USE_JOINT_NEWTON = True          # Enable joint {φ,θ,r} Newton refinement (sub-degree polish!)
