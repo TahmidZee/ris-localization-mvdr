@@ -79,6 +79,10 @@ backup_*/
 archive_*/
 OldCode/
 
+# External / legacy side projects (not part of ris-localization-mvdr)
+AI-Subspace-Methods/
+AI-Subspace-Methods-Original/
+
 # Test outputs
 overfit_test.log
 correlation_check.py
