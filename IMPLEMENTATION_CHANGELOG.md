@@ -1,8 +1,8 @@
 # Implementation Changelog: K-Free MVDR Localization
 
-**Date:** January 15, 2026  
+**Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 15, 2026 (SpectrumRefiner added)
+**Last Updated:** January 16, 2026 (Refiner mandatory + robust MVDR thresholding + repo cleanup)
 
 ---
 
@@ -15,7 +15,8 @@ This document details all code changes made to transition from a K-head classifi
 - ✅ Added 2.5D → 3D refinement pipeline
 - ✅ Created visualization/verification tools
 - ✅ Removed all K-head related code (clean slate)
-- ✅ Updated inference to use MDL/MVDR
+- ✅ **Made SpectrumRefiner mandatory in production inference** (MVDR → Refiner → peak picking)
+- ✅ Added robust MVDR thresholding mode (`MVDR_THRESH_MODE="mad"`)
 - ✅ Cleaned up redundant files
 - ✅ Added SpectrumRefiner CNN for learned spectrum denoising
 - ✅ Added heatmap supervision loss (Gaussian blob targets)
@@ -29,6 +30,8 @@ This document details all code changes made to transition from a K-head classifi
 - ✅ **Deleted legacy directories/scripts** (`archive_docs/`, `archive_scripts/`, `OldCode/`, outdated K-estimation reports/scripts, `train.py.bak`, stray CLI artifact files).
 - ✅ **Implemented Option B Stage-2 SpectrumRefiner training** (freeze backbone, generate MVDR spectrum from low-rank factors, train refiner with heatmap loss).
 - ✅ **Added CLI entrypoint** `python -m ris_pytorch_pipeline.ris_pipeline train-refiner` for Stage-2 refiner training.
+- ✅ **Removed MDL from the production inference decision path** (kept only for ablations/debug where needed).
+- ✅ **Repo hygiene cleanup**: committed deletion of legacy archives + removed a dangling submodule-style gitlink (`AI-Subspace-Methods`) and ignored local copies.
 
 ### Stage-2 SpectrumRefiner Training (Option B) — New Additions
 
