@@ -205,7 +205,6 @@ class Trainer:
             self.model.set_trainable_for_phase(
                 freeze_backbone=freeze_backbone,
                 freeze_aux=freeze_aux,
-                freeze_k=False,
             )
         # Initialize loss with config values (will be updated by schedule)
         self.loss_fn = UltimateHybridLoss(
