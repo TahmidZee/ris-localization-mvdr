@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 16, 2026 (Refiner mandatory + robust MVDR thresholding + repo cleanup)
+**Last Updated:** January 16, 2026 (Guardrails + MVDR low-rank equivalence test + peak-level validation metrics)
 
 ---
 
@@ -15,7 +15,7 @@ This document details all code changes made to transition from a K-head classifi
 - ✅ Added 2.5D → 3D refinement pipeline
 - ✅ Created visualization/verification tools
 - ✅ Removed all K-head related code (clean slate)
-- ✅ **Made SpectrumRefiner mandatory in production inference** (MVDR → Refiner → peak picking)
+- ✅ **Added SpectrumRefiner-assisted inference** (MVDR → Refiner → peak picking) with **guardrails + MVDR fallback**
 - ✅ Added robust MVDR thresholding mode (`MVDR_THRESH_MODE="mad"`)
 - ✅ Cleaned up redundant files
 - ✅ Added SpectrumRefiner CNN for learned spectrum denoising
@@ -44,6 +44,69 @@ This document details all code changes made to transition from a K-head classifi
   - added lightweight logging of offending parameter gradients on the first non-finite event
 - ✅ **HPO no longer aborts the entire study** when one trial encounters non-finite gradients:
   - non-finite-grad trials are pruned (`optuna.TrialPruned`) and the run continues
+
+---
+
+## Guardrails & Regression Tests (NEW, post initial rollout)
+
+These changes were added after reviewing failure modes observed in logs (e.g. seemingly-worse surrogate aux RMSE and FP-heavy peak picking) and to prevent “train on one physics transform, infer on another”.
+
+### 1) Surrogate aux RMSE is now permutation-invariant (fixes inflated ~35–40° cases)
+
+**File:** `ris_pytorch_pipeline/train.py`
+
+Previously, surrogate aux RMSE compared predicted sources to GT **by index**. In multi-source scenes, correct predictions in a different ordering can look “very wrong” (e.g. `aux_φ_rmse≈35°`) even when the set of sources is correct.
+
+**Now:** surrogate aux RMSE uses **assignment-based matching** (Hungarian if SciPy available, greedy fallback) so it is **invariant to source permutation**.
+
+### 2) Refiner guardrail + MVDR fallback (prevents “hallucination amplifier” failure mode)
+
+**File:** `ris_pytorch_pipeline/infer.py` (+ config knobs in `configs.py`)
+
+Inference now **prefers** the refiner-assisted path but will fall back to raw MVDR peak detection on `R_eff` when:
+- the refiner is missing / disabled, or
+- the refiner probability map is pathological (non-finite / too flat / too saturated / too many peaks)
+
+This keeps inference robust under distribution shift and avoids catastrophic FP blowups.
+
+### 3) Covariance sanity checks (fail-fast in HPO)
+
+**File:** `ris_pytorch_pipeline/covariance_utils.py` (+ defaults in `configs.py`)
+
+Added optional checks on the effective covariance:
+- finite entries
+- approximately Hermitian
+- trace close to target
+
+In **HPO mode** this raises to quickly prune broken trials; otherwise it warns (configurable).
+
+### 4) MVDR low-rank (Woodbury) equivalence regression test + bug fix
+
+**Files:** `ris_pytorch_pipeline/music_gpu.py`, `ris_pytorch_pipeline/regression_tests.py`
+
+Added a regression test that compares:
+- **full MVDR** (explicit inverse) vs
+- **low-rank MVDR** (Woodbury) spectrum
+
+and fails if correlation/peak location disagreement exceeds a threshold.
+
+During implementation, the test caught a convention mismatch in the Woodbury quadratic form; this was fixed so the low-rank MVDR now matches the full MVDR spectrum consistently.
+
+Run:
+```bash
+python -m ris_pytorch_pipeline.regression_tests mvdr_lowrank --n 5
+```
+
+### 5) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
+
+**File:** `ris_pytorch_pipeline/train.py` (+ defaults in `configs.py`)
+
+Surrogate validation can now optionally report **MVDR peak detection metrics** on a capped subset (coarse grids for speed):
+- peak precision / peak recall
+- FP per scene
+- median peak-to-sidelobe proxy (PSSR, in dB)
+
+This is evaluation-only reporting (no backprop through MVDR) and helps catch “200% detection” issues during HPO/training rather than at the end.
 
 ### Stage-2 SpectrumRefiner Training (Option B) — New Additions
 
