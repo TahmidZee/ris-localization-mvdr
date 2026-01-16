@@ -2265,10 +2265,7 @@ class Trainer:
                     # Update structure loss weights (subspace align + peak contrast) based on phase
                     self._update_structure_loss_weights(ep, epochs)
             
-            # Phase 2: Ramp K-weight gradually (ONLY when curriculum is ON)
-            # ICC FIX: Disable K-ramp during HPO for stationary objective
-            if mdl_cfg.USE_3_PHASE_CURRICULUM and getattr(mdl_cfg, "K_WEIGHT_RAMP", True):
-                self._ramp_k_weight(ep, epochs)
+            # NOTE: K-weight ramping removed - K-head no longer used (MVDR peak detection instead)
             
             # Check if we should start SWA
             swa_start_epoch = int(self.swa_start_frac * epochs)
