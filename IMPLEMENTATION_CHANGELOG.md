@@ -34,6 +34,10 @@ This document details all code changes made to transition from a K-head classifi
 - ✅ **Repo hygiene cleanup**: committed deletion of legacy archives + removed a dangling submodule-style gitlink (`AI-Subspace-Methods`) and ignored local copies.
 - ✅ **Disabled eigengap/margin regularizers entirely** (`lam_gap`, `lam_margin`) to eliminate SVD-based backward instability during backbone training/HPO.
 - ✅ **Removed per-sample QR retraction inside the loss** (rely on orthogonality penalty instead) and **detached SVD subspaces** in alignment loss to avoid fragile linear-algebra backprop.
+- ✅ **Fixed training crash + HPO nonsense metrics**:
+  - fixed `overflow` NameError in gradient logging (`overflow_hint`)
+  - fixed surrogate validation `ptr` parsing (chunked layout) and converted angle RMSE to **degrees**
+  - aligned validation loss with training by constructing `R_blend` in validation when `R_samp` is present
 
 ### Stage-2 SpectrumRefiner Training (Option B) — New Additions
 

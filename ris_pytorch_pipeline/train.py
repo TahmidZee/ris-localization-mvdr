@@ -56,6 +56,32 @@ def _ri_to_c(R_ri: torch.Tensor) -> torch.Tensor:
 def _c_to_ri(Z: torch.Tensor) -> torch.Tensor:
     return torch.stack([Z.real, Z.imag], dim=-1)
 
+def build_R_pred_from_factor_vecs(cf_ang: torch.Tensor, cf_rng: torch.Tensor, *, N: int, Kmax: int, lam_range: float) -> torch.Tensor:
+    """
+    Build complex covariance from interleaved RI factor vectors.
+
+    Args:
+        cf_ang/cf_rng: [B, 2*N*Kmax] with interleaved real/imag entries.
+        N: covariance dimension (cfg.N)
+        Kmax: maximum sources (cfg.K_MAX)
+        lam_range: range factor weight (mdl_cfg.LAM_RANGE_FACTOR)
+
+    Returns:
+        R_pred: [B, N, N] complex64, Hermitian.
+    """
+    B = int(cf_ang.shape[0])
+    cf_ang = cf_ang.float()
+    cf_rng = cf_rng.float()
+
+    def _vec2c(v: torch.Tensor) -> torch.Tensor:
+        xr, xi = v[:, ::2], v[:, 1::2]  # [B, N*Kmax]
+        return torch.complex(xr.view(B, N, Kmax), xi.view(B, N, Kmax)).to(torch.complex64)
+
+    Aang = _vec2c(cf_ang)
+    Arng = _vec2c(cf_rng)
+    R = (Aang @ Aang.conj().transpose(-2, -1)) + float(lam_range) * (Arng @ Arng.conj().transpose(-2, -1))
+    return 0.5 * (R + R.conj().transpose(-2, -1))
+
 def _load_json_if_exists(path: Path) -> Dict[str, Any]:
     if path.exists():
         with open(path, "r") as f:
@@ -1303,14 +1329,14 @@ class Trainer:
                 g_total = float(g_total.detach().cpu())
                 
                 # AMP overflow/skip detection:
-                # - internal found_inf_map can be stale; scale drop is the reliable signal.
+                # - found_inf_map can be stale; rely on scale drop after step to detect actual AMP skip.
                 scale_before_step = float(self.scaler.get_scale()) if (hasattr(self, "scaler") and self.scaler is not None) else 1.0
                 overflow_hint = any(v > 0.0 for v in found_inf_map.values())
-                ok = (not overflow_hint) and math.isfinite(g_total) and (g_total > 1e-12)
+                ok = math.isfinite(g_total) and (g_total > 1e-12)
 
                 # Expert fix: Log gradient status for ALL batches in first epoch
                 # DEBUG: Print for EVERY batch, not just epoch 1
-                print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow={overflow}", flush=True)
+                print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow_hint={overflow_hint}", flush=True)
                 import sys; sys.stdout.flush(); sys.stderr.flush()
                 
                 # Initialize stepped flag
@@ -1401,7 +1427,7 @@ class Trainer:
             if bi == 0 and not hasattr(self, '_first_val_batch'):
                 self._first_val_batch = batch
             
-            y, H, C, ptr, K, R_in, snr, H_full, _ = self._unpack_any_batch(batch)
+            y, H, C, ptr, K, R_in, snr, H_full, R_samp = self._unpack_any_batch(batch)
             
             # CRITICAL FIX: Clear batch references to prevent memory leaks (except first)
             if bi > 0:
@@ -1488,6 +1514,33 @@ class Trainer:
                                 labels_fp32[k] = v
                         else:
                             labels_fp32[k] = v
+
+                    # TRAIN/VAL ALIGNMENT: build R_blend in validation (same as training) when R_samp is present.
+                    if (R_samp is not None) and ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
+                        try:
+                            R_samp_c = _ri_to_c(R_samp.float())
+                            R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
+                            lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                            R_pred = build_R_pred_from_factor_vecs(
+                                preds["cov_fact_angle"],
+                                preds["cov_fact_range"],
+                                N=int(cfg.N),
+                                Kmax=int(cfg.K_MAX),
+                                lam_range=lam_range,
+                            )
+                            beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
+                            R_blend = build_effective_cov_torch(
+                                R_pred,
+                                snr_db=None,
+                                R_samp=R_samp_c.detach(),
+                                beta=beta,
+                                diag_load=False,
+                                apply_shrink=False,
+                                target_trace=float(cfg.N),
+                            )
+                            preds["R_blend"] = R_blend
+                        except Exception:
+                            pass
                     
                     loss = self.loss_fn(preds, labels_fp32)
                 
@@ -1607,6 +1660,34 @@ class Trainer:
                                 labels_fp32[k] = v
                         else:
                             labels_fp32[k] = v
+
+                    # TRAIN/VAL ALIGNMENT: build blended covariance (R_blend) in validation exactly like training.
+                    # Without this, val loss becomes apples-to-oranges when HYBRID_COV_BETA>0 and R_samp exists.
+                    if (R_samp is not None) and ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
+                        try:
+                            R_samp_c = _ri_to_c(R_samp.float())
+                            R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
+                            lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                            R_pred = build_R_pred_from_factor_vecs(
+                                preds["cov_fact_angle"],
+                                preds["cov_fact_range"],
+                                N=int(cfg.N),
+                                Kmax=int(cfg.K_MAX),
+                                lam_range=lam_range,
+                            )
+                            beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
+                            R_blend = build_effective_cov_torch(
+                                R_pred,
+                                snr_db=None,
+                                R_samp=R_samp_c.detach(),
+                                beta=beta,
+                                diag_load=False,
+                                apply_shrink=False,
+                                target_trace=float(cfg.N),
+                            )
+                            preds["R_blend"] = R_blend
+                        except Exception:
+                            pass
                     
                     loss = self.loss_fn(preds, labels_fp32)
                     if not torch.isfinite(loss):
@@ -1616,25 +1697,36 @@ class Trainer:
                 
                 # ---------- Aux angle/range metrics (direct head vs GT) ----------
                 if "phi_theta_r" in preds:
-                    phi_theta_r_pred = preds["phi_theta_r"].float().cpu()  # [B, 3*K_max]
-                    ptr_gt = ptr.float().cpu()  # [B, 3*K_max]
+                    # IMPORTANT: ptr format is CHUNKED: [phi_pad..., theta_pad..., r_pad...]
+                    # Angles are stored in RADIANS in both ptr and phi_theta_r head.
+                    phi_theta_r_pred = preds["phi_theta_r"].float().cpu()  # [B, 3*Kmax] chunked
+                    ptr_gt = ptr.float().cpu()  # [B, 3*Kmax] chunked
                     K_true_list = K.cpu().tolist()
+                    Kmax = int(getattr(cfg, "K_MAX", 5))
                     
                     for i in range(B):
                         k_i = int(K_true_list[i])
                         if k_i <= 0:
                             continue
                         
-                        # Extract GT and pred for first k_i sources
-                        # ptr format: [phi1, theta1, r1, phi2, theta2, r2, ...]
-                        gt_i = ptr_gt[i, :3*k_i].view(k_i, 3)  # [k_i, 3]
-                        pr_i = phi_theta_r_pred[i, :3*k_i].view(k_i, 3)  # [k_i, 3]
-                        
-                        # Absolute errors per source
-                        d = torch.abs(pr_i - gt_i)  # [k_i, 3]
-                        aux_phi_err.extend(d[:, 0].tolist())
-                        aux_theta_err.extend(d[:, 1].tolist())
-                        aux_r_err.extend(d[:, 2].tolist())
+                        # GT (chunked)
+                        gt_phi = ptr_gt[i, :Kmax][:k_i]
+                        gt_th  = ptr_gt[i, Kmax:2*Kmax][:k_i]
+                        gt_r   = ptr_gt[i, 2*Kmax:3*Kmax][:k_i]
+
+                        # Pred (chunked)
+                        pr_phi = phi_theta_r_pred[i, :Kmax][:k_i]
+                        pr_th  = phi_theta_r_pred[i, Kmax:2*Kmax][:k_i]
+                        pr_r   = phi_theta_r_pred[i, 2*Kmax:3*Kmax][:k_i]
+
+                        # Errors (convert angles to DEGREES for reporting + surrogate weighting)
+                        dphi_deg = torch.rad2deg(torch.abs(pr_phi - gt_phi))
+                        dth_deg  = torch.rad2deg(torch.abs(pr_th  - gt_th))
+                        dr       = torch.abs(pr_r - gt_r)
+
+                        aux_phi_err.extend(dphi_deg.tolist())
+                        aux_theta_err.extend(dth_deg.tolist())
+                        aux_r_err.extend(dr.tolist())
         
         # Compute summary metrics
         avg_loss = total_loss / max(1, n_samples)
