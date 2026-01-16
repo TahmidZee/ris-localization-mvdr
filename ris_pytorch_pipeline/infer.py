@@ -47,7 +47,7 @@ def _load_model_arch_from_hpo(hpo_json=None):
     )
 
 @torch.no_grad()
-def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_swa=True):
+def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_swa=True, *, require_refiner: bool = True):
     if ckpt_dir is None:
         ckpt_dir = cfg.CKPT_DIR  # Use cfg.CKPT_DIR as default
     
@@ -123,17 +123,23 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
             else:
                 print(f"    - {unexpected_keys[0]} ... and {len(unexpected_keys)-1} more")
         
-        # Attach SpectrumRefiner if present
+        # Attach SpectrumRefiner (required for production inference by default)
         if refiner_sd is not None:
-            try:
-                refiner = SpectrumRefiner().to(next(model.parameters()).device)
-                refiner.load_state_dict(refiner_sd, strict=False)
-                refiner.eval()
-                # Attach to model for inference usage
-                model._spectrum_refiner = refiner
-                print("✅ Loaded SpectrumRefiner weights from checkpoint")
-            except Exception as e:
-                print(f"⚠️  Failed to load SpectrumRefiner from checkpoint: {e}")
+            refiner = SpectrumRefiner().to(next(model.parameters()).device)
+            missing_r, unexpected_r = refiner.load_state_dict(refiner_sd, strict=False)
+            if missing_r or unexpected_r:
+                # Non-strict load tolerates small naming drift, but report for reproducibility.
+                print(f"⚠️  SpectrumRefiner load: missing={len(missing_r)} unexpected={len(unexpected_r)}", flush=True)
+            refiner.eval()
+            # Attach to model for inference usage
+            model._spectrum_refiner = refiner
+            print("✅ Loaded SpectrumRefiner weights from checkpoint")
+        elif require_refiner:
+            raise ValueError(
+                "SpectrumRefiner weights not found in checkpoint. "
+                "Inference now requires a Stage-2 refiner checkpoint (format: {'backbone':..., 'refiner':...}). "
+                "Run `python ris_pytorch_pipeline/ris_pipeline.py train-refiner` (Option B) and use that checkpoint."
+            )
 
         model.eval()
         return model
@@ -293,8 +299,16 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     # --- MVDR detection (K-free) ---
     max_sources = int(force_K) if (force_K is not None) else int(cfg.K_MAX)
 
-    use_refiner = bool(getattr(cfg, "USE_SPECTRUM_REFINER_IN_INFER", False)) and hasattr(model, "_spectrum_refiner")
-    if use_refiner:
+    use_refiner_cfg = bool(getattr(cfg, "USE_SPECTRUM_REFINER_IN_INFER", True))
+    if not use_refiner_cfg:
+        raise ValueError("USE_SPECTRUM_REFINER_IN_INFER is False, but the refiner is part of the production plan. Set it True in configs.py.")
+    if (not hasattr(model, "_spectrum_refiner")) or (getattr(model, "_spectrum_refiner", None) is None):
+        raise ValueError(
+            "SpectrumRefiner is required for inference but was not attached to the model. "
+            "Load a Stage-2 refiner checkpoint via load_model(..., require_refiner=True)."
+        )
+
+    if True:
         # Refiner-assisted inference:
         # 1) low-rank MVDR spectrum max over range planes (from factors)
         # 2) SpectrumRefiner -> probability heatmap
@@ -333,17 +347,28 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
 
         # 2D NMS peak detection
         min_sep = int(getattr(cfg, "REFINER_NMS_MIN_SEP", 2))
-        thr = float(getattr(cfg, "REFINER_PEAK_THRESH", 0.5))
         prob2d = prob[0, 0]
         ksize = 2 * min_sep + 1
         pooled = F.max_pool2d(prob2d[None, None], kernel_size=ksize, stride=1, padding=min_sep)[0, 0]
-        is_max = (prob2d >= pooled) & (prob2d >= thr)
+        is_max = (prob2d >= pooled)
+
+        # Apply absolute or relative thresholding (relative is default; avoids brittle calibration).
+        peak_thresh = getattr(cfg, "REFINER_PEAK_THRESH", None)
+        if peak_thresh is not None:
+            is_max = is_max & (prob2d >= float(peak_thresh))
+        else:
+            rel = float(getattr(cfg, "REFINER_REL_THRESH", 0.20))
+            rel = float(np.clip(rel, 0.0, 1.0))
+            pmax = float(prob2d.max().item()) if prob2d.numel() > 0 else 0.0
+            is_max = is_max & (prob2d >= (rel * pmax))
+
         idx = torch.nonzero(is_max, as_tuple=False)
         if idx.numel() == 0:
-            # fallback: take top-k by prob
+            # Fallback: take the global max (still K-free; avoids MDL fallback).
             flat = prob2d.flatten()
-            topk = min(max_sources, flat.numel())
-            vals, inds = torch.topk(flat, k=topk, largest=True)
+            if flat.numel() == 0:
+                return [], [], []
+            inds = torch.argmax(flat).view(1)
             idx = torch.stack([inds // prob2d.shape[1], inds % prob2d.shape[1]], dim=1)
 
         # Sort peaks by probability desc
@@ -371,18 +396,8 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             conf = float(prob2d[pi, ti].item())
             sources.append((phi, theta, best_r, conf))
     else:
-        sources, _ = mvdr_detect_sources(
-            R_eff,
-            cfg,
-            device=device_str,
-            grid_phi=int(getattr(cfg, "MVDR_GRID_PHI", 361)),
-            grid_theta=int(getattr(cfg, "MVDR_GRID_THETA", 181)),
-            delta_scale=float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2)),
-            threshold_db=float(getattr(cfg, "MVDR_THRESH_DB", 12.0)),
-            max_sources=max_sources,
-            do_refinement=bool(do_newton),
-            prepared=True,
-        )
+        # Legacy non-refiner inference path removed (refiner is mandatory).
+        sources = []
 
     if len(sources) == 0:
         return [], [], []

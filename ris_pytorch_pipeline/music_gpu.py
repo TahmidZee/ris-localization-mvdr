@@ -1054,6 +1054,8 @@ class GPUMusicEstimator:
                             r_planes: Optional[List[float]] = None,
                             delta_scale: float = 1e-2,
                             threshold_db: float = 12.0,
+                            threshold_mode: str = "max_db",
+                            cfar_z: float = 5.0,
                             max_sources: int = 5,
                             do_refinement: bool = True,
                             prepared: bool = False) -> Tuple[List[Tuple[float, float, float, float]], np.ndarray]:
@@ -1067,7 +1069,9 @@ class GPUMusicEstimator:
             grid_phi, grid_theta: Angular grid resolution
             r_planes: Range planes
             delta_scale: Diagonal loading
-            threshold_db: Detection threshold (dB below max)
+            threshold_db: Detection threshold (used in "max_db" mode and as a safety cap in "mad" mode)
+            threshold_mode: "max_db" (relative-to-max) or "mad" (robust CFAR-ish in dB domain)
+            cfar_z: CFAR aggressiveness for "mad" mode (median + z * MAD)
             max_sources: Maximum sources to detect
             do_refinement: Whether to do local 3D refinement
             prepared: If True, R is already processed
@@ -1100,8 +1104,34 @@ class GPUMusicEstimator:
         if len(candidates) == 0:
             return [], spectrum_max
         
-        max_conf = max(c[3] for c in candidates)
-        threshold = max_conf / (10 ** (threshold_db / 10))
+        max_conf = max(float(c[3]) for c in candidates)
+
+        # Default: relative threshold to max (classic "X dB down from peak")
+        thr_from_max = max_conf / (10 ** (float(threshold_db) / 10.0))
+
+        mode = str(threshold_mode or "max_db").lower()
+        threshold = thr_from_max
+        if mode == "mad":
+            try:
+                # Robust CFAR-ish threshold from the full 2D spectrum.
+                spec = np.asarray(spectrum_max, dtype=np.float64)
+                eps = 1e-12
+                spec_db = 10.0 * np.log10(np.maximum(spec, eps))
+                med = float(np.median(spec_db))
+                mad = float(np.median(np.abs(spec_db - med)))
+                sigma = 1.4826 * mad
+                if np.isfinite(sigma) and sigma > 1e-6:
+                    thr_db_abs = med + float(cfar_z) * sigma
+                    thr_mad = 10 ** (thr_db_abs / 10.0)
+                    # Safety: also enforce the relative-to-max threshold (pick the stricter one)
+                    threshold = max(thr_mad, thr_from_max)
+            except Exception:
+                threshold = thr_from_max
+        elif mode == "max_db":
+            threshold = thr_from_max
+        else:
+            # Unknown mode -> default to legacy behavior
+            threshold = thr_from_max
         
         sources = [c for c in candidates if c[3] >= threshold]
         sources = sources[:max_sources]
@@ -1214,6 +1244,11 @@ def mvdr_detect_sources(R, cfg, device: str = 'cuda', **kwargs):
         sources: List of (phi_deg, theta_deg, r_m, confidence)
         spectrum: [G_phi, G_theta] 2D spectrum
     """
+    # Default thresholding knobs from cfg (callers may override via kwargs).
+    if "threshold_mode" not in kwargs:
+        kwargs["threshold_mode"] = getattr(cfg, "MVDR_THRESH_MODE", "max_db")
+    if "cfar_z" not in kwargs:
+        kwargs["cfar_z"] = float(getattr(cfg, "MVDR_CFAR_Z", 5.0))
     estimator = get_gpu_estimator(cfg, device)
     return estimator.detect_sources_mvdr(R, **kwargs)
 

@@ -117,7 +117,9 @@ class SysConfig:
         self.HPO_BEST_JSON = f"{self.HPO_DIR}/best.json"
 
         # Inference policy (use HPO knobs for Newton+range grid)
-        self.USE_MDL_K_FOR_BLIND = True
+        # K-free policy: do NOT use MDL/AIC in the production inference path.
+        # Keep MDL as a debug/ablation knob only (see infer.py).
+        self.USE_MDL_K_FOR_BLIND = False
         self.DEFAULT_NEWTON_FROM_HPO = True
         self.DEFAULT_RANGE_GRID_FROM_HPO = True
     
@@ -217,14 +219,22 @@ class SysConfig:
         # Used by ris_pytorch_pipeline.infer.hybrid_estimate_final (MVDR-first).
         self.MVDR_GRID_PHI = 361
         self.MVDR_GRID_THETA = 181
+        # Detection thresholding mode for multi-source peak picking on MVDR spectra.
+        # - "max_db": keep peaks within MVDR_THRESH_DB dB of the global max
+        # - "mad": robust CFAR-ish rule using median + z * MAD in dB domain
+        self.MVDR_THRESH_MODE = "mad"
         self.MVDR_THRESH_DB = 12.0
+        self.MVDR_CFAR_Z = 5.0
         self.MVDR_DELTA_SCALE = 1e-2
         self.MVDR_DO_REFINEMENT = True
-        # If True and a SpectrumRefiner is loaded, inference will run:
-        # MVDR spectrum -> SpectrumRefiner -> peak detection (instead of peak-picking on raw MVDR).
-        self.USE_SPECTRUM_REFINER_IN_INFER = False
-        # Refiner peak selection threshold (probability map). If None, fallback to top-K peaks.
-        self.REFINER_PEAK_THRESH = 0.5
+        # Refiner is part of the plan: production inference assumes it is present.
+        # (infer.py will raise if missing from checkpoint.)
+        self.USE_SPECTRUM_REFINER_IN_INFER = True
+        # Refiner peak selection:
+        # - If REFINER_PEAK_THRESH is set, use absolute probability threshold.
+        # - Otherwise use a relative threshold to the map max, then take top-K.
+        self.REFINER_PEAK_THRESH = None
+        self.REFINER_REL_THRESH = 0.20
         # Minimum NMS separation in grid cells for refined heatmap peak picking.
         self.REFINER_NMS_MIN_SEP = 2
 
