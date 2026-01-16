@@ -232,17 +232,24 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
             hpo_n_val = int(0.1 * total_val_samples)      # 1K samples (10%) - effective HPO subset
             
             print(f"[HPO Trial {trial.number}] Starting training with {hpo_n_train} train, {hpo_n_val} val samples...", flush=True)
-            best_val = t.fit(
-                epochs=epochs_per_trial,
-                use_shards=True,
-                n_train=hpo_n_train,    # 10K samples (10% of 100K) for effective HPO
-                n_val=hpo_n_val,        # 1K samples (10% of 10K) for effective HPO
-                gpu_cache=True,         # Critical for HPO speed
-                grad_accumulation=1,    # REDUCED from 2 (was 256 effective batch, too smooth)
-                early_stop_patience=early_stop_patience,  # Stop if no improvement for N epochs
-                val_every=1,            # Validate every epoch (surrogate is fast!)
-                skip_music_val=True,    # NO MUSIC during HPO - use surrogate metrics only
-            )
+            try:
+                best_val = t.fit(
+                    epochs=epochs_per_trial,
+                    use_shards=True,
+                    n_train=hpo_n_train,    # 10K samples (10% of 100K) for effective HPO
+                    n_val=hpo_n_val,        # 1K samples (10% of 10K) for effective HPO
+                    gpu_cache=True,         # Critical for HPO speed
+                    grad_accumulation=1,    # REDUCED from 2 (was 256 effective batch, too smooth)
+                    early_stop_patience=early_stop_patience,  # Stop if no improvement for N epochs
+                    val_every=1,            # Validate every epoch (surrogate is fast!)
+                    skip_music_val=True,    # NO MUSIC during HPO - use surrogate metrics only
+                )
+            except RuntimeError as e:
+                msg = str(e)
+                # Do not crash the entire HPO run on one unstable trial.
+                if "Non-finite gradients detected" in msg:
+                    raise optuna.TrialPruned(msg)
+                raise
             # CRITICAL FIX: Handle None/inf values in print
             if best_val is None or not np.isfinite(best_val):
                 print(f"[HPO Trial {trial.number}] Training completed! Best objective: {best_val} (non-finite)", flush=True)
@@ -283,6 +290,7 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
         study.optimize(
             objective,
             n_trials=remaining,
+            catch=(RuntimeError,),
             gc_after_trial=True,
             show_progress_bar=False,
             n_jobs=1  # CRITICAL: Force sequential trials to avoid memory issues

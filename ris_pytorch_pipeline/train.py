@@ -1180,7 +1180,17 @@ class Trainer:
                         # No offline R_samp available → use pure R_pred
                         if epoch == 1 and bi == 0 and getattr(cfg, "HYBRID_COV_BLEND", True) and getattr(cfg, "HYBRID_COV_BETA", 0.0) > 0.0:
                             print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
-                        preds_fp32['R_blend'] = R_pred
+                        # IMPORTANT: Even without R_samp, keep the covariance scale sane.
+                        # Do NOT apply shrink/diag-load here (loss applies those consistently via build_effective_cov_torch).
+                        preds_fp32['R_blend'] = build_effective_cov_torch(
+                            R_pred,
+                            snr_db=None,
+                            R_samp=None,
+                            beta=None,
+                            diag_load=False,
+                            apply_shrink=False,
+                            target_trace=float(N),
+                        )
         
             # Compute loss in FP32
             import os, time
@@ -1284,6 +1294,29 @@ class Trainer:
                         has_nonfinite_grad = True
                         break
                 if has_nonfinite_grad:
+                    # Diagnostics: identify which grads are non-finite (helps pinpoint the culprit quickly).
+                    try:
+                        bad = []
+                        for n, p in (self.refiner.named_parameters() if (self.train_refiner_only and self.refiner is not None) else self.model.named_parameters()):
+                            if p.grad is None:
+                                continue
+                            g = p.grad
+                            if not torch.isfinite(g).all():
+                                gmax = float(torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0).abs().max().detach().cpu())
+                                bad.append((n, str(g.dtype), gmax))
+                        if bad:
+                            print(f"[NONFINITE] ep={epoch} batch={bi} bad_grads(top10)={bad[:10]}", flush=True)
+                    except Exception:
+                        pass
+
+                    # AMP note: occasional overflow is normal early training; GradScaler is meant to adapt by skipping a step.
+                    overflow_hint_local = any(v > 0.0 for v in found_inf_map.values())
+                    if bool(getattr(cfg, "HPO_MODE", False)) and overflow_hint_local:
+                        print(f"[NONFINITE] ep={epoch} batch={bi} treated as AMP overflow (found_inf={found_inf_map}) -> skip batch", flush=True)
+                        self.opt.zero_grad(set_to_none=True)
+                        self.scaler.update()
+                        continue
+
                     if bool(getattr(cfg, "HPO_MODE", False)) and bool(getattr(cfg, "HPO_FAIL_FAST_ON_NONFINITE_GRADS", True)):
                         raise RuntimeError(f"Non-finite gradients detected (ep={epoch}, batch={bi}). Aborting HPO trial.")
                     # Non-HPO: skip the step cleanly (do not sanitize to zeros; that masks instability).

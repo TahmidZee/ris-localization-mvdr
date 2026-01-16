@@ -38,6 +38,12 @@ This document details all code changes made to transition from a K-head classifi
   - fixed `overflow` NameError in gradient logging (`overflow_hint`)
   - fixed surrogate validation `ptr` parsing (chunked layout) and converted angle RMSE to **degrees**
   - aligned validation loss with training by constructing `R_blend` in validation when `R_samp` is present
+- ✅ **Reduced remaining non-finite gradient events**:
+  - conditioned `R_pred` even when `R_samp` is missing (trace-normalize via `build_effective_cov_torch` with `beta=None`)
+  - HPO now treats `found_inf`-flagged non-finite grads as **AMP overflow** (skip + scaler update) instead of failing the entire trial immediately
+  - added lightweight logging of offending parameter gradients on the first non-finite event
+- ✅ **HPO no longer aborts the entire study** when one trial encounters non-finite gradients:
+  - non-finite-grad trials are pruned (`optuna.TrialPruned`) and the run continues
 
 ### Stage-2 SpectrumRefiner Training (Option B) — New Additions
 
