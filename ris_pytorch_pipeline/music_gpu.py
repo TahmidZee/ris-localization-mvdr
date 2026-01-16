@@ -450,12 +450,15 @@ class GPUMusicEstimator:
         M = I + (1.0 / delta.to(G.real.dtype)) * G
         M_inv = torch.linalg.inv(M)
 
-        # v = F^H a for all a: V = F^H A^T  -> [K_lr, P]
-        V = F.conj().transpose(0, 1) @ A_flat.transpose(0, 1)  # [K_lr, P]
-
-        # term = v^H M^{-1} v for each column
-        MV = M_inv @ V  # [K_lr, P]
-        quad = torch.real((V.conj() * MV).sum(dim=0))  # [P]
+        # IMPORTANT: Match the convention used by _compute_spectrum_mvdr(), which computes:
+        #   denom = Re( (a @ R_inv) · conj(a) )  == Re( a R_inv a^H )
+        # Using Woodbury:
+        #   denom = (1/δ)||a||^2 - (1/δ^2) * u M^{-1} u^H, where u = a F  (row-vector)
+        #
+        # This is numerically more consistent than using v = F^H a (which corresponds to a^H R_inv a).
+        U = A_flat @ F  # [P, K_lr]
+        UM = U @ M_inv  # [P, K_lr]
+        quad = torch.real((UM * U.conj()).sum(dim=1))  # [P]
 
         # ||a||^2 (should be ~1, but compute to be safe)
         a_norm2 = torch.real((A_flat.conj() * A_flat).sum(dim=1))  # [P]

@@ -252,6 +252,33 @@ class SysConfig:
         self.REFINER_GRID_THETA = 41
         # If None/empty, use estimator defaults (log-spaced near-field planes)
         self.REFINER_R_PLANES = None
+
+        # --- Refiner guardrails / fallback ---
+        # If the refiner output looks pathological (flat/saturated/too-many-peaks/non-finite),
+        # fall back to raw MVDR peak detection on R_eff.
+        self.REFINER_GUARD_ENABLE = True
+        self.REFINER_GUARD_MIN_STD = 1e-4           # prob-map std below this => too flat
+        self.REFINER_GUARD_MAX_SAT_FRAC = 0.10      # fraction(prob > 0.99) above this => too saturated
+        self.REFINER_GUARD_MAX_RAW_PEAKS = 2000      # too many local maxima => reject
+        self.REFINER_GUARD_FALLBACK_TO_MVDR = True   # if rejected/missing => MVDR fallback
+        self.ALLOW_INFER_WITHOUT_REFINER = True      # allow loading/infer without refiner (with fallback)
+        self.REFINER_REJECT_LOG_EVERY = 1            # print every N rejects (0 disables logging)
+
+        # --- Covariance sanity checks (cheap, catches silent corruption) ---
+        self.COV_SANITY_CHECK = True
+        self.COV_SANITY_STRICT = False               # if True, raise even outside HPO
+        self.COV_SANITY_TRACE_RTOL = 1e-2
+        self.COV_SANITY_HERMITIAN_ATOL = 1e-3
+
+        # --- Surrogate peak-level metrics (MVDR-based, eval-time only) ---
+        # Keeps training objective unchanged but reports what matters: FP/recall tradeoff.
+        self.SURROGATE_PEAK_METRICS = True
+        self.SURROGATE_PEAK_MAX_SCENES = 32          # cap per validation epoch
+        self.SURROGATE_PEAK_GRID_PHI = 121           # coarse grids to keep it cheap
+        self.SURROGATE_PEAK_GRID_THETA = 61
+        self.SURROGATE_DET_TOL_PHI_DEG = 5.0
+        self.SURROGATE_DET_TOL_THETA_DEG = 5.0
+        self.SURROGATE_DET_TOL_R_M = 1.0
         
         # === Validation & Checkpointing Strategy ===
         # VAL_PRIMARY options:

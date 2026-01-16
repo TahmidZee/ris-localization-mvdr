@@ -134,12 +134,14 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
             # Attach to model for inference usage
             model._spectrum_refiner = refiner
             print("✅ Loaded SpectrumRefiner weights from checkpoint")
-        elif require_refiner:
+        elif require_refiner and (not bool(getattr(cfg, "ALLOW_INFER_WITHOUT_REFINER", False))):
             raise ValueError(
                 "SpectrumRefiner weights not found in checkpoint. "
                 "Inference now requires a Stage-2 refiner checkpoint (format: {'backbone':..., 'refiner':...}). "
                 "Run `python ris_pytorch_pipeline/ris_pipeline.py train-refiner` (Option B) and use that checkpoint."
             )
+        elif require_refiner:
+            print("⚠️ SpectrumRefiner weights not found in checkpoint; proceeding with MVDR-only fallback (ALLOW_INFER_WITHOUT_REFINER=True).", flush=True)
 
         model.eval()
         return model
@@ -300,12 +302,45 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     max_sources = int(force_K) if (force_K is not None) else int(cfg.K_MAX)
 
     use_refiner_cfg = bool(getattr(cfg, "USE_SPECTRUM_REFINER_IN_INFER", True))
-    if not use_refiner_cfg:
-        raise ValueError("USE_SPECTRUM_REFINER_IN_INFER is False, but the refiner is part of the production plan. Set it True in configs.py.")
-    if (not hasattr(model, "_spectrum_refiner")) or (getattr(model, "_spectrum_refiner", None) is None):
+    has_refiner = hasattr(model, "_spectrum_refiner") and (getattr(model, "_spectrum_refiner", None) is not None)
+    allow_fallback = bool(getattr(cfg, "REFINER_GUARD_FALLBACK_TO_MVDR", True))
+
+    # Helper: raw MVDR fallback path (K-free, uses robust thresholding).
+    def _mvdr_fallback():
+        try:
+            est = get_gpu_estimator(cfg, device=device_str)
+            sources, _spec = mvdr_detect_sources(
+                R_eff,
+                cfg,
+                device=device_str,
+                grid_phi=int(getattr(cfg, "MVDR_GRID_PHI", 361)),
+                grid_theta=int(getattr(cfg, "MVDR_GRID_THETA", 181)),
+                r_planes=getattr(cfg, "REFINER_R_PLANES", None) or est.default_r_planes_mvdr,
+                delta_scale=float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2)),
+                threshold_db=float(getattr(cfg, "MVDR_THRESH_DB", 12.0)),
+                threshold_mode=str(getattr(cfg, "MVDR_THRESH_MODE", "mad")),
+                cfar_z=float(getattr(cfg, "MVDR_CFAR_Z", 5.0)),
+                max_sources=max_sources,
+                do_refinement=bool(getattr(cfg, "MVDR_DO_REFINEMENT", True)),
+            )
+            if len(sources) == 0:
+                return [], [], []
+            phi_deg = np.array([s[0] for s in sources], dtype=np.float32)
+            theta_deg = np.array([s[1] for s in sources], dtype=np.float32)
+            r_m = np.array([s[2] for s in sources], dtype=np.float32)
+            return np.deg2rad(phi_deg).tolist(), np.deg2rad(theta_deg).tolist(), r_m.tolist()
+        except Exception:
+            return [], [], []
+
+    # If refiner is disabled/missing, fall back if allowed.
+    if (not use_refiner_cfg) or (not has_refiner):
+        if allow_fallback:
+            if int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0:
+                print("[INFER] Refiner unavailable/disabled -> MVDR fallback", flush=True)
+            return _mvdr_fallback()
         raise ValueError(
-            "SpectrumRefiner is required for inference but was not attached to the model. "
-            "Load a Stage-2 refiner checkpoint via load_model(..., require_refiner=True)."
+            "SpectrumRefiner is required for inference but was not attached to the model and fallback is disabled. "
+            "Load a Stage-2 refiner checkpoint or set REFINER_GUARD_FALLBACK_TO_MVDR=True."
         )
 
     if True:
@@ -352,6 +387,24 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
         pooled = F.max_pool2d(prob2d[None, None], kernel_size=ksize, stride=1, padding=min_sep)[0, 0]
         is_max = (prob2d >= pooled)
 
+        # Guardrail: reject pathological refiner outputs (flat/saturated/non-finite/too-many-peaks).
+        if bool(getattr(cfg, "REFINER_GUARD_ENABLE", True)):
+            try:
+                if (not torch.isfinite(prob2d).all()):
+                    raise RuntimeError("non-finite prob map")
+                pstd = float(prob2d.std().item())
+                if pstd < float(getattr(cfg, "REFINER_GUARD_MIN_STD", 1e-4)):
+                    raise RuntimeError(f"prob map too flat (std={pstd:.3e})")
+                sat = float((prob2d > 0.99).float().mean().item())
+                if sat > float(getattr(cfg, "REFINER_GUARD_MAX_SAT_FRAC", 0.10)):
+                    raise RuntimeError(f"prob map too saturated (sat_frac={sat:.3f})")
+            except Exception as e:
+                if allow_fallback:
+                    if int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0:
+                        print(f"[INFER] Refiner rejected ({e}) -> MVDR fallback", flush=True)
+                    return _mvdr_fallback()
+                raise
+
         # Apply absolute or relative thresholding (relative is default; avoids brittle calibration).
         peak_thresh = getattr(cfg, "REFINER_PEAK_THRESH", None)
         if peak_thresh is not None:
@@ -363,6 +416,14 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             is_max = is_max & (prob2d >= (rel * pmax))
 
         idx = torch.nonzero(is_max, as_tuple=False)
+        if bool(getattr(cfg, "REFINER_GUARD_ENABLE", True)):
+            max_raw = int(getattr(cfg, "REFINER_GUARD_MAX_RAW_PEAKS", 2000))
+            if idx.numel() > 0 and idx.shape[0] > max_raw:
+                if allow_fallback:
+                    if int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0:
+                        print(f"[INFER] Refiner rejected (too many peaks: {idx.shape[0]}) -> MVDR fallback", flush=True)
+                    return _mvdr_fallback()
+                # else: keep going and rely on top-K truncation
         if idx.numel() == 0:
             # Fallback: take the global max (still K-free; avoids MDL fallback).
             flat = prob2d.flatten()

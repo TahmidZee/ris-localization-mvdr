@@ -1638,6 +1638,73 @@ class Trainer:
         - Aux angle/range RMSE (from phi_theta_r head)
         - Composite score for model selection (higher is better)
         """
+        # Small helper: assignment-based matching to avoid punishing permutation of sources.
+        def _match_errors_deg(phi_p_deg, th_p_deg, r_p_m, phi_g_deg, th_g_deg, r_g_m):
+            """
+            Returns per-match absolute errors (deg/deg/m) for min(P, G) matches.
+            Uses Hungarian if SciPy is available; greedy fallback otherwise.
+            """
+            phi_p_deg = np.asarray(phi_p_deg, dtype=np.float64).reshape(-1)
+            th_p_deg = np.asarray(th_p_deg, dtype=np.float64).reshape(-1)
+            r_p_m = np.asarray(r_p_m, dtype=np.float64).reshape(-1)
+            phi_g_deg = np.asarray(phi_g_deg, dtype=np.float64).reshape(-1)
+            th_g_deg = np.asarray(th_g_deg, dtype=np.float64).reshape(-1)
+            r_g_m = np.asarray(r_g_m, dtype=np.float64).reshape(-1)
+
+            P, G = len(phi_p_deg), len(phi_g_deg)
+            m = min(P, G)
+            if m == 0:
+                return [], [], []
+
+            # Normalization scales (keep stable across datasets; K<=5 so this is cheap).
+            s_phi = float(getattr(cfg, "SURR_MATCH_SIGMA_PHI_DEG", 5.0))
+            s_th = float(getattr(cfg, "SURR_MATCH_SIGMA_THETA_DEG", 5.0))
+            s_r = float(getattr(cfg, "SURR_MATCH_SIGMA_R_M", 1.0))
+            s_phi = max(s_phi, 1e-6)
+            s_th = max(s_th, 1e-6)
+            s_r = max(s_r, 1e-6)
+
+            # Cost: normalized L2 in (phi,theta,r)
+            C = np.full((P, G), 1e9, dtype=np.float64)
+            for i in range(P):
+                for j in range(G):
+                    dphi = abs(phi_p_deg[i] - phi_g_deg[j]) / s_phi
+                    dth = abs(th_p_deg[i] - th_g_deg[j]) / s_th
+                    dr = abs(r_p_m[i] - r_g_m[j]) / s_r
+                    C[i, j] = (dphi * dphi + dth * dth + dr * dr) ** 0.5
+
+            try:
+                from scipy.optimize import linear_sum_assignment
+                ri, ci = linear_sum_assignment(C)
+                pairs = [(int(ri[k]), int(ci[k])) for k in range(min(len(ri), m))]
+            except Exception:
+                # Greedy fallback
+                pairs = []
+                used_i, used_j = set(), set()
+                for _ in range(m):
+                    best = None
+                    bestv = 1e18
+                    for i in range(P):
+                        if i in used_i:
+                            continue
+                        for j in range(G):
+                            if j in used_j:
+                                continue
+                            v = float(C[i, j])
+                            if v < bestv:
+                                bestv = v
+                                best = (i, j)
+                    if best is None:
+                        break
+                    used_i.add(best[0])
+                    used_j.add(best[1])
+                    pairs.append(best)
+
+            dphi = [abs(phi_p_deg[i] - phi_g_deg[j]) for i, j in pairs]
+            dth = [abs(th_p_deg[i] - th_g_deg[j]) for i, j in pairs]
+            dr = [abs(r_p_m[i] - r_g_m[j]) for i, j in pairs]
+            return dphi, dth, dr
+
         self.model.eval()
         total_loss = 0.0
         n_samples = 0
@@ -1646,6 +1713,16 @@ class Trainer:
         aux_phi_err = []
         aux_theta_err = []
         aux_r_err = []
+
+        # Optional: MVDR peak-level detection metrics (what matters in practice).
+        do_peak_metrics = bool(getattr(cfg, "SURROGATE_PEAK_METRICS", False))
+        peak_max_scenes = int(getattr(cfg, "SURROGATE_PEAK_MAX_SCENES", 0))
+        peak_max_scenes = max(0, peak_max_scenes)
+        peak_evald = 0
+        peak_tp = 0
+        peak_fp = 0
+        peak_fn = 0
+        pssr_db_vals = []
         
         iters = len(loader) if max_batches is None else min(len(loader), max_batches)
         
@@ -1752,14 +1829,103 @@ class Trainer:
                         pr_th  = phi_theta_r_pred[i, Kmax:2*Kmax][:k_i]
                         pr_r   = phi_theta_r_pred[i, 2*Kmax:3*Kmax][:k_i]
 
-                        # Errors (convert angles to DEGREES for reporting + surrogate weighting)
-                        dphi_deg = torch.rad2deg(torch.abs(pr_phi - gt_phi))
-                        dth_deg  = torch.rad2deg(torch.abs(pr_th  - gt_th))
-                        dr       = torch.abs(pr_r - gt_r)
+                        # Convert to degrees/meters and compute MATCHED errors (perm-invariant).
+                        gt_phi_deg = torch.rad2deg(gt_phi).numpy()
+                        gt_th_deg = torch.rad2deg(gt_th).numpy()
+                        gt_r_m = gt_r.numpy()
+                        pr_phi_deg = torch.rad2deg(pr_phi).numpy()
+                        pr_th_deg = torch.rad2deg(pr_th).numpy()
+                        pr_r_m = pr_r.numpy()
 
-                        aux_phi_err.extend(dphi_deg.tolist())
-                        aux_theta_err.extend(dth_deg.tolist())
-                        aux_r_err.extend(dr.tolist())
+                        dphi, dth, dr = _match_errors_deg(pr_phi_deg, pr_th_deg, pr_r_m, gt_phi_deg, gt_th_deg, gt_r_m)
+                        aux_phi_err.extend(dphi)
+                        aux_theta_err.extend(dth)
+                        aux_r_err.extend(dr)
+
+                # ---------- Peak-level MVDR detection metrics (optional) ----------
+                if do_peak_metrics and ("R_blend" in preds) and (peak_max_scenes == 0 or peak_evald < peak_max_scenes):
+                    try:
+                        from .music_gpu import mvdr_detect_sources, get_gpu_estimator
+                        est = get_gpu_estimator(cfg, device=("cuda" if torch.cuda.is_available() else "cpu"))
+                        tol_phi = float(getattr(cfg, "SURROGATE_DET_TOL_PHI_DEG", 5.0))
+                        tol_th = float(getattr(cfg, "SURROGATE_DET_TOL_THETA_DEG", 5.0))
+                        tol_r = float(getattr(cfg, "SURROGATE_DET_TOL_R_M", 1.0))
+                        gphi = int(getattr(cfg, "SURROGATE_PEAK_GRID_PHI", 121))
+                        gth = int(getattr(cfg, "SURROGATE_PEAK_GRID_THETA", 61))
+                        r_planes = getattr(cfg, "REFINER_R_PLANES", None) or est.default_r_planes_mvdr
+                        delta_scale = float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2))
+                        thr_db = float(getattr(cfg, "MVDR_THRESH_DB", 12.0))
+                        thr_mode = str(getattr(cfg, "MVDR_THRESH_MODE", "mad"))
+                        cfar_z = float(getattr(cfg, "MVDR_CFAR_Z", 5.0))
+
+                        # Per-scene loop (cap by peak_max_scenes)
+                        Rb = preds["R_blend"]  # [B,N,N] complex
+                        for i in range(B):
+                            if peak_max_scenes != 0 and peak_evald >= peak_max_scenes:
+                                break
+                            k_i = int(K_true_list[i])
+                            if k_i <= 0:
+                                continue
+
+                            # GT (degrees/meters)
+                            Kmax = int(getattr(cfg, "K_MAX", 5))
+                            gt_phi = ptr_gt[i, :Kmax][:k_i]
+                            gt_th = ptr_gt[i, Kmax:2*Kmax][:k_i]
+                            gt_r = ptr_gt[i, 2*Kmax:3*Kmax][:k_i]
+                            gt_phi_deg = torch.rad2deg(gt_phi).numpy()
+                            gt_th_deg = torch.rad2deg(gt_th).numpy()
+                            gt_r_m = gt_r.numpy()
+
+                            # MVDR detect (full MVDR, K-free)
+                            sources, spectrum = mvdr_detect_sources(
+                                Rb[i].detach(),
+                                cfg,
+                                device=("cuda" if torch.cuda.is_available() else "cpu"),
+                                grid_phi=gphi,
+                                grid_theta=gth,
+                                r_planes=r_planes,
+                                delta_scale=delta_scale,
+                                threshold_db=thr_db,
+                                threshold_mode=thr_mode,
+                                cfar_z=cfar_z,
+                                max_sources=int(getattr(cfg, "K_MAX", 5)),
+                                do_refinement=False,  # keep it cheap for validation
+                                prepared=False,
+                            )
+                            peak_evald += 1
+
+                            # PSSR (max vs median) on spectrum_max
+                            try:
+                                spec = np.asarray(spectrum, dtype=np.float64)
+                                eps = 1e-12
+                                pmax = float(np.max(spec)) if spec.size else 0.0
+                                pmed = float(np.median(spec)) if spec.size else 0.0
+                                pssr = 10.0 * np.log10(max(pmax, eps) / max(pmed, eps))
+                                if np.isfinite(pssr):
+                                    pssr_db_vals.append(float(pssr))
+                            except Exception:
+                                pass
+
+                            # Pred arrays
+                            phi_p = np.array([s[0] for s in sources], dtype=np.float64)
+                            th_p = np.array([s[1] for s in sources], dtype=np.float64)
+                            r_p = np.array([s[2] for s in sources], dtype=np.float64)
+
+                            # Match using the same matcher (but in degrees/meters already)
+                            dphi, dth, dr = _match_errors_deg(phi_p, th_p, r_p, gt_phi_deg, gt_th_deg, gt_r_m)
+                            # Count TP as matched within tolerance in all dims
+                            tp_i = 0
+                            for a, b, c in zip(dphi, dth, dr):
+                                if (a <= tol_phi) and (b <= tol_th) and (c <= tol_r):
+                                    tp_i += 1
+                            fp_i = max(0, len(phi_p) - tp_i)
+                            fn_i = max(0, k_i - tp_i)
+                            peak_tp += tp_i
+                            peak_fp += fp_i
+                            peak_fn += fn_i
+                    except Exception:
+                        # Never let metrics break validation.
+                        pass
         
         # Compute summary metrics
         avg_loss = total_loss / max(1, n_samples)
@@ -1787,6 +1953,26 @@ class Trainer:
             "aux_r_rmse": r_rmse,
             "score": score,
         }
+
+        # Optional peak-level metrics
+        if do_peak_metrics and peak_evald > 0:
+            prec = float(peak_tp) / max(1.0, float(peak_tp + peak_fp))
+            rec = float(peak_tp) / max(1.0, float(peak_tp + peak_fn))
+            fp_per_scene = float(peak_fp) / max(1.0, float(peak_evald))
+            metrics.update(
+                {
+                    "peak_precision": prec,
+                    "peak_recall": rec,
+                    "peak_fp_per_scene": fp_per_scene,
+                    "peak_pssr_db_med": float(np.median(pssr_db_vals)) if pssr_db_vals else 0.0,
+                    "peak_eval_scenes": int(peak_evald),
+                }
+            )
+            print(
+                f"[VAL PEAK] scenes={peak_evald} precision={prec:.3f} recall={rec:.3f} "
+                f"fp/scene={fp_per_scene:.2f} pssr_med={metrics['peak_pssr_db_med']:.2f}dB",
+                flush=True,
+            )
         
         print(
             f"[VAL SURROGATE] loss={avg_loss:.4f}, "

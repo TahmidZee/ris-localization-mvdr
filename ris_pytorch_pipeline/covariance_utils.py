@@ -84,6 +84,35 @@ def build_effective_cov_torch(
         # Shrinkage formula: (1-α)R + α*μ*I preserves trace if μ = tr(R)/N, which it does
         # So no re-norm needed here (and we want to preserve the shrinkage effect)
 
+    # Optional sanity checks (useful for catching silent numeric corruption early).
+    if bool(getattr(cfg, "COV_SANITY_CHECK", False)):
+        try:
+            tol_trace = float(getattr(cfg, "COV_SANITY_TRACE_RTOL", 1e-2))
+            tol_herm = float(getattr(cfg, "COV_SANITY_HERMITIAN_ATOL", 1e-3))
+            # Finite
+            if not torch.isfinite(R.real).all() or not torch.isfinite(R.imag).all():
+                raise RuntimeError("non-finite entries")
+            # Hermitian (relative to scale)
+            anti = R - R.conj().transpose(-2, -1)
+            anti_max = float(torch.max(torch.abs(anti)).detach().cpu().item())
+            scale = float(torch.max(torch.abs(R)).detach().cpu().item())
+            scale = max(scale, 1e-12)
+            if anti_max > (tol_herm * scale + 1e-12):
+                raise RuntimeError(f"not Hermitian enough (anti_max={anti_max:.3e}, scale={scale:.3e})")
+            # Trace close to target
+            tr = torch.diagonal(R, dim1=-2, dim2=-1).real.sum(-1)  # [B]
+            target = float(target_trace)
+            tr_rel = torch.max(torch.abs(tr - target) / max(target, 1e-9)).detach().cpu().item()
+            if float(tr_rel) > tol_trace:
+                raise RuntimeError(f"bad trace (max_rel_err={float(tr_rel):.3e}, target={target:.3g})")
+        except Exception as e:
+            # In HPO we want to fail-fast (prune), otherwise warn once and continue.
+            if bool(getattr(cfg, "HPO_MODE", False)):
+                raise
+            if not hasattr(build_effective_cov_torch, "_warned_sanity"):
+                print(f"[WARN] COV_SANITY_CHECK failed (continuing): {e}", flush=True)
+                setattr(build_effective_cov_torch, "_warned_sanity", True)
+
     return R
 
 
