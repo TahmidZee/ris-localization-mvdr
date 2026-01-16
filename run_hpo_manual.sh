@@ -10,10 +10,8 @@
 #     - 50 trials, 20 epochs max, aggressive pruning
 #     - Goal: Find good regions, not final hyperparameters
 #     - Time: ~6-10 hours
-#   Stage 2 (run_stage2_refinement.sh): Refine top 5 configs on full data
-#     - 5 runs, 50 epochs each, full 100K dataset
-#     - Goal: Find best final model
-#     - Time: ~20-30 hours total
+#   Stage 2 (manual): Train top configs on full data using `ris_pipeline train`
+#   Optional Stage 2b (MVDR): Train SpectrumRefiner using `ris_pipeline train-refiner`
 
 set -e  # Exit on error
 
@@ -123,11 +121,14 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "NEXT STEP: Run Stage 2 Refinement"
     echo "=============================================================================="
     echo ""
-    echo "Stage 2 will train top 5 configs on FULL dataset (100K samples):"
+    echo "Stage 2 will train top configs on FULL dataset (100K samples)."
+    echo "The legacy run_stage2_refinement scripts were removed during MVDR cleanup."
     echo ""
-    echo "  ./run_stage2_refinement.sh"
+    echo "Manual full-data training:"
+    echo "  python -m ris_pytorch_pipeline.ris_pipeline train --epochs 50 --use_shards --n_train 100000 --n_val 10000"
     echo ""
-    echo "Or manually run full training with best config:"
+    echo "Optional Stage 2b (MVDR SpectrumRefiner):"
+    echo "  python -m ris_pytorch_pipeline.ris_pipeline train-refiner --backbone_ckpt <path_to_best.pt> --epochs 10 --use_shards"
     echo ""
     echo "  python train_ris.py --epochs 50 --batch-size 64"
     echo ""

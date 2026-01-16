@@ -70,6 +70,19 @@ def main():
     g2.add_argument("--from_hpo", type=str, default=None,
                     help="Path to results_final/hpo/best.json")
 
+    # --- train SpectrumRefiner (Option B Stage 2) ---
+    g2r = sub.add_parser("train-refiner", help="Train SpectrumRefiner on MVDR spectra (freeze backbone)")
+    g2r.add_argument("--backbone_ckpt", type=str, required=True, help="Path to pretrained backbone checkpoint")
+    g2r.add_argument("--epochs", type=int, default=10)
+    g2r.add_argument("--n_train", type=int, default=160000)
+    g2r.add_argument("--n_val", type=int, default=40000)
+    g2r.add_argument("--use_shards", action="store_true")
+    g2r.add_argument("--lam_heatmap", type=float, default=0.1)
+    g2r.add_argument("--grid_phi", type=int, default=61)
+    g2r.add_argument("--grid_theta", type=int, default=41)
+    g2r.add_argument("--out_ckpt_dir", type=str, default=None, help="Override cfg.CKPT_DIR for refiner stage")
+    g2r.add_argument("--from_hpo", type=str, default=None, help="Optional best.json for backbone arch params")
+
     # --- HPO ---
     g = sub.add_parser("hpo", help="Hyperparameter optimization")
     g.add_argument("--trials", type=int, default=60)
@@ -145,6 +158,20 @@ def main():
                                  eta_perturb=args.eta, override_L=args.L)
 
     elif args.cmd == "train":
+        t = Trainer(from_hpo=args.from_hpo)
+        t.fit(epochs=args.epochs, n_train=args.n_train, n_val=args.n_val, use_shards=args.use_shards)
+
+    elif args.cmd == "train-refiner":
+        # Configure stage-2 refiner training (Option B)
+        cfg.TRAIN_PHASE = "refiner"
+        cfg.INIT_CKPT = str(args.backbone_ckpt)
+        mdl_cfg.LAM_HEATMAP = float(args.lam_heatmap)
+        cfg.REFINER_GRID_PHI = int(args.grid_phi)
+        cfg.REFINER_GRID_THETA = int(args.grid_theta)
+        if args.out_ckpt_dir:
+            cfg.CKPT_DIR = str(args.out_ckpt_dir)
+            Path(cfg.CKPT_DIR).mkdir(parents=True, exist_ok=True)
+
         t = Trainer(from_hpo=args.from_hpo)
         t.fit(epochs=args.epochs, n_train=args.n_train, n_val=args.n_val, use_shards=args.use_shards)
 

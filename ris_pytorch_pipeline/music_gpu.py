@@ -94,8 +94,12 @@ class GPUMusicEstimator:
         # Pre-compute exchange matrices for FBA
         self._J = self._build_exchange_matrix().to(self.device)
         
-        # Default parameters
-        self.default_r_planes = [0.6, 1.5, 3.0, 6.0, 9.0]  # 5 range planes
+        # Default parameters - LOG-SPACED for near-field (more density at close range)
+        self.default_r_planes = [0.6, 1.5, 3.0, 6.0, 9.0]  # 5 planes (legacy)
+        self.default_r_planes_mvdr = [0.55, 0.85, 1.3, 2.0, 3.5, 6.0, 9.5]  # 7 planes (recommended)
+        
+        # MVDR diagonal loading default
+        self.mvdr_delta_scale = 1e-2  # δ = scale * tr(R) / N
         
         # Store config for later use
         self.cfg = cfg
@@ -362,6 +366,310 @@ class GPUMusicEstimator:
         return spectrum_max, winning_ranges
     
     # =========================================================================
+    # MVDR/Capon Spectrum Computation (K-FREE)
+    # =========================================================================
+    
+    def _compute_R_inv(self, R: torch.Tensor, delta_scale: Optional[float] = None) -> torch.Tensor:
+        """
+        Compute regularized inverse of covariance matrix for MVDR.
+        
+        Args:
+            R: Covariance [N, N] complex64
+            delta_scale: Diagonal loading scale (δ = scale * tr(R) / N)
+            
+        Returns:
+            R_inv: [N, N] complex64
+        """
+        N = R.shape[-1]
+        delta_scale = delta_scale or self.mvdr_delta_scale
+        
+        # Diagonal loading: δ = scale * tr(R) / N
+        trace_R = torch.real(torch.trace(R))
+        delta = delta_scale * trace_R / N
+        
+        # Regularize and invert
+        R_reg = R + delta * torch.eye(N, dtype=R.dtype, device=R.device)
+        R_inv = torch.linalg.inv(R_reg)
+        
+        return R_inv
+    
+    def _compute_spectrum_mvdr(self, R_inv: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        """
+        Compute MVDR/Capon spectrum: P = 1 / (a^H R_inv a).
+        
+        This is K-FREE - no subspace split needed!
+        
+        Args:
+            R_inv: Inverse covariance [N, N] complex64
+            A: Steering vectors [G_phi, G_theta, N] complex64
+            
+        Returns:
+            Spectrum [G_phi, G_theta] float32
+        """
+        G_phi, G_theta, N = A.shape
+        A_flat = A.reshape(-1, N)  # [G_phi*G_theta, N]
+        
+        # Efficient: (A @ R_inv) * A.conj() summed over N
+        AR = torch.matmul(A_flat, R_inv)  # [G_phi*G_theta, N]
+        denom = torch.real((AR * A_flat.conj()).sum(dim=1))  # [G_phi*G_theta]
+        denom = torch.clamp(denom, min=1e-12)
+        
+        return (1.0 / denom).reshape(G_phi, G_theta).float()
+
+    def _compute_spectrum_mvdr_lowrank(self, A_flat: torch.Tensor, F: torch.Tensor, delta_scale: float = 1e-2) -> torch.Tensor:
+        """
+        Fast MVDR spectrum for low-rank covariance using Woodbury identity.
+
+        We assume:
+            R = F F^H + δ I
+        where F is [N, K_lr] (K_lr is small; e.g. 5–10).
+
+        Then:
+            a^H R^{-1} a = (1/δ)||a||^2 - (1/δ^2) v^H (I + (1/δ) G)^{-1} v
+            where v = F^H a and G = F^H F.
+
+        Args:
+            A_flat: steering vectors flattened to [P, N] complex64
+            F: low-rank factors [N, K_lr] complex64
+            delta_scale: diagonal loading scale; δ = delta_scale * tr(R0)/N, where R0 = F F^H
+
+        Returns:
+            spectrum_flat: [P] float32 MVDR spectrum values
+        """
+        # Shapes
+        P, N = A_flat.shape
+        K_lr = F.shape[1]
+
+        # Compute δ from trace(F F^H) = ||F||_F^2
+        trace_R0 = torch.real((F.conj() * F).sum()).to(torch.float32)
+        delta = (float(delta_scale) * trace_R0 / float(N)).clamp(min=1e-6)  # scalar float32 tensor
+
+        # Precompute small KxK system: M = I + (1/δ) G
+        G = F.conj().transpose(0, 1) @ F  # [K_lr, K_lr]
+        I = torch.eye(K_lr, device=self.device, dtype=G.dtype)
+        M = I + (1.0 / delta.to(G.real.dtype)) * G
+        M_inv = torch.linalg.inv(M)
+
+        # v = F^H a for all a: V = F^H A^T  -> [K_lr, P]
+        V = F.conj().transpose(0, 1) @ A_flat.transpose(0, 1)  # [K_lr, P]
+
+        # term = v^H M^{-1} v for each column
+        MV = M_inv @ V  # [K_lr, P]
+        quad = torch.real((V.conj() * MV).sum(dim=0))  # [P]
+
+        # ||a||^2 (should be ~1, but compute to be safe)
+        a_norm2 = torch.real((A_flat.conj() * A_flat).sum(dim=1))  # [P]
+
+        denom = (1.0 / delta) * a_norm2 - (1.0 / (delta * delta)) * quad
+        denom = torch.clamp(denom, min=1e-12)
+        return (1.0 / denom).to(torch.float32)
+
+    def mvdr_spectrum_max_2_5d_lowrank(self,
+                                       F: torch.Tensor,
+                                       phi_grid: torch.Tensor,
+                                       theta_grid: torch.Tensor,
+                                       r_planes: List[float],
+                                       delta_scale: float = 1e-2) -> torch.Tensor:
+        """
+        Compute 2.5D MVDR spectrum max over range planes using low-rank Woodbury MVDR.
+
+        Args:
+            F: [N, K_lr] complex64 factors (concatenated angle/range factors)
+            phi_grid, theta_grid: grids in radians
+            r_planes: list of range planes
+            delta_scale: diagonal loading scale
+
+        Returns:
+            spectrum_max: [G_phi, G_theta] float32
+        """
+        G_phi, G_theta = len(phi_grid), len(theta_grid)
+        P = G_phi * G_theta
+        spectrum_max = torch.zeros(P, device=self.device, dtype=torch.float32)
+
+        for r in r_planes:
+            A = self._steering_nearfield_grid(phi_grid, theta_grid, r)  # [G_phi,G_theta,N]
+            A_flat = A.reshape(-1, A.shape[-1])  # [P,N]
+            spec_flat = self._compute_spectrum_mvdr_lowrank(A_flat, F, delta_scale=delta_scale)  # [P]
+            spectrum_max = torch.maximum(spectrum_max, spec_flat)
+
+        return spectrum_max.reshape(G_phi, G_theta)
+    
+    def _compute_spectrum_mvdr_2d(self, R_inv: torch.Tensor,
+                                   phi_grid: torch.Tensor, 
+                                   theta_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Compute 2D MVDR spectrum (far-field, fast).
+        """
+        A = self._steering_planar_grid(phi_grid, theta_grid)
+        return self._compute_spectrum_mvdr(R_inv, A)
+    
+    def _compute_spectrum_mvdr_2_5d(self, R_inv: torch.Tensor,
+                                     phi_grid: torch.Tensor, 
+                                     theta_grid: torch.Tensor,
+                                     r_planes: List[float]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute 2.5D MVDR spectrum: P(phi, theta) = max_r P(phi, theta, r).
+        
+        K-FREE alternative to MUSIC 2.5D.
+        
+        Args:
+            R_inv: Inverse covariance [N, N]
+            phi_grid: [G_phi] radians
+            theta_grid: [G_theta] radians
+            r_planes: Range planes [R] meters
+            
+        Returns:
+            spectrum_max: [G_phi, G_theta] - max over range planes
+            winning_ranges: [G_phi, G_theta] - best range per angle
+            spectrum_3d: [G_phi, G_theta, n_planes] - full 3D spectrum
+        """
+        G_phi, G_theta = len(phi_grid), len(theta_grid)
+        n_planes = len(r_planes)
+        
+        # Compute spectrum for all range planes
+        spectrum_3d = torch.zeros(G_phi, G_theta, n_planes, device=self.device, dtype=torch.float32)
+        
+        for ri, r in enumerate(r_planes):
+            A = self._steering_nearfield_grid(phi_grid, theta_grid, r)
+            spectrum_3d[:, :, ri] = self._compute_spectrum_mvdr(R_inv, A)
+        
+        # Max over range planes
+        spectrum_max, plane_idx = torch.max(spectrum_3d, dim=-1)
+        
+        # Convert plane indices to range values
+        r_planes_t = torch.tensor(r_planes, device=self.device, dtype=torch.float32)
+        winning_ranges = r_planes_t[plane_idx]
+        
+        return spectrum_max, winning_ranges, spectrum_3d
+    
+    def _compute_spectrum_mvdr_3d_local(self, R_inv: torch.Tensor,
+                                         phi_grid: torch.Tensor,
+                                         theta_grid: torch.Tensor,
+                                         r_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Compute full 3D MVDR spectrum for local refinement.
+        
+        Args:
+            R_inv: Inverse covariance [N, N]
+            phi_grid: [G_phi] radians
+            theta_grid: [G_theta] radians
+            r_grid: [G_r] meters
+            
+        Returns:
+            spectrum_3d: [G_phi, G_theta, G_r] float32
+        """
+        G_phi, G_theta, G_r = len(phi_grid), len(theta_grid), len(r_grid)
+        spectrum_3d = torch.zeros(G_phi, G_theta, G_r, device=self.device, dtype=torch.float32)
+        
+        for ri, r in enumerate(r_grid):
+            A = self._steering_nearfield_grid(phi_grid, theta_grid, float(r))
+            spectrum_3d[:, :, ri] = self._compute_spectrum_mvdr(R_inv, A)
+        
+        return spectrum_3d
+    
+    # =========================================================================
+    # 3D NMS and Candidate Extraction
+    # =========================================================================
+    
+    def _find_local_maxima_3d(self, spectrum_3d: torch.Tensor, 
+                               min_sep_phi: int = 3, 
+                               min_sep_theta: int = 3,
+                               min_sep_r: int = 1) -> List[Tuple[int, int, int, float]]:
+        """
+        Find local maxima in 3D spectrum using max pooling.
+        
+        Args:
+            spectrum_3d: [G_phi, G_theta, G_r] float32
+            min_sep_*: Minimum separation in grid units
+            
+        Returns:
+            List of (phi_idx, theta_idx, r_idx, value) sorted by value descending
+        """
+        G_phi, G_theta, G_r = spectrum_3d.shape
+        
+        # Pad for 3D max pooling
+        kernel_size = (2*min_sep_phi + 1, 2*min_sep_theta + 1, 2*min_sep_r + 1)
+        padding = (min_sep_phi, min_sep_theta, min_sep_r)
+        
+        # 3D max pooling to find local maxima
+        spectrum_4d = spectrum_3d.unsqueeze(0).unsqueeze(0)  # [1, 1, G_phi, G_theta, G_r]
+        local_max = F.max_pool3d(spectrum_4d, kernel_size=kernel_size, stride=1, padding=padding)
+        local_max = local_max.squeeze()  # [G_phi, G_theta, G_r]
+        
+        # Points where value equals local max are maxima
+        is_max = (spectrum_3d == local_max) & (spectrum_3d > 0)
+        
+        # Extract maxima indices and values
+        max_indices = torch.nonzero(is_max, as_tuple=False)  # [n_maxima, 3]
+        max_values = spectrum_3d[is_max]
+        
+        # Sort by value descending
+        sorted_idx = torch.argsort(max_values, descending=True)
+        
+        maxima = []
+        for idx in sorted_idx:
+            i, j, k = max_indices[idx].tolist()
+            v = max_values[idx].item()
+            maxima.append((i, j, k, v))
+        
+        return maxima
+    
+    def _nms_3d(self, maxima: List[Tuple[int, int, int, float]],
+                phi_grid: torch.Tensor, theta_grid: torch.Tensor, r_grid: torch.Tensor,
+                min_sep_deg: float = 5.0, min_sep_r: float = 0.5,
+                n_keep: int = 20) -> List[Tuple[float, float, float, float]]:
+        """
+        Non-maximum suppression in physical coordinates.
+        
+        Args:
+            maxima: List of (phi_idx, theta_idx, r_idx, value)
+            phi_grid, theta_grid: Grid in radians
+            r_grid: Grid in meters (can be planes or fine grid)
+            min_sep_deg: Minimum angular separation (degrees)
+            min_sep_r: Minimum range separation (meters)
+            n_keep: Maximum candidates to keep
+            
+        Returns:
+            List of (phi_deg, theta_deg, r_m, value) after NMS
+        """
+        candidates = []
+        min_sep_rad = np.deg2rad(min_sep_deg)
+        
+        # Convert grid to numpy for indexing
+        phi_np = phi_grid.cpu().numpy()
+        theta_np = theta_grid.cpu().numpy()
+        
+        # Handle both planes (list) and fine grid (tensor)
+        if isinstance(r_grid, torch.Tensor):
+            r_np = r_grid.cpu().numpy()
+        else:
+            r_np = np.array(r_grid)
+        
+        for phi_idx, theta_idx, r_idx, value in maxima:
+            phi_rad = phi_np[phi_idx]
+            theta_rad = theta_np[theta_idx]
+            r_m = r_np[r_idx] if r_idx < len(r_np) else r_np[-1]
+            
+            # Check against existing candidates
+            too_close = False
+            for cand_phi, cand_theta, cand_r, _ in candidates:
+                dphi = abs(np.deg2rad(cand_phi) - phi_rad)
+                dtheta = abs(np.deg2rad(cand_theta) - theta_rad)
+                dr = abs(cand_r - r_m)
+                
+                if dphi < min_sep_rad and dtheta < min_sep_rad and dr < min_sep_r:
+                    too_close = True
+                    break
+            
+            if not too_close:
+                candidates.append((np.rad2deg(phi_rad), np.rad2deg(theta_rad), r_m, value))
+            
+            if len(candidates) >= n_keep:
+                break
+        
+        return candidates
+    
+    # =========================================================================
     # Peak Detection and Refinement
     # =========================================================================
     
@@ -566,6 +874,240 @@ class GPUMusicEstimator:
         
         return phi_batch, theta_batch, r_batch
     
+    # =========================================================================
+    # MVDR Main Estimation Methods (K-FREE)
+    # =========================================================================
+    
+    @torch.no_grad()
+    def estimate_mvdr_2_5d(self, R: Union[torch.Tensor, np.ndarray],
+                           grid_phi: int = 361,
+                           grid_theta: int = 181,
+                           r_planes: Optional[List[float]] = None,
+                           delta_scale: float = 1e-2,
+                           n_candidates: int = 20,
+                           min_sep_deg: float = 5.0,
+                           min_sep_r: float = 0.5,
+                           prepared: bool = False) -> Tuple[List[Tuple[float, float, float, float]], np.ndarray, np.ndarray]:
+        """
+        K-FREE source localization using 2.5D MVDR spectrum.
+        
+        This is the main entry point for MVDR-based localization.
+        
+        Args:
+            R: Covariance [N, N] complex (R_blend recommended)
+            grid_phi, grid_theta: Angular grid resolution
+            r_planes: Range planes (default: log-spaced)
+            delta_scale: Diagonal loading scale
+            n_candidates: Max candidates to return
+            min_sep_deg: Minimum angular separation for NMS
+            min_sep_r: Minimum range separation for NMS
+            prepared: If True, R is already processed
+            
+        Returns:
+            candidates: List of (phi_deg, theta_deg, r_m, confidence)
+            spectrum_max: [G_phi, G_theta] max spectrum over range
+            spectrum_3d: [G_phi, G_theta, n_planes] full spectrum
+        """
+        # Convert to torch
+        if isinstance(R, np.ndarray):
+            R = torch.as_tensor(R, dtype=torch.complex64, device=self.device)
+        else:
+            R = R.to(dtype=torch.complex64, device=self.device)
+        
+        N = R.shape[0]
+        
+        # Preprocessing (if not already done)
+        if not prepared:
+            # Trace normalization
+            trace_R = torch.real(torch.trace(R))
+            if trace_R > 1e-8:
+                R = R * (N / trace_R)
+            
+            # Hermitian symmetry
+            R = 0.5 * (R + R.conj().T)
+        
+        # Use log-spaced range planes by default
+        r_planes = r_planes or self.default_r_planes_mvdr
+        
+        # Compute regularized inverse (ONCE)
+        R_inv = self._compute_R_inv(R, delta_scale)
+        
+        # Angle grids (radians)
+        phi_grid_rad = torch.linspace(np.deg2rad(self.phi_min), np.deg2rad(self.phi_max),
+                                       grid_phi, device=self.device, dtype=torch.float32)
+        theta_grid_rad = torch.linspace(np.deg2rad(self.theta_min), np.deg2rad(self.theta_max),
+                                         grid_theta, device=self.device, dtype=torch.float32)
+        
+        # Compute 2.5D MVDR spectrum
+        spectrum_max, winning_ranges, spectrum_3d = self._compute_spectrum_mvdr_2_5d(
+            R_inv, phi_grid_rad, theta_grid_rad, r_planes
+        )
+        
+        # Find local maxima in 3D spectrum
+        maxima = self._find_local_maxima_3d(spectrum_3d, min_sep_phi=3, min_sep_theta=3, min_sep_r=1)
+        
+        # NMS to get final candidates
+        r_planes_arr = np.array(r_planes)
+        candidates = self._nms_3d(
+            maxima, phi_grid_rad, theta_grid_rad, r_planes_arr,
+            min_sep_deg=min_sep_deg, min_sep_r=min_sep_r, n_keep=n_candidates
+        )
+        
+        return candidates, spectrum_max.cpu().numpy(), spectrum_3d.cpu().numpy()
+    
+    @torch.no_grad()
+    def refine_candidate_3d(self, R: Union[torch.Tensor, np.ndarray],
+                            phi_init: float, theta_init: float, r_init: float,
+                            phi_window: float = 2.0, theta_window: float = 2.0, r_window: float = 1.0,
+                            n_phi: int = 41, n_theta: int = 41, n_r: int = 41,
+                            delta_scale: float = 1e-2,
+                            prepared: bool = False) -> Tuple[float, float, float, float]:
+        """
+        Local 3D refinement around a candidate position.
+        
+        Args:
+            R: Covariance [N, N] complex
+            phi_init, theta_init: Initial angles (degrees)
+            r_init: Initial range (meters)
+            *_window: Search window (degrees for angles, meters for range)
+            n_*: Grid points per dimension
+            delta_scale: Diagonal loading
+            prepared: If True, R is already processed
+            
+        Returns:
+            phi_ref, theta_ref, r_ref: Refined position (degrees, meters)
+            confidence: Peak spectrum value
+        """
+        # Convert to torch
+        if isinstance(R, np.ndarray):
+            R = torch.as_tensor(R, dtype=torch.complex64, device=self.device)
+        else:
+            R = R.to(dtype=torch.complex64, device=self.device)
+        
+        N = R.shape[0]
+        
+        if not prepared:
+            trace_R = torch.real(torch.trace(R))
+            if trace_R > 1e-8:
+                R = R * (N / trace_R)
+            R = 0.5 * (R + R.conj().T)
+        
+        # Compute R_inv
+        R_inv = self._compute_R_inv(R, delta_scale)
+        
+        # Build local grids
+        phi_min_local = max(self.phi_min, phi_init - phi_window)
+        phi_max_local = min(self.phi_max, phi_init + phi_window)
+        theta_min_local = max(self.theta_min, theta_init - theta_window)
+        theta_max_local = min(self.theta_max, theta_init + theta_window)
+        r_min_local = max(self.r_min, r_init - r_window)
+        r_max_local = min(self.r_max, r_init + r_window)
+        
+        phi_grid_rad = torch.linspace(np.deg2rad(phi_min_local), np.deg2rad(phi_max_local),
+                                       n_phi, device=self.device, dtype=torch.float32)
+        theta_grid_rad = torch.linspace(np.deg2rad(theta_min_local), np.deg2rad(theta_max_local),
+                                         n_theta, device=self.device, dtype=torch.float32)
+        r_grid = torch.linspace(r_min_local, r_max_local, n_r, device=self.device, dtype=torch.float32)
+        
+        # Compute local 3D spectrum
+        spectrum_3d = self._compute_spectrum_mvdr_3d_local(R_inv, phi_grid_rad, theta_grid_rad, r_grid)
+        
+        # Find peak
+        flat_idx = torch.argmax(spectrum_3d)
+        n_theta_local, n_r_local = spectrum_3d.shape[1], spectrum_3d.shape[2]
+        phi_idx = flat_idx // (n_theta_local * n_r_local)
+        rem = flat_idx % (n_theta_local * n_r_local)
+        theta_idx = rem // n_r_local
+        r_idx = rem % n_r_local
+        
+        confidence = spectrum_3d[phi_idx, theta_idx, r_idx].item()
+        
+        # Parabolic sub-grid refinement
+        phi_ref, theta_ref = self._parabolic_refine(
+            spectrum_3d[:, :, r_idx], int(phi_idx), int(theta_idx),
+            torch.rad2deg(phi_grid_rad), torch.rad2deg(theta_grid_rad)
+        )
+        
+        # Simple range refinement
+        r_ref = r_grid[r_idx].item()
+        if 0 < r_idx < n_r - 1:
+            # Parabolic fit in range
+            v0, v1, v2 = spectrum_3d[phi_idx, theta_idx, r_idx-1:r_idx+2]
+            a = 0.5 * (v0 + v2 - 2*v1)
+            b = 0.5 * (v2 - v0)
+            if abs(a) > 1e-12:
+                delta = float(torch.clamp(-b / (2*a), -0.75, 0.75))
+                dr = (r_grid[1] - r_grid[0]).item()
+                r_ref += delta * dr
+        
+        # Clamp to FOV
+        phi_ref = np.clip(phi_ref, self.phi_min, self.phi_max)
+        theta_ref = np.clip(theta_ref, self.theta_min, self.theta_max)
+        r_ref = np.clip(r_ref, self.r_min, self.r_max)
+        
+        return phi_ref, theta_ref, r_ref, confidence
+    
+    @torch.no_grad()
+    def detect_sources_mvdr(self, R: Union[torch.Tensor, np.ndarray],
+                            grid_phi: int = 361,
+                            grid_theta: int = 181,
+                            r_planes: Optional[List[float]] = None,
+                            delta_scale: float = 1e-2,
+                            threshold_db: float = 12.0,
+                            max_sources: int = 5,
+                            do_refinement: bool = True,
+                            prepared: bool = False) -> Tuple[List[Tuple[float, float, float, float]], np.ndarray]:
+        """
+        Full MVDR-based multi-source detection pipeline.
+        
+        This is the recommended entry point for K-free localization.
+        
+        Args:
+            R: Covariance [N, N] complex (R_blend recommended)
+            grid_phi, grid_theta: Angular grid resolution
+            r_planes: Range planes
+            delta_scale: Diagonal loading
+            threshold_db: Detection threshold (dB below max)
+            max_sources: Maximum sources to detect
+            do_refinement: Whether to do local 3D refinement
+            prepared: If True, R is already processed
+            
+        Returns:
+            sources: List of (phi_deg, theta_deg, r_m, confidence)
+            spectrum_max: [G_phi, G_theta] 2D spectrum for visualization
+        """
+        # Stage 1: 2.5D MVDR for candidates
+        candidates, spectrum_max, spectrum_3d = self.estimate_mvdr_2_5d(
+            R, grid_phi=grid_phi, grid_theta=grid_theta, r_planes=r_planes,
+            delta_scale=delta_scale, n_candidates=max(20, max_sources * 3),
+            prepared=prepared
+        )
+        
+        if len(candidates) == 0:
+            return [], spectrum_max
+        
+        # Stage 2: Local refinement (optional)
+        if do_refinement:
+            refined = []
+            for phi, theta, r, conf in candidates:
+                phi_ref, theta_ref, r_ref, conf_ref = self.refine_candidate_3d(
+                    R, phi, theta, r, prepared=prepared, delta_scale=delta_scale
+                )
+                refined.append((phi_ref, theta_ref, r_ref, conf_ref))
+            candidates = refined
+        
+        # Stage 3: Threshold-based detection
+        if len(candidates) == 0:
+            return [], spectrum_max
+        
+        max_conf = max(c[3] for c in candidates)
+        threshold = max_conf / (10 ** (threshold_db / 10))
+        
+        sources = [c for c in candidates if c[3] >= threshold]
+        sources = sources[:max_sources]
+        
+        return sources, spectrum_max
+    
     def newton_refine(self, phi_init: np.ndarray, theta_init: np.ndarray,
                       r_init: np.ndarray, R: Union[torch.Tensor, np.ndarray],
                       K: int, max_iters: int = 5, lr: float = 0.3) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -650,6 +1192,49 @@ def music_batch_gpu(R_batch, K_batch, cfg, device: str = 'cuda', K_max: int = 5,
     """Batch MUSIC estimation."""
     estimator = get_gpu_estimator(cfg, device)
     return estimator.estimate_batch(R_batch, K_batch, K_max=K_max, **kwargs)
+
+
+# =============================================================================
+# MVDR Convenience Functions (K-FREE)
+# =============================================================================
+
+def mvdr_detect_sources(R, cfg, device: str = 'cuda', **kwargs):
+    """
+    K-free multi-source detection using MVDR.
+    
+    This is the recommended entry point for localization without K estimation.
+    
+    Args:
+        R: Covariance [N, N] complex (R_blend recommended)
+        cfg: Configuration object
+        device: 'cuda' or 'cpu'
+        **kwargs: See GPUMusicEstimator.detect_sources_mvdr
+        
+    Returns:
+        sources: List of (phi_deg, theta_deg, r_m, confidence)
+        spectrum: [G_phi, G_theta] 2D spectrum
+    """
+    estimator = get_gpu_estimator(cfg, device)
+    return estimator.detect_sources_mvdr(R, **kwargs)
+
+
+def mvdr_spectrum_2_5d(R, cfg, device: str = 'cuda', **kwargs):
+    """
+    Compute 2.5D MVDR spectrum for visualization/debugging.
+    
+    Args:
+        R: Covariance [N, N] complex
+        cfg: Configuration object
+        device: 'cuda' or 'cpu'
+        **kwargs: See GPUMusicEstimator.estimate_mvdr_2_5d
+        
+    Returns:
+        candidates: List of (phi_deg, theta_deg, r_m, confidence)
+        spectrum_max: [G_phi, G_theta] max over range
+        spectrum_3d: [G_phi, G_theta, n_planes] full spectrum
+    """
+    estimator = get_gpu_estimator(cfg, device)
+    return estimator.estimate_mvdr_2_5d(R, **kwargs)
 
 
 # =============================================================================

@@ -19,6 +19,7 @@ from .loss import UltimateHybridLoss
 from .dataset import ShardNPZDataset  # unchanged
 from .eval_angles import eval_scene_angles_ranges, eval_batch_angles_ranges, music2d_from_cov_factor
 from .covariance_utils import build_effective_cov_torch  # canonical cov builder (train-time usage)
+from .music_gpu import get_gpu_estimator  # MVDR spectrum computation for SpectrumRefiner stage
 
 # ----------------------------
 # small helpers
@@ -131,6 +132,7 @@ class Trainer:
         # 2) Build model / loss / optimizer
         self.device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model    = HybridModel().to(self.device)
+        self.refiner  = None
         # Optional warm-start (weights-only). This is intentionally *before* any phase freezing
         # so that all modules load consistently, then we apply requires_grad masks.
         ckpt = str(getattr(cfg, "INIT_CKPT", "")).strip()
@@ -139,15 +141,65 @@ class Trainer:
             p = Path(ckpt)
             if p.exists():
                 sd = torch.load(str(p), map_location="cpu")
-                if isinstance(sd, dict) and "model" in sd:
-                    sd = sd["model"]
-                missing, unexpected = self.model.load_state_dict(sd, strict=False)
-                print(f"✅ Loaded INIT_CKPT: {p} | missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+                # Support multiple checkpoint formats:
+                # - state_dict() directly
+                # - {"model": state_dict}
+                # - {"backbone": state_dict, "refiner": state_dict} (refiner stage)
+                if isinstance(sd, dict) and ("backbone" in sd or "refiner" in sd):
+                    bb = sd.get("backbone", sd.get("model", sd))
+                    missing, unexpected = self.model.load_state_dict(bb, strict=False)
+                    print(f"✅ Loaded backbone from INIT_CKPT: {p} | missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+                    # Load refiner weights if present and we are in refiner stage (refiner may not be constructed yet)
+                    self._init_refiner_state_dict = sd.get("refiner", None)
+                else:
+                    if isinstance(sd, dict) and "model" in sd:
+                        sd = sd["model"]
+                    missing, unexpected = self.model.load_state_dict(sd, strict=False)
+                    print(f"✅ Loaded INIT_CKPT: {p} | missing={len(missing)} unexpected={len(unexpected)}", flush=True)
             else:
                 print(f"⚠️ INIT_CKPT not found: {p}", flush=True)
         self.phase    = str(getattr(cfg, "TRAIN_PHASE", "geom")).lower()
+        self.train_refiner_only = (self.phase == "refiner")
+
+        # Option B (Stage 2): freeze backbone and train SpectrumRefiner only
+        if self.train_refiner_only:
+            from .model import SpectrumRefiner
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+            self.refiner = SpectrumRefiner().to(self.device)
+            # Optional: resume refiner weights if INIT_CKPT carried them
+            if hasattr(self, "_init_refiner_state_dict") and (self._init_refiner_state_dict is not None):
+                try:
+                    missing, unexpected = self.refiner.load_state_dict(self._init_refiner_state_dict, strict=False)
+                    print(f"✅ Loaded refiner from INIT_CKPT | missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+                except Exception as e:
+                    print(f"⚠️ Failed to load refiner state from INIT_CKPT: {e}", flush=True)
+
+            # MVDR estimator and cached grids for fast spectrum generation from low-rank factors
+            self._mvdr_est = get_gpu_estimator(cfg, device=("cuda" if self.device.type == "cuda" else "cpu"))
+            self._refiner_phi_grid = torch.linspace(
+                math.radians(float(getattr(cfg, "PHI_MIN_DEG", -60.0))),
+                math.radians(float(getattr(cfg, "PHI_MAX_DEG", 60.0))),
+                int(getattr(cfg, "REFINER_GRID_PHI", 61)),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self._refiner_theta_grid = torch.linspace(
+                math.radians(float(getattr(cfg, "THETA_MIN_DEG", -30.0))),
+                math.radians(float(getattr(cfg, "THETA_MAX_DEG", 30.0))),
+                int(getattr(cfg, "REFINER_GRID_THETA", 41)),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self._refiner_r_planes = getattr(cfg, "REFINER_R_PLANES", None) or self._mvdr_est.default_r_planes_mvdr
+
+            # Default heatmap weight if user didn't set one
+            if float(getattr(mdl_cfg, "LAM_HEATMAP", 0.0)) <= 0.0:
+                setattr(mdl_cfg, "LAM_HEATMAP", 0.1)
+            # Disable alignment-on-cov losses during refiner-only stage
+            setattr(mdl_cfg, "LAM_ALIGN", 0.0)
         # Apply phase-specific freezing before optimizer construction
-        if hasattr(self.model, "set_trainable_for_phase"):
+        if (not self.train_refiner_only) and hasattr(self.model, "set_trainable_for_phase"):
             freeze_backbone = bool(getattr(cfg, "FREEZE_BACKBONE_FOR_K_PHASE", False)) if self.phase == "k_only" else False
             freeze_aux = bool(getattr(cfg, "FREEZE_AUX_IN_K_PHASE", False)) if self.phase == "k_only" else False
             self.model.set_trainable_for_phase(
@@ -160,8 +212,26 @@ class Trainer:
             lam_cov=1.0,  # CRITICAL: Main covariance NMSE weight (will be scaled by HPO if needed)
             lam_subspace_align=getattr(mdl_cfg, 'LAM_SUBSPACE_ALIGN', 0.05),
             lam_peak_contrast=getattr(mdl_cfg, 'LAM_PEAK_CONTRAST', 0.1),
-            lam_cov_pred=getattr(mdl_cfg, 'LAM_COV_PRED', 0.05)  # 5% auxiliary on R_pred
+            lam_cov_pred=getattr(mdl_cfg, 'LAM_COV_PRED', 0.05),  # 5% auxiliary on R_pred
+            # SpectrumRefiner supervision (optional; active only if model outputs refined_spectrum)
+            lam_heatmap=getattr(mdl_cfg, 'LAM_HEATMAP', 0.0),
+            heatmap_sigma_phi=getattr(mdl_cfg, 'HEATMAP_SIGMA_PHI', 2.0),
+            heatmap_sigma_theta=getattr(mdl_cfg, 'HEATMAP_SIGMA_THETA', 2.0),
         ).to(self.device)
+
+        # If training refiner-only, use heatmap-only loss for speed/stability
+        if self.train_refiner_only:
+            self.loss_fn.lam_cov = 0.0
+            self.loss_fn.lam_cov_pred = 0.0
+            self.loss_fn.lam_ortho = 0.0
+            self.loss_fn.lam_cross = 0.0
+            self.loss_fn.lam_gap = 0.0
+            self.loss_fn.lam_margin = 0.0
+            self.loss_fn.lam_aux = 0.0
+            self.loss_fn.lam_peak = 0.0
+            self.loss_fn.lam_subspace_align = 0.0
+            self.loss_fn.lam_peak_contrast = 0.0
+            self.loss_fn.lam_heatmap = float(getattr(mdl_cfg, "LAM_HEATMAP", 0.1))
         
         # Always initialize _hpo_loss_weights (may be populated later by HPO config loading)
         self._hpo_loss_weights = {}
@@ -176,47 +246,67 @@ class Trainer:
             self._apply_hpo_loss_weights()
         # Apply phase-specific loss weights (overrides defaults/HPO for the chosen phase)
         self._apply_phase_loss_weights(self.phase)
+
+        # Finalize refiner-only loss setup after all schedules/overrides
+        if self.train_refiner_only:
+            self.loss_fn.lam_cov = 0.0
+            self.loss_fn.lam_cov_pred = 0.0
+            self.loss_fn.lam_ortho = 0.0
+            self.loss_fn.lam_cross = 0.0
+            self.loss_fn.lam_gap = 0.0
+            self.loss_fn.lam_margin = 0.0
+            self.loss_fn.lam_aux = 0.0
+            self.loss_fn.lam_peak = 0.0
+            self.loss_fn.lam_subspace_align = 0.0
+            self.loss_fn.lam_peak_contrast = 0.0
+            self.loss_fn.lam_heatmap = float(getattr(mdl_cfg, "LAM_HEATMAP", 0.1))
         lr_init       = float(getattr(mdl_cfg, "LR_INIT", 3e-4))
         opt_name      = str(getattr(mdl_cfg, "OPT", "adamw")).lower()
         wd            = float(getattr(mdl_cfg, "WEIGHT_DECAY", 1e-4))
 
         # CRITICAL FIX: Bullet-proof parameter grouping with strong asserts
-        # Ensure model is in train mode and all parameters are trainable
+        # Ensure modules are in train mode and parameters are trainable as intended
         self.model.train()
-        for n, p in self.model.named_parameters():
-            if not p.requires_grad:
-                # Allow intentional freezing in K-only phase
-                if self.phase == "k_only":
-                    continue
-                print(f"⚠️  Re-enabling gradients for: {n}")
-                p.requires_grad_(True)
+        if self.refiner is not None:
+            self.refiner.train()
+        if not self.train_refiner_only:
+            for n, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    # Allow intentional freezing in K-only phase
+                    if self.phase == "k_only":
+                        continue
+                    print(f"⚠️  Re-enabling gradients for: {n}")
+                    p.requires_grad_(True)
         
         # Robust parameter grouping by name prefix
         backbone_params = []
         head_params = []
         # Head keys used for optimizer grouping (head gets higher LR than backbone).
-        # IMPORTANT: include *all* K-head components, including the direct path and logit scale.
+        # NOTE: K-head components removed - using MVDR peak detection instead
         HEAD_KEYS = (
-            'k_head', 'k_mlp', 'k_direct_mlp',
-            'k_ord', 'k_direct_ord',  # ordinal heads: k_ord_mlp, k_direct_ord_mlp
-            'k_spec_proj', 'k_fuse', 'k_logit',  # K head components
             'head', 'classifier', 'aux_angles', 'aux_range',
             'cov_fact_angle', 'cov_fact_range', 'logits_gg'
         )
         
-        for n, p in self.model.named_parameters():
-            if not p.requires_grad:
-                continue
-            # Classify by module name
-            if any(k in n for k in HEAD_KEYS):
-                head_params.append(p)
-            else:
-                backbone_params.append(p)
+        if self.train_refiner_only:
+            backbone_params = []
+            head_params = list(self.refiner.parameters()) if self.refiner is not None else []
+        else:
+            for n, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                # Classify by module name
+                if any(k in n for k in HEAD_KEYS):
+                    head_params.append(p)
+                else:
+                    backbone_params.append(p)
         
         # Calculate parameter counts
         n_back = sum(p.numel() for p in backbone_params)
         n_head = sum(p.numel() for p in head_params)
-        n_tot = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        n_tot_model = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        n_tot_refiner = sum(p.numel() for p in self.refiner.parameters() if p.requires_grad) if self.refiner is not None else 0
+        n_tot = n_tot_model + n_tot_refiner
         
         # Head LR multiplier (3-5× backbone LR)
         head_lr_multiplier = float(getattr(mdl_cfg, "HEAD_LR_MULTIPLIER", 4.0))  # 4× by default
@@ -228,9 +318,12 @@ class Trainer:
         print(f"   Total trainable: {n_tot:,}")
         
         # CRITICAL ASSERTS - catch dead groups immediately (relaxed for frozen phases)
-        if self.phase != "k_only":
-            assert n_back > 1_000_000, f"❌ Backbone param count too small: {n_back:,}"
-        assert n_head > 0, f"❌ Head param count too small: {n_head:,}"
+        if self.train_refiner_only:
+            assert n_head > 0, f"❌ Refiner param count too small: {n_head:,}"
+        else:
+            if self.phase != "k_only":
+                assert n_back > 1_000_000, f"❌ Backbone param count too small: {n_back:,}"
+            assert n_head > 0, f"❌ Head param count too small: {n_head:,}"
         assert n_back + n_head == n_tot, f"❌ Group sum ({n_back + n_head:,}) != total ({n_tot:,})"
         print("   ✅ Parameter grouping verified!")
         
@@ -252,26 +345,32 @@ class Trainer:
 
         # Expert fix: Optimizer wiring sanity check
         opt_ids = {id(p) for g in self.opt.param_groups for p in g['params']}
-        missing = [n for n,p in self.model.named_parameters() if p.requires_grad and id(p) not in opt_ids]
+        if self.train_refiner_only and (self.refiner is not None):
+            missing = [n for n, p in self.refiner.named_parameters() if p.requires_grad and id(p) not in opt_ids]
+        else:
+            missing = [n for n, p in self.model.named_parameters() if p.requires_grad and id(p) not in opt_ids]
         assert not missing, f"❌ Params missing from optimizer: {missing[:8]}"
         print(f"   ✅ Optimizer wiring verified: all {len(opt_ids)} trainable params in optimizer!")
 
         # AMP
-        self.amp = bool(getattr(mdl_cfg, "AMP", True))
+        # Prefer mdl_cfg.USE_AMP if present (some scripts set USE_AMP), fallback to mdl_cfg.AMP for backward compat.
+        self.amp = bool(getattr(mdl_cfg, "USE_AMP", getattr(mdl_cfg, "AMP", True)))
         self.scaler = torch.amp.GradScaler('cuda', enabled=(self.amp and self.device.type == "cuda"))
 
         # EMA
-        self.use_ema   = bool(getattr(mdl_cfg, "USE_EMA", True))
+        self.use_ema   = bool(getattr(mdl_cfg, "USE_EMA", True)) and (not self.train_refiner_only)
         self.ema_decay = float(getattr(mdl_cfg, "EMA_DECAY", 0.999))
         # Only track floating-point parameters in EMA (skip buffers like indices)
-        self.ema_shadow: Dict[str, torch.Tensor] = {
-            k: v.detach().clone() for k, v in self.model.state_dict().items() 
-            if v.dtype.is_floating_point
-        }
+        self.ema_shadow: Dict[str, torch.Tensor] = {}
+        if self.use_ema:
+            self.ema_shadow = {
+                k: v.detach().clone() for k, v in self.model.state_dict().items() 
+                if v.dtype.is_floating_point
+            }
         self._ema_bak: Dict[str, torch.Tensor] | None = None
         
         # SWA (Stochastic Weight Averaging)
-        self.use_swa = getattr(mdl_cfg, 'USE_SWA', False)
+        self.use_swa = getattr(mdl_cfg, 'USE_SWA', False) and (not self.train_refiner_only)
         self.swa_start_frac = getattr(mdl_cfg, 'SWA_START_FRAC', 0.8)
         self.swa_lr_factor = getattr(mdl_cfg, 'SWA_LR_FACTOR', 0.1)
         if self.use_swa:
@@ -360,8 +459,7 @@ class Trainer:
             self._hpo_loss_weights["lam_ang"] = float(best["lam_ang"])
         if "lam_rng" in best:
             self._hpo_loss_weights["lam_rng"] = float(best["lam_rng"])
-        if "lam_K" in best:
-            self._hpo_loss_weights["lam_K"] = float(best["lam_K"])
+        # NOTE: lam_K removed - using MVDR peak detection instead
         if "shrink_alpha" in best:
             setattr(mdl_cfg, "SHRINK_BASE_ALPHA", float(best["shrink_alpha"]))
         if "softmax_tau" in best:
@@ -393,8 +491,7 @@ class Trainer:
             self.loss_fn.lam_aux = weights["lam_ang"] + weights["lam_rng"]  # Combined aux weight
         
         # Apply K-logits weight
-        if "lam_K" in weights:
-            self.loss_fn.lam_K = weights["lam_K"]
+        # NOTE: lam_K removed - using MVDR peak detection instead
         
         # Set reasonable defaults for missing loss parameters (same as HPO)
         self.loss_fn.lam_ortho = 1e-3  # Orthogonality penalty
@@ -406,8 +503,7 @@ class Trainer:
         print(f"🎯 Applied HPO loss weights: "
               f"lam_diag={getattr(self.loss_fn, 'lam_diag', 'N/A'):.3f}, "
               f"lam_off={getattr(self.loss_fn, 'lam_off', 'N/A'):.3f}, "
-              f"lam_aux={getattr(self.loss_fn, 'lam_aux', 'N/A'):.3f}, "
-              f"lam_K={getattr(self.loss_fn, 'lam_K', 'N/A'):.3f}")
+              f"lam_aux={getattr(self.loss_fn, 'lam_aux', 'N/A'):.3f}")
 
     def _apply_phase_loss_weights(self, phase: str):
         """Apply per-phase loss weights from cfg.PHASE_LOSS if provided."""
@@ -421,8 +517,7 @@ class Trainer:
             self.loss_fn.lam_subspace_align = float(weights["lam_subspace_align"])
         if "lam_aux" in weights:
             self.loss_fn.lam_aux = float(weights["lam_aux"])
-        if "lam_K" in weights:
-            self.loss_fn.lam_K = float(weights["lam_K"])
+        # NOTE: lam_K removed - using MVDR peak detection instead
         if "lam_peak_contrast" in weights:
             self.loss_fn.lam_peak_contrast = float(weights["lam_peak_contrast"])
         # CRITICAL: Also apply SVD-based loss weights to prevent NaN gradients
@@ -434,7 +529,6 @@ class Trainer:
               f"lam_cov={self.loss_fn.lam_cov:.3f}, "
               f"lam_subspace_align={self.loss_fn.lam_subspace_align:.3f}, "
               f"lam_aux={self.loss_fn.lam_aux:.3f}, "
-              f"lam_K={self.loss_fn.lam_K:.3f}, "
               f"lam_peak_contrast={self.loss_fn.lam_peak_contrast:.3f}, "
               f"lam_gap={getattr(self.loss_fn, 'lam_gap', 0):.3f}, "
               f"lam_margin={getattr(self.loss_fn, 'lam_margin', 0):.3f}")
@@ -863,8 +957,14 @@ class Trainer:
                 
             # CRITICAL FIX: Network forward in FP16, loss computation in FP32
             # ENABLE AMP for faster training (we've fixed the numerical issues)
-            with torch.amp.autocast('cuda', enabled=self.amp):
-                preds = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
+            if self.train_refiner_only:
+                # Backbone is frozen; run it under no_grad and train only SpectrumRefiner.
+                with torch.no_grad():
+                    with torch.amp.autocast('cuda', enabled=self.amp):
+                        preds = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
+            else:
+                with torch.amp.autocast('cuda', enabled=self.amp):
+                    preds = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
             
             # CRITICAL FIX: LOSS IN FP32 - turn off autocast for numerical stability
             # Cast EVERYTHING to FP32 before loss computation (preds AND labels)
@@ -891,6 +991,50 @@ class Trainer:
                             labels_fp32[k] = v
                     else:
                         labels_fp32[k] = v
+
+                # -------------------------
+                # Refiner-only path (Option B)
+                # -------------------------
+                if self.train_refiner_only:
+                    assert self.refiner is not None, "Refiner module missing in refiner-only phase"
+
+                    # Convert flat factors to complex [B, N, K]
+                    Bc = preds_fp32["cov_fact_angle"].shape[0]
+                    N = int(cfg.N)
+                    Kmax = int(cfg.K_MAX)
+                    flat_ang = preds_fp32["cov_fact_angle"].contiguous().float()
+                    flat_rng = preds_fp32["cov_fact_range"].contiguous().float()
+
+                    def _vec2c(v):
+                        xr, xi = v[:, ::2], v[:, 1::2]
+                        return torch.complex(xr.view(Bc, N, Kmax), xi.view(Bc, N, Kmax))
+
+                    A_ang = _vec2c(flat_ang).to(torch.complex64)
+                    A_rng = _vec2c(flat_rng).to(torch.complex64)
+
+                    lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                    F_list = []
+                    # Build low-rank factor concatenation: [N, 2*Kmax]
+                    for bi2 in range(Bc):
+                        F_b = torch.cat([A_ang[bi2], (lam_range ** 0.5) * A_rng[bi2]], dim=1).contiguous()
+                        F_list.append(F_b)
+
+                    # Compute MVDR spectrum max over range planes (low-rank Woodbury) per sample
+                    specs = []
+                    delta_scale = float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2))
+                    for bi2, F_b in enumerate(F_list):
+                        S_b = self._mvdr_est.mvdr_spectrum_max_2_5d_lowrank(
+                            F_b,
+                            self._refiner_phi_grid,
+                            self._refiner_theta_grid,
+                            self._refiner_r_planes,
+                            delta_scale=delta_scale,
+                        )
+                        specs.append(S_b)
+                    mvdr_spec = torch.stack(specs, dim=0).unsqueeze(1)  # [B,1,G_phi,G_theta]
+
+                    refined = self.refiner(mvdr_spec)
+                    preds_fp32 = {"refined_spectrum": refined}
                 
                 # DEBUG: Check for NaN/Inf in network outputs (first batch only)
                 if epoch == 1 and bi == 0:
@@ -908,7 +1052,7 @@ class Trainer:
                 
                 # CRITICAL FIX: Construct blended covariance for loss function
                 # This ensures eigengap loss operates on well-conditioned matrix
-                if 'cov_fact_angle' in preds_fp32 and 'cov_fact_range' in preds_fp32:
+                if (not self.train_refiner_only) and ('cov_fact_angle' in preds_fp32 and 'cov_fact_range' in preds_fp32):
                     # Extract factors from network output
                     A_angle = preds_fp32['cov_fact_angle']  # [B, N, K_MAX]
                     A_range = preds_fp32['cov_fact_range']  # [B, N, K_MAX]
@@ -985,6 +1129,14 @@ class Trainer:
                         if epoch == 1 and bi == 0:
                             print(f"[Beta] epoch={epoch}, beta={beta:.3f} (offline R_samp)", flush=True)
                         # Build blended covariance using the canonical helper (no shrink/diag-load here).
+                        # Optional timings for diagnosing "hangs" in first forward/loss/backward.
+                        import os, time
+                        _dbg_timing = (os.environ.get("DEBUG_TIMINGS", "") == "1")
+                        if _dbg_timing and epoch == 1 and bi == 0:
+                            t0 = time.perf_counter()
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                            print("[TIMING] build_effective_cov_torch: start", flush=True)
                         R_blend = build_effective_cov_torch(
                             R_pred,
                             snr_db=None,                 # do NOT shrink here; loss applies it consistently
@@ -994,6 +1146,10 @@ class Trainer:
                             apply_shrink=False,
                             target_trace=float(N),
                         )
+                        if _dbg_timing and epoch == 1 and bi == 0:
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                            print(f"[TIMING] build_effective_cov_torch: done in {time.perf_counter()-t0:.3f}s", flush=True)
                         preds_fp32['R_blend'] = R_blend
                     else:
                         # No offline R_samp available → use pure R_pred
@@ -1001,176 +1157,198 @@ class Trainer:
                             print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
                         preds_fp32['R_blend'] = R_pred
         
-        # Compute loss in FP32
-        loss  = self.loss_fn(preds_fp32, labels_fp32)
-        
-        # Expert fix: Log exact optimized loss for first batch
-        if epoch == 1 and bi == 0:
-            print(f"[OPTIMIZED LOSS] batch={bi} total_loss={loss.detach().item():.6f}", flush=True)
-        
-        # Expert debug: Gradient path test - verify R_blend has live gradients to heads
-        if epoch == 1 and bi == 0:
-            assert 'R_blend' in preds_fp32, "R_blend missing from preds!"
-            assert preds_fp32['R_blend'].requires_grad, "R_blend lost grad path!"
+            # Compute loss in FP32
+            import os, time
+            _dbg_timing = (os.environ.get("DEBUG_TIMINGS", "") == "1")
+            if _dbg_timing and epoch == 1 and bi == 0:
+                t1 = time.perf_counter()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print("[TIMING] loss_fn: start", flush=True)
+            loss  = self.loss_fn(preds_fp32, labels_fp32)
+            if _dbg_timing and epoch == 1 and bi == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print(f"[TIMING] loss_fn: done in {time.perf_counter()-t1:.3f}s", flush=True)
             
-            # Unit-test the gradient path from R_blend to any head parameter
-            try:
-                any_head = next(p for n,p in self.model.named_parameters() if "cov_fact_angle" in n and p.requires_grad)
-                s = preds_fp32['R_blend'].real.mean()  # cheap scalar depending on R_pred
-                g = torch.autograd.grad(s, any_head, retain_graph=True, allow_unused=True)[0]
-                print(f"[GRADPATH] d<R_blend>/d(cov_fact_angle) = {0.0 if g is None else g.norm().item():.3e}", flush=True)
-            except StopIteration:
-                print(f"[GRADPATH] No cov_fact_angle parameter found!", flush=True)
-        
-        # DEBUG: Check if loss itself is NaN (first batch only)
-        if epoch == 1 and bi == 0:
-            if torch.isnan(loss):
-                print(f"[DEBUG] Loss is NaN! loss={loss.item()}")
-            elif torch.isinf(loss):
-                print(f"[DEBUG] Loss is Inf! loss={loss.item()}")
-            else:
-                print(f"[DEBUG] Loss is finite: {loss.item():.6f}")
-        
-        # Expert fix: Log first batch loss before backward
-        if epoch == 1 and bi == 0:
-            print(f"[DEBUG] total loss pre-backward = {float(loss.detach().item()):.6f}", flush=True)
-        
-        # Scale loss by accumulation steps for proper averaging
-        loss = loss / grad_accumulation
-
-        self.scaler.scale(loss).backward()
-        
-        # CRITICAL: Accumulate loss for EVERY batch BEFORE optimizer step
-        batch_loss_val = float(loss.detach().item()) * grad_accumulation
-        running += batch_loss_val
-        print(f"[BATCH] ep={epoch} bi={bi} batch_loss={batch_loss_val:.4f} running={running:.4f}", flush=True)
-        
-        # Only step optimizer every grad_accumulation steps
-        if (bi + 1) % grad_accumulation == 0 or (bi + 1) == iters:
-            # Unscale ONCE right before step
-            self.scaler.unscale_(self.opt)
-            
-            # Expert fix: Check GradScaler internal state to see if step will be skipped
-            found_inf_map = {}
-            try:
-                state = self.scaler._per_optimizer_states[self.opt]
-                # PyTorch stores found_inf tensors per device
-                for dev, t in state["found_inf_per_device"].items():
-                    found_inf_map[str(dev)] = float(t.item())
-                current_scale = float(self.scaler.get_scale())
-            except Exception as e:
-                found_inf_map = {"n/a": -1.0}
-                current_scale = -1.0
-
-            if epoch == 1 and bi < 3:
-                print(f"[AMP] scale={current_scale} found_inf={found_inf_map}", flush=True)
-            
-            # Expert fix: Log gradient norms before and after sanitization
+            # Expert fix: Log exact optimized loss for first batch
             if epoch == 1 and bi == 0:
-                grad_norm_before = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
-                print(f"[GRAD SANITIZE] Before: ||g||_2={grad_norm_before:.3e}", flush=True)
+                print(f"[OPTIMIZED LOSS] batch={bi} total_loss={loss.detach().item():.6f}", flush=True)
             
-            # Expert fix: Conservative gradient sanitization to avoid masking AMP overflow
-            # Only zero out NaN gradients, leave inf gradients alone (AMP will handle them)
-            for p in self.model.parameters():
-                if p.grad is not None:
-                    p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=float('inf'), neginf=float('-inf'))
+            # Expert debug: Gradient path test - verify R_blend has live gradients to heads
+            if (not self.train_refiner_only) and epoch == 1 and bi == 0:
+                assert 'R_blend' in preds_fp32, "R_blend missing from preds!"
+                assert preds_fp32['R_blend'].requires_grad, "R_blend lost grad path!"
+                
+                # Unit-test the gradient path from R_blend to any head parameter
+                try:
+                    any_head = next(p for n,p in self.model.named_parameters() if "cov_fact_angle" in n and p.requires_grad)
+                    s = preds_fp32['R_blend'].real.mean()  # cheap scalar depending on R_pred
+                    g = torch.autograd.grad(s, any_head, retain_graph=True, allow_unused=True)[0]
+                    print(f"[GRADPATH] d<R_blend>/d(cov_fact_angle) = {0.0 if g is None else g.norm().item():.3e}", flush=True)
+                except StopIteration:
+                    print(f"[GRADPATH] No cov_fact_angle parameter found!", flush=True)
             
-            # Expert fix: Log gradient norms after sanitization
+            # DEBUG: Check if loss itself is NaN (first batch only)
             if epoch == 1 and bi == 0:
-                grad_norm_after = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
-                print(f"[GRAD SANITIZE] After: ||g||_2={grad_norm_after:.3e}", flush=True)
+                if torch.isnan(loss):
+                    print(f"[DEBUG] Loss is NaN! loss={loss.item()}")
+                elif torch.isinf(loss):
+                    print(f"[DEBUG] Loss is Inf! loss={loss.item()}")
+                else:
+                    print(f"[DEBUG] Loss is finite: {loss.item():.6f}")
             
-            # Gradient clipping (AFTER sanitization, BEFORE step)
-            if self.clip_norm and self.clip_norm > 0:
-                grad_norm_clipped = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
-                if epoch == 1 and bi == 0:
-                    print(f"[GRAD CLIP] After clipping: ||g||_2={grad_norm_clipped:.3e}", flush=True)
+            # Expert fix: Log first batch loss before backward
+            if epoch == 1 and bi == 0:
+                print(f"[DEBUG] total loss pre-backward = {float(loss.detach().item()):.6f}", flush=True)
             
-            # Expert fix: Improved gradient flow instrumentation
-            import math
-            # Keep consistent with optimizer grouping HEAD_KEYS above.
-            HEAD_KEYS = (
-                'k_head', 'k_mlp', 'k_direct_mlp',
-                'k_ord', 'k_direct_ord',
-                'k_spec_proj', 'k_fuse', 'k_logit',
-                'head', 'classifier', 'aux_angles', 'aux_range',
-                'cov_fact_angle', 'cov_fact_range', 'logits_gg'
-            )
-            
-            def _group_grad_norm(params):
-                vals = [p.grad.norm(2).item() for p in params if p.grad is not None and torch.isfinite(p.grad).all()]
-                return (sum(v*v for v in vals))**0.5 if vals else 0.0
-            
-            # Expert fix: Robust step gate - step if ANY gradient signal is present and finite
-            def total_grad_norm(params):
-                norms = []
-                grad_count = 0
-                none_count = 0
-                for p in params:
-                    if p.grad is not None:
-                        grad_count += 1
-                        norms.append(p.grad.norm(2))
-                    else:
-                        none_count += 1
-                if not norms:
-                    return torch.tensor(0.0, device=self.device), grad_count, none_count
-                return torch.norm(torch.stack(norms), 2), grad_count, none_count
+            # Scale loss by accumulation steps for proper averaging
+            loss = loss / grad_accumulation
 
-            g_total, grad_count, none_count = total_grad_norm(self.model.parameters())
-            g_total = float(g_total.detach().cpu())
+            if _dbg_timing and epoch == 1 and bi == 0:
+                t2 = time.perf_counter()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print("[TIMING] backward: start", flush=True)
+            self.scaler.scale(loss).backward()
+            print(f"[LOOP-CHECK] bi={bi} did_backward", flush=True)  # Verify loop fix
+            if _dbg_timing and epoch == 1 and bi == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print(f"[TIMING] backward: done in {time.perf_counter()-t2:.3f}s", flush=True)
             
-            # Expert fix: Check for AMP overflow
-            overflow = any(v > 0.0 for v in found_inf_map.values())
-            ok = (not overflow) and math.isfinite(g_total) and (g_total > 1e-12)
+            # CRITICAL: Accumulate loss for EVERY batch BEFORE optimizer step
+            batch_loss_val = float(loss.detach().item()) * grad_accumulation
+            running += batch_loss_val
+            print(f"[BATCH] ep={epoch} bi={bi} batch_loss={batch_loss_val:.4f} running={running:.4f}", flush=True)
+            
+            # Only step optimizer every grad_accumulation steps
+            if (bi + 1) % grad_accumulation == 0 or (bi + 1) == iters:
+                # Unscale ONCE right before step
+                self.scaler.unscale_(self.opt)
+                
+                # Expert fix: Check GradScaler internal state to see if step will be skipped
+                found_inf_map = {}
+                try:
+                    state = self.scaler._per_optimizer_states[self.opt]
+                    # PyTorch stores found_inf tensors per device
+                    for dev, t in state["found_inf_per_device"].items():
+                        found_inf_map[str(dev)] = float(t.item())
+                    current_scale = float(self.scaler.get_scale())
+                except Exception as e:
+                    found_inf_map = {"n/a": -1.0}
+                    current_scale = -1.0
 
-            # Expert fix: Log gradient status for ALL batches in first epoch
-            # DEBUG: Print for EVERY batch, not just epoch 1
-            print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow={overflow}", flush=True)
-            import sys; sys.stdout.flush(); sys.stderr.flush()
-            
-            # Initialize stepped flag
-            stepped = False
-            
-            # CRITICAL: Skip step if gradients are non-finite or overflow detected
-            if not ok:
-                if epoch == 1:
-                    print(f"[STEP] batch={bi} SKIPPED - overflow={overflow} ||g||_2={g_total:.3e}", flush=True)
-                self.opt.zero_grad(set_to_none=True)
-                self.scaler.update()  # Still update scaler state
-            else:
-                # Step optimizer (with AMP scaler)
-                self.scaler.step(self.opt)
-                self.scaler.update()
-                self.opt.zero_grad(set_to_none=True)
-                stepped = True
-                
-                # Expert fix: Log when step is actually taken
-                if epoch == 1:
-                    print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
-                
-                # Expert fix: Track steps taken
-                self._steps_taken += 1
                 if epoch == 1 and bi < 3:
-                    lrs = [g['lr'] for g in self.opt.param_groups]
-                    print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
+                    print(f"[AMP] scale={current_scale} found_inf={found_inf_map}", flush=True)
                 
-                # Expert fix: Parameter drift probe - measure BEFORE EMA update
-                with torch.no_grad():
-                    vec_now = torch.nn.utils.parameters_to_vector([p.detach().float() for p in self.model.parameters() if p.requires_grad])
-                    delta = (vec_now - getattr(self, "_param_vec_prev", vec_now)).norm().item()
-                    self._param_vec_prev = vec_now.detach().clone()
-                    print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
-                
-                self._ema_update()
-                
-                # Update SWA model if in SWA phase
-                if self.swa_started:
-                    self._swa_update()
+                train_params = list(self.refiner.parameters()) if (self.train_refiner_only and self.refiner is not None) else list(self.model.parameters())
 
-            # CRITICAL FIX: Clear intermediate tensors to prevent memory leaks
-            # NOTE: running is already accumulated BEFORE this block
-            del y, H, C, ptr, K, R_in, snr, R_true_c, R_true, labels, loss
+                # Expert fix: Log gradient norms before and after sanitization
+                if epoch == 1 and bi == 0:
+                    grad_norm_before = torch.nn.utils.clip_grad_norm_(train_params, float('inf'))
+                    print(f"[GRAD SANITIZE] Before: ||g||_2={grad_norm_before:.3e}", flush=True)
+                
+                # Expert fix: Conservative gradient sanitization to avoid masking AMP overflow
+                # Only zero out NaN gradients, leave inf gradients alone (AMP will handle them)
+                for p in train_params:
+                    if p.grad is not None:
+                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=float('inf'), neginf=float('-inf'))
+                
+                # Expert fix: Log gradient norms after sanitization
+                if epoch == 1 and bi == 0:
+                    grad_norm_after = torch.nn.utils.clip_grad_norm_(train_params, float('inf'))
+                    print(f"[GRAD SANITIZE] After: ||g||_2={grad_norm_after:.3e}", flush=True)
+                
+                # Gradient clipping (AFTER sanitization, BEFORE step)
+                if self.clip_norm and self.clip_norm > 0:
+                    grad_norm_clipped = torch.nn.utils.clip_grad_norm_(train_params, self.clip_norm)
+                    if epoch == 1 and bi == 0:
+                        print(f"[GRAD CLIP] After clipping: ||g||_2={grad_norm_clipped:.3e}", flush=True)
+                
+                # Expert fix: Improved gradient flow instrumentation
+                import math
+                # NOTE: K-head removed - using MVDR peak detection instead
+                HEAD_KEYS = (
+                    'head', 'classifier', 'aux_angles', 'aux_range',
+                    'cov_fact_angle', 'cov_fact_range', 'logits_gg'
+                )
+                
+                def _group_grad_norm(params):
+                    vals = [p.grad.norm(2).item() for p in params if p.grad is not None and torch.isfinite(p.grad).all()]
+                    return (sum(v*v for v in vals))**0.5 if vals else 0.0
+                
+                # Expert fix: Robust step gate - step if ANY gradient signal is present and finite
+                def total_grad_norm(params):
+                    norms = []
+                    grad_count = 0
+                    none_count = 0
+                    for p in params:
+                        if p.grad is not None:
+                            grad_count += 1
+                            norms.append(p.grad.norm(2))
+                        else:
+                            none_count += 1
+                    if not norms:
+                        return torch.tensor(0.0, device=self.device), grad_count, none_count
+                    return torch.norm(torch.stack(norms), 2), grad_count, none_count
+
+                g_total, grad_count, none_count = total_grad_norm(train_params)
+                g_total = float(g_total.detach().cpu())
+                
+                # Expert fix: Check for AMP overflow
+                overflow = any(v > 0.0 for v in found_inf_map.values())
+                ok = (not overflow) and math.isfinite(g_total) and (g_total > 1e-12)
+
+                # Expert fix: Log gradient status for ALL batches in first epoch
+                # DEBUG: Print for EVERY batch, not just epoch 1
+                print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow={overflow}", flush=True)
+                import sys; sys.stdout.flush(); sys.stderr.flush()
+                
+                # Initialize stepped flag
+                stepped = False
+                
+                # CRITICAL: Skip step if gradients are non-finite or overflow detected
+                if not ok:
+                    if epoch == 1:
+                        print(f"[STEP] batch={bi} SKIPPED - overflow={overflow} ||g||_2={g_total:.3e}", flush=True)
+                    self.opt.zero_grad(set_to_none=True)
+                    self.scaler.update()  # Still update scaler state
+                else:
+                    # Step optimizer (with AMP scaler)
+                    self.scaler.step(self.opt)
+                    self.scaler.update()
+                    self.opt.zero_grad(set_to_none=True)
+                    print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
+                    stepped = True
+                    
+                    # Expert fix: Log when step is actually taken
+                    if epoch == 1:
+                        print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
+                    
+                    # Expert fix: Track steps taken
+                    self._steps_taken += 1
+                    if epoch == 1 and bi < 3:
+                        lrs = [g['lr'] for g in self.opt.param_groups]
+                        print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
+                    
+                    # Expert fix: Parameter drift probe - measure BEFORE EMA update
+                    with torch.no_grad():
+                        vec_src = (self.refiner.parameters() if (self.train_refiner_only and self.refiner is not None) else self.model.parameters())
+                        vec_now = torch.nn.utils.parameters_to_vector([p.detach().float() for p in vec_src if p.requires_grad])
+                        delta = (vec_now - getattr(self, "_param_vec_prev", vec_now)).norm().item()
+                        self._param_vec_prev = vec_now.detach().clone()
+                        print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
+                    
+                    self._ema_update()
+                    
+                    # Update SWA model if in SWA phase
+                    if self.swa_started:
+                        self._swa_update()
+
+                # CRITICAL FIX: Clear intermediate tensors to prevent memory leaks
+                # NOTE: running is already accumulated BEFORE this block
+                del y, H, C, ptr, K, R_in, snr, R_true_c, R_true, labels, loss
 
         # DEBUG: Print how many batches were processed (OUTSIDE for loop)
         print(f"[EPOCH DEBUG] epoch={epoch} processed {batch_count} batches", flush=True)
@@ -1191,14 +1369,15 @@ class Trainer:
     @torch.no_grad()
     def _validate_one_epoch(self, loader, max_batches: Optional[int]=None, return_debug=False):
         self.model.eval()
+        if self.refiner is not None:
+            self.refiner.eval()
         running = 0.0
         iters = len(loader) if max_batches is None else min(len(loader), max_batches)
         
         # Accumulate per-term losses for debugging
         debug_acc = {}
         
-        # ICC FIX: Track K-logits std for first batch diagnostics
-        first_batch_k_logits_std = None
+        # NOTE: K-head removed - no K-logits tracking needed
 
         for bi, batch in enumerate(loader):
             if bi >= iters: break
@@ -1218,39 +1397,84 @@ class Trainer:
             R_true   = _c_to_ri(R_true_c).float()
             labels   = {"R_true": R_true, "ptr": ptr, "K": K, "snr_db": snr}
 
-            # Expert fix: Forward can stay FP16 for speed
-            with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
-                preds_half = self.model(y=y, H=H, codes=C, snr_db=snr)
-            
-            # Expert fix: Loss MUST be in FP32 for numerical stability (SVD/eigens/divides)
-            with torch.amp.autocast('cuda', enabled=False):
-                # Cast preds to FP32
-                preds = {}
-                for k, v in preds_half.items():
-                    if isinstance(v, torch.Tensor):
-                        if v.dtype == torch.float16:
-                            preds[k] = v.float()
-                        elif v.dtype == torch.complex32:
-                            preds[k] = v.to(torch.complex64)
-                        else:
-                            preds[k] = v
-                    else:
-                        preds[k] = v
-                
-                # Cast labels to FP32 (already float but ensure)
-                labels_fp32 = {}
-                for k, v in labels.items():
-                    if isinstance(v, torch.Tensor):
-                        if v.dtype == torch.float16:
-                            labels_fp32[k] = v.float()
-                        elif v.dtype == torch.complex32:
-                            labels_fp32[k] = v.to(torch.complex64)
+            if self.train_refiner_only:
+                # Backbone factors -> MVDR spectrum -> SpectrumRefiner -> heatmap loss
+                with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
+                    preds_half = self.model(y=y, H=H, codes=C, snr_db=snr)
+
+                with torch.amp.autocast('cuda', enabled=False):
+                    # Cast labels to FP32
+                    labels_fp32 = {}
+                    for k, v in labels.items():
+                        if isinstance(v, torch.Tensor):
+                            labels_fp32[k] = v.float() if v.dtype == torch.float16 else v
                         else:
                             labels_fp32[k] = v
-                    else:
-                        labels_fp32[k] = v
+
+                    # Cast factors to FP32 then convert to complex
+                    flat_ang = preds_half["cov_fact_angle"].float()
+                    flat_rng = preds_half["cov_fact_range"].float()
+                    Bc = flat_ang.shape[0]
+                    N = int(cfg.N)
+                    Kmax = int(cfg.K_MAX)
+
+                    def _vec2c(v):
+                        xr, xi = v[:, ::2], v[:, 1::2]
+                        return torch.complex(xr.view(Bc, N, Kmax), xi.view(Bc, N, Kmax)).to(torch.complex64)
+
+                    A_ang = _vec2c(flat_ang)
+                    A_rng = _vec2c(flat_rng)
+                    lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                    specs = []
+                    delta_scale = float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2))
+                    for bi2 in range(Bc):
+                        F_b = torch.cat([A_ang[bi2], (lam_range ** 0.5) * A_rng[bi2]], dim=1).contiguous()
+                        S_b = self._mvdr_est.mvdr_spectrum_max_2_5d_lowrank(
+                            F_b,
+                            self._refiner_phi_grid,
+                            self._refiner_theta_grid,
+                            self._refiner_r_planes,
+                            delta_scale=delta_scale,
+                        )
+                        specs.append(S_b)
+                    mvdr_spec = torch.stack(specs, dim=0).unsqueeze(1)
+                    refined = self.refiner(mvdr_spec)
+
+                    loss = self.loss_fn({"refined_spectrum": refined}, labels_fp32)
+            else:
+                # Expert fix: Forward can stay FP16 for speed
+                with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
+                    preds_half = self.model(y=y, H=H, codes=C, snr_db=snr)
                 
-                loss = self.loss_fn(preds, labels_fp32)
+                # Expert fix: Loss MUST be in FP32 for numerical stability (SVD/eigens/divides)
+                with torch.amp.autocast('cuda', enabled=False):
+                    # Cast preds to FP32
+                    preds = {}
+                    for k, v in preds_half.items():
+                        if isinstance(v, torch.Tensor):
+                            if v.dtype == torch.float16:
+                                preds[k] = v.float()
+                            elif v.dtype == torch.complex32:
+                                preds[k] = v.to(torch.complex64)
+                            else:
+                                preds[k] = v
+                        else:
+                            preds[k] = v
+                    
+                    # Cast labels to FP32 (already float but ensure)
+                    labels_fp32 = {}
+                    for k, v in labels.items():
+                        if isinstance(v, torch.Tensor):
+                            if v.dtype == torch.float16:
+                                labels_fp32[k] = v.float()
+                            elif v.dtype == torch.complex32:
+                                labels_fp32[k] = v.to(torch.complex64)
+                            else:
+                                labels_fp32[k] = v
+                        else:
+                            labels_fp32[k] = v
+                    
+                    loss = self.loss_fn(preds, labels_fp32)
                 
                 # Expert fix: Guard against non-finite validation loss
                 if not torch.isfinite(loss):
@@ -1273,9 +1497,7 @@ class Trainer:
             
             running += float(loss.detach().item())
             
-            # ICC FIX: Capture K-logits std from first batch
-            if bi == 0 and "k_logits" in preds:
-                first_batch_k_logits_std = float(preds["k_logits"].std().detach().cpu().item())
+            # NOTE: K-head removed - K-logits tracking removed
             
             # Accumulate debug terms if requested
             if return_debug:
@@ -1295,9 +1517,7 @@ class Trainer:
             # Average debug terms
             for key in debug_acc:
                 debug_acc[key] /= max(1, iters)
-            # ICC FIX: Add K-logits std to debug info
-            if first_batch_k_logits_std is not None:
-                debug_acc['k_logits_std'] = first_batch_k_logits_std
+            # NOTE: K-head removed - K-logits std removed
             return avg_loss, debug_acc
         return avg_loss
 
@@ -1314,18 +1534,12 @@ class Trainer:
         3. Highly correlated with final MUSIC performance
         
         Metrics computed:
-        - K accuracy (from k_logits)
         - Aux angle/range RMSE (from phi_theta_r head)
-        - Composite score for model selection
+        - Composite score for model selection (higher is better)
         """
         self.model.eval()
         total_loss = 0.0
         n_samples = 0
-        
-        # K metrics
-        k_correct = 0
-        k_under = 0
-        k_over = 0
         
         # Aux angle/range errors (direct head vs GT, no MUSIC)
         aux_phi_err = []
@@ -1385,24 +1599,6 @@ class Trainer:
                 
                 total_loss += float(loss.detach().item()) * B
                 
-                # ---------- K metrics (internal, no MUSIC) ----------
-                k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
-                if k_mode == "ordinal" and ("k_ord_logits" in preds):
-                    probs = torch.sigmoid(preds["k_ord_logits"].float())  # [B, K_max-1]
-                    thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
-                    k_pred = 1 + (probs > thr).sum(dim=1)
-                elif "k_logits" in preds:
-                    k_logits = preds["k_logits"].float()  # [B, K_max]
-                    k_pred = torch.argmax(k_logits, dim=1) + 1  # 1-based
-                else:
-                    k_pred = None
-                if k_pred is not None:
-                    k_true = K.cpu()
-                    k_pred_cpu = k_pred.cpu()
-                    k_correct += (k_pred_cpu == k_true).sum().item()
-                    k_under += (k_pred_cpu < k_true).sum().item()
-                    k_over += (k_pred_cpu > k_true).sum().item()
-                
                 # ---------- Aux angle/range metrics (direct head vs GT) ----------
                 if "phi_theta_r" in preds:
                     phi_theta_r_pred = preds["phi_theta_r"].float().cpu()  # [B, 3*K_max]
@@ -1427,9 +1623,6 @@ class Trainer:
         
         # Compute summary metrics
         avg_loss = total_loss / max(1, n_samples)
-        k_acc = k_correct / max(1, n_samples)
-        k_under_rate = k_under / max(1, n_samples)
-        k_over_rate = k_over / max(1, n_samples)
         
         phi_rmse = float(np.sqrt(np.mean(np.square(aux_phi_err)))) if aux_phi_err else 0.0
         theta_rmse = float(np.sqrt(np.mean(np.square(aux_theta_err)))) if aux_theta_err else 0.0
@@ -1437,21 +1630,18 @@ class Trainer:
         
         # Composite score (higher is better)
         w = getattr(cfg, "SURROGATE_METRIC_WEIGHTS", None) or {
-            "w_k_acc": 1.0,
+            "w_loss": 1.0,
             "w_aux_ang": 0.01,
             "w_aux_r": 0.01,
         }
         score = (
-            k_acc
+            - w["w_loss"] * avg_loss
             - w["w_aux_ang"] * (phi_rmse + theta_rmse) / 2.0
             - w["w_aux_r"] * r_rmse
         )
         
         metrics = {
             "loss": avg_loss,
-            "k_acc": k_acc,
-            "k_under": k_under_rate,
-            "k_over": k_over_rate,
             "aux_phi_rmse": phi_rmse,
             "aux_theta_rmse": theta_rmse,
             "aux_r_rmse": r_rmse,
@@ -1459,8 +1649,7 @@ class Trainer:
         }
         
         print(
-            f"[VAL SURROGATE] loss={avg_loss:.4f}, k_acc={k_acc:.3f}, "
-            f"under={k_under_rate:.3f}, over={k_over_rate:.3f}, "
+            f"[VAL SURROGATE] loss={avg_loss:.4f}, "
             f"aux_φ_rmse={phi_rmse:.2f}°, aux_θ_rmse={theta_rmse:.2f}°, "
             f"aux_r_rmse={r_rmse:.2f}m, score={score:.4f}",
             flush=True
@@ -1487,12 +1676,11 @@ class Trainer:
         hpo_lam_cov = self._hpo_loss_weights.get("lam_cov", 1.0)  # Default 1.0 (no scaling)
         hpo_lam_ang = self._hpo_loss_weights.get("lam_ang", 0.2)  # Default 0.2
         hpo_lam_rng = self._hpo_loss_weights.get("lam_rng", 0.2)  # Default 0.2
-        hpo_lam_K = self._hpo_loss_weights.get("lam_K", 0.12)     # Default 0.12
+        # NOTE: K removed - using MVDR peak detection instead
         
-        if phase == 0:   # B1 (e1-e4): Angles ONLY, minimal range/K
+        if phase == 0:   # B1 (e1-e4): Angles ONLY, minimal range
             # Set all primary loss weights (using HPO suggestions as base)
             self.loss_fn.lam_cov   = hpo_lam_cov * 0.25   # lam_cov≈0.25
-            self.loss_fn.lam_K     = 0.05                 # lam_K≤0.05
             
             # Phase 0: lam_ang≈0.7, NO range - lock clean angle seeds early
             self.loss_fn.lam_aux   = hpo_lam_ang * 0.70 + hpo_lam_rng * 0.00  # lam_ang≈0.7
@@ -1514,7 +1702,6 @@ class Trainer:
         elif phase == 1: # B2 (e5-e8): Add range, maintain angles
             # Set all primary loss weights
             self.loss_fn.lam_cov   = hpo_lam_cov * 0.25   # lam_cov≈0.25
-            self.loss_fn.lam_K     = 0.10                 # Light K (10%) - still secondary to angles/range
             
             # Phase 1: lam_rng≈0.35–0.5, lam_ang≈0.2
             self.loss_fn.lam_aux   = hpo_lam_ang * 0.20 + hpo_lam_rng * 0.45  # lam_rng≈0.35–0.5, lam_ang≈0.2
@@ -1532,10 +1719,9 @@ class Trainer:
             dropout = max(float(getattr(mdl_cfg, "DROPOUT", 0.10)), 0.10)
             mdl_cfg.DROPOUT = dropout
             self.model.set_dropout(dropout)  # Actually update the model
-        else:            # B3 (e9-e12): Joint training (angles + range + K)
+        else:            # B3 (e9-e12): Joint training (angles + range)
             # Set all primary loss weights
             self.loss_fn.lam_cov   = hpo_lam_cov * 0.7    # lam_cov≈0.7
-            self.loss_fn.lam_K     = hpo_lam_K            # lam_K≈0.2–0.35 (raise only on mixed-SNR)
             
             # Phase 2: lam_ang≈0.25, lam_rng≈0.3
             self.loss_fn.lam_aux   = hpo_lam_ang * 0.25 + hpo_lam_rng * 0.30  # lam_ang≈0.25, lam_rng≈0.3
@@ -1574,28 +1760,7 @@ class Trainer:
         # Phase 2: Full joint training with K-estimation
         pass  # The phase-based curriculum is handled in the main training loop
     
-    def _ramp_k_weight(self, epoch: int, total_epochs: int):
-        """
-        Phase 2: Ramp up lam_K gradually over the first few epochs.
-        This gives the K-head time to learn without overwhelming early gradients.
-        
-        Ramps from 0.0 → target_lam_K over warmup_epochs (default: 5).
-        """
-        warmup_epochs = getattr(mdl_cfg, "K_WEIGHT_WARMUP_EPOCHS", 5)
-        
-        # Store target on first call
-        if not hasattr(self, '_target_lam_K'):
-            self._target_lam_K = self.loss_fn.lam_K
-        
-        if epoch < warmup_epochs:
-            # Linear ramp
-            ramp_factor = (epoch + 1) / warmup_epochs
-            self.loss_fn.lam_K = self._target_lam_K * ramp_factor
-            if epoch == 0 or epoch == warmup_epochs - 1:
-                print(f"[K-ramp] Epoch {epoch}: lam_K = {self.loss_fn.lam_K:.4f} (target: {self._target_lam_K:.4f})", flush=True)
-        else:
-            # Fully ramped
-            self.loss_fn.lam_K = self._target_lam_K
+    # NOTE: _ramp_k_weight removed - K-head no longer used (MVDR peak detection instead)
     
     def _update_structure_loss_weights(self, epoch: int, total_epochs: int):
         """
@@ -1729,21 +1894,10 @@ class Trainer:
                             from .angle_pipeline import angle_pipeline, angle_pipeline_gpu, _GPU_MUSIC_AVAILABLE
                             
                             cf_ang = preds["cov_fact_angle"][i].detach().cpu().numpy()  # [N*K_MAX*2]
-                            # NN K (ordinal or softmax)
-                            k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
-                            if k_mode == "ordinal" and ("k_ord_logits" in preds):
-                                probs_i = torch.sigmoid(preds["k_ord_logits"][i]).detach().cpu().numpy()  # [K_MAX-1]
-                                thr_ord = float(getattr(cfg, "K_ORD_THRESH", 0.5))
-                                K_nn = 1 + int((probs_i > thr_ord).sum())
-                                nn_conf = float(np.mean(np.abs(probs_i - 0.5)) * 2.0)  # 0..1
-                            elif "k_logits" in preds:
-                                k_temp = float(getattr(self.model, "_k_calibration_temp", 1.0))
-                                logits_i = preds["k_logits"][i].detach().cpu().numpy() / max(k_temp, 1e-6)
-                                pK = np.exp(logits_i - np.max(logits_i)); pK = pK / np.sum(pK)
-                                K_nn = int(np.argmax(pK)) + 1
-                                nn_conf = float(np.max(pK))
-                            else:
-                                K_nn, nn_conf = int(min(max(1, k_true), cfg.K_MAX)), 0.0
+                            # NOTE: K-head removed - use GT K for validation MUSIC
+                            # At inference, use MDL/MVDR for K estimation
+                            K_nn = int(min(max(1, k_true), cfg.K_MAX))
+                            nn_conf = 0.0  # No NN confidence without K-head
                             
                             # L=16 CRITICAL FIX: Extract snapshots for hybrid covariance blending
                             y_snaps = None
@@ -1796,8 +1950,8 @@ class Trainer:
                                 K_mdl = int(np.clip(K_mdl, 1, cfg.K_MAX))
                             except Exception:
                                 K_mdl = int(K_nn)
-                            thr = float(getattr(cfg, "K_CONF_THRESH", 0.65))
-                            K_hat = K_mdl if (nn_conf < thr) else K_nn
+                            # NOTE: K-head removed - always use MDL/AIC for K estimation
+                            K_hat = K_mdl
                             
                             # Use GPU MUSIC if available (10-20x faster), else fall back to CPU
                             use_gpu_music = _GPU_MUSIC_AVAILABLE and torch.cuda.is_available()
@@ -1882,17 +2036,9 @@ class Trainer:
                         if getattr(cfg, "MUSIC_DEBUG", False):
                             print(f"[MDL] baseline failed: {e}")
                     
-                    # K metrics (compute first for success check) — match current K_HEAD_MODE
-                    k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
-                    if k_mode == "ordinal" and ("k_ord_logits" in preds):
-                        probs_i = torch.sigmoid(preds["k_ord_logits"][i]).detach().cpu().numpy()
-                        thr_ord = float(getattr(cfg, "K_ORD_THRESH", 0.5))
-                        k_hat = int(1 + int((probs_i > thr_ord).sum()))
-                        k_hat = int(np.clip(k_hat, 1, cfg.K_MAX))
-                    elif "k_logits" in preds:
-                        k_hat = int(np.clip(np.argmax(preds["k_logits"][i].detach().cpu().numpy()) + 1, 1, cfg.K_MAX))
-                    else:
-                        k_hat = int(min(max(1, k_true), cfg.K_MAX))
+                    # NOTE: K-head removed - use GT K for validation metrics
+                    # At inference, use MDL/MVDR for K estimation
+                    k_hat = int(min(max(1, k_true), cfg.K_MAX))
                     k_true_all.append(k_true)
                     k_hat_all.append(k_hat)
                     
@@ -1976,17 +2122,10 @@ class Trainer:
                 print(f"  {label:15s} (N={n:4d}): φ={np.median(phi_err[mask]):.3f}°, "
                       f"θ={np.median(theta_err[mask]):.3f}°, r={np.median(r_err[mask]):.3f}m")
         
-        # K metrics
+        # NOTE: K-head removed. We only report localization metrics + success_rate.
         k_true_all = np.array(k_true_all, dtype=np.int32)
-        k_hat_all = np.array(k_hat_all, dtype=np.int32)
-        if k_true_all.size > 0:
-            k_correct = (k_true_all == k_hat_all)
-            k_acc = float(np.mean(k_correct))
-            k_under = int(np.sum(k_hat_all < k_true_all))
-            k_over = int(np.sum(k_hat_all > k_true_all))
-            success_rate = float(success_count / len(k_true_all))
-        else:
-            k_acc, k_under, k_over, success_rate = 0.0, 0, 0, 0.0
+        n_scenes = int(k_true_all.size)
+        success_rate = float(success_count / n_scenes) if n_scenes > 0 else 0.0
         
         # Return metrics for composite score calculation
         return {
@@ -1994,134 +2133,14 @@ class Trainer:
             "med_theta": med_theta,
             "med_r": med_r,
             "high_snr_samples": high_snr_mask.sum(),
-            "n_scenes": len(phi_err),  # Total scenes evaluated (should be 1600)
+            "n_scenes": n_scenes,
             "rmse_phi_mean": rmse_phi_mean,
             "rmse_theta_mean": rmse_theta_mean,
             "rmse_r_mean": rmse_r_mean,
-            "k_acc": k_acc,
-            "k_under": k_under,
-            "k_over": k_over,
             "success_rate": success_rate,
-            "k_mdl_acc": float(k_mdl_correct / len(k_true_all)) if len(k_true_all) > 0 else 0.0,
         }
     
-    def calibrate_k_logits(self, val_loader, save_path=None):
-        """
-        Temperature-scale k_logits on validation set for better K estimation.
-        Finds optimal temperature T such that softmax(logits/T) is well-calibrated.
-        """
-        import torch.nn.functional as F
-
-        # Ordinal mode: we don't temperature-scale sigmoid thresholds here (different calibration).
-        if str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower() == "ordinal":
-            print("ℹ️ K_HEAD_MODE=ordinal: skipping softmax temperature calibration", flush=True)
-            return 1.0
-        
-        def golden_section_search(f, a, b, tol=1e-5):
-            """Simple golden section search to replace scipy dependency"""
-            phi = (1 + 5**0.5) / 2
-            resphi = 2 - phi
-            
-            # Initial points
-            tol1 = tol * abs(b) + tol
-            x1 = a + resphi * (b - a)
-            x2 = b - resphi * (b - a)
-            f1, f2 = f(x1), f(x2)
-            
-            while abs(b - a) > tol1:
-                if f2 > f1:
-                    b, x2, f2 = x2, x1, f1
-                    x1 = a + resphi * (b - a)
-                    f1 = f(x1)
-                else:
-                    a, x1, f1 = x1, x2, f2
-                    x2 = b - resphi * (b - a)
-                    f2 = f(x2)
-                tol1 = tol * abs(b) + tol
-            
-            return (a + b) / 2
-        
-        self.model.eval()
-        all_logits, all_k_true, all_snr = [], [], []
-        
-        print("🌡️ Collecting k_logits from validation set...")
-        with torch.no_grad():
-            for batch in val_loader:
-                # Unpack batch using the same logic as training
-                y, H, C, ptr, K, R_in, snr, H_full, R_samp = self._unpack_any_batch(batch)
-                
-                # Forward pass (R_samp already extracted by _unpack_any_batch)
-                pred = self.model(y, H, C, snr_db=snr, R_samp=R_samp)
-                
-                if "k_logits" in pred:
-                    logits = pred["k_logits"]  # [B, K_MAX]
-                    k_true = K - 1            # [B] Map K (1-5) to class index (0-4)
-                    
-                    all_logits.append(logits.cpu())
-                    all_k_true.append(k_true.cpu())
-                    all_snr.append(snr.cpu() if snr is not None else torch.zeros(K.shape[0]))
-        
-        if not all_logits:
-            print("⚠️ No k_logits found in validation set, skipping calibration")
-            return 1.0
-        
-        # Concatenate all validation data
-        logits_val = torch.cat(all_logits, dim=0)  # [N, K_MAX+1]
-        k_true_val = torch.cat(all_k_true, dim=0)  # [N]
-        snr_val = torch.cat(all_snr, dim=0)  # [N]
-        
-        print(f"📊 Calibrating on {len(logits_val)} validation samples...")
-        
-        def negative_log_likelihood(temperature):
-            """Negative log-likelihood for temperature scaling"""
-            if temperature <= 0:
-                return float('inf')
-            
-            scaled_logits = logits_val / temperature
-            log_probs = F.log_softmax(scaled_logits, dim=1)
-            
-            # Select log probabilities for true K values
-            k_clamped = torch.clamp(k_true_val, 0, logits_val.shape[1] - 1)
-            selected_log_probs = log_probs.gather(1, k_clamped.unsqueeze(1)).squeeze(1)
-            
-            return -selected_log_probs.mean().item()
-        
-        # Find optimal temperature using golden section search
-        optimal_temp = golden_section_search(negative_log_likelihood, 0.1, 10.0)
-        
-        print(f"🎯 Optimal K temperature: {optimal_temp:.3f}")
-        
-        # Compute calibration metrics
-        with torch.no_grad():
-            orig_probs = F.softmax(logits_val, dim=1)
-            calib_probs = F.softmax(logits_val / optimal_temp, dim=1)
-            
-            orig_conf = orig_probs.max(dim=1)[0].mean().item()
-            calib_conf = calib_probs.max(dim=1)[0].mean().item()
-            
-            orig_acc = (orig_probs.argmax(dim=1) == k_true_val).float().mean().item()
-            calib_acc = (calib_probs.argmax(dim=1) == k_true_val).float().mean().item()
-            
-            # Compute high-SNR K accuracy (SNR > 10 dB)
-            high_snr_mask = snr_val > 10
-            if high_snr_mask.sum() > 0:
-                high_snr_acc = (calib_probs.argmax(dim=1)[high_snr_mask] == k_true_val[high_snr_mask]).float().mean().item()
-            else:
-                high_snr_acc = calib_acc  # Fallback if no high-SNR samples
-            
-            print(f"📈 Before calibration: confidence={orig_conf:.3f}, accuracy={orig_acc:.3f}")
-            print(f"📈 After calibration: confidence={calib_conf:.3f}, accuracy={calib_acc:.3f}")
-            print(f"📈 High-SNR (>10dB) K-acc: {high_snr_acc:.3f} (N={high_snr_mask.sum()})")
-        
-        # Save temperature to checkpoint if path provided
-        if save_path:
-            if Path(save_path).exists():
-                ckpt = torch.load(save_path, map_location='cpu')
-                ckpt['k_calibration_temp'] = optimal_temp
-                torch.save(ckpt, save_path)
-                print(f"💾 Saved calibrated temperature to {save_path}")
-        
-        return optimal_temp, calib_acc, high_snr_acc
+    # NOTE: calibrate_k_logits removed - K-head removed, using MDL/MVDR for K estimation
 
     # ----------------------------
     # Public API
@@ -2333,12 +2352,12 @@ class Trainer:
                         phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
                         theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))
                         r_norm = float(getattr(cfg, "VAL_NORM_R_M", 1.0))
-                        k_acc = float(metrics.get("k_acc", 0.0))
                         succ = float(metrics.get("success_rate", 0.0))
                         rmse_phi = float(metrics.get("rmse_phi_mean") or phi_norm)
                         rmse_theta = float(metrics.get("rmse_theta_mean") or theta_norm)
                         rmse_r = float(metrics.get("rmse_r_mean") or r_norm)
-                        val_score = (1.0 - k_acc) + (rmse_phi / phi_norm) + (rmse_theta / theta_norm) + (rmse_r / r_norm) - succ
+                        # Lower is better: normalized RMSEs, with success rate as a bonus
+                        val_score = (rmse_phi / phi_norm) + (rmse_theta / theta_norm) + (rmse_r / r_norm) - succ
                     except Exception as e:
                         print(f"[VAL MUSIC] Error: {e}", flush=True)
                         val_score = float("inf")  # Worst score on error
@@ -2364,37 +2383,37 @@ class Trainer:
                     best_val = float(val_loss)
                     improved = True
             if improved:
-                torch.save(self.model.state_dict(), best_path)
+                if self.train_refiner_only and (self.refiner is not None):
+                    torch.save({"backbone": self.model.state_dict(), "refiner": self.refiner.state_dict()}, best_path)
+                else:
+                    torch.save(self.model.state_dict(), best_path)
                 patience_counter = 0
             else:
                 patience_counter += 1
-            torch.save(self.model.state_dict(), last_path)
+            if self.train_refiner_only and (self.refiner is not None):
+                torch.save({"backbone": self.model.state_dict(), "refiner": self.refiner.state_dict()}, last_path)
+            else:
+                torch.save(self.model.state_dict(), last_path)
 
             phase_str = f"phase={phase}" if phase >= 0 else "no-curriculum"
             print(
                 f"Epoch {ep+1:03d}/{epochs:03d} [{phase_str}] "
                 f"train {tr_loss:.6f}  val {val_loss:.6f}  "
                 f"(lam_cross={getattr(self.loss_fn,'lam_cross',0):.1e}, "
-                f"lam_gap={getattr(self.loss_fn,'lam_gap',0):.2f}, "
-                f"lam_K={getattr(self.loss_fn,'lam_K',0):.2f})",
+                f"lam_gap={getattr(self.loss_fn,'lam_gap',0):.2f})",
                 flush=True
             )
             # Print key metrics if available
             if metrics is not None:
                 if val_primary == "surrogate":
                     # Surrogate metrics (no MUSIC)
-                    print(f"  🎯 Surrogate: K_acc={metrics.get('k_acc', 0.0):.3f}, "
-                          f"K_under={metrics.get('k_under', 0.0):.3f}, "
-                          f"K_over={metrics.get('k_over', 0.0):.3f}, "
-                          f"aux_φ={metrics.get('aux_phi_rmse', float('nan')):.2f}°, "
+                    print(f"  🎯 Surrogate: aux_φ={metrics.get('aux_phi_rmse', float('nan')):.2f}°, "
                           f"aux_θ={metrics.get('aux_theta_rmse', float('nan')):.2f}°, "
                           f"aux_r={metrics.get('aux_r_rmse', float('nan')):.2f}m, "
                           f"score={val_score:.4f}", flush=True)
                 else:
                     # MUSIC-based metrics
-                    print(f"  🧭 MUSIC: K_acc={metrics.get('k_acc', 0.0):.3f}, "
-                          f"K_mdl_acc={metrics.get('k_mdl_acc', 0.0):.3f}, "
-                          f"succ_rate={metrics.get('success_rate', 0.0):.3f}, "
+                    print(f"  🧭 MVDR/MUSIC: succ_rate={metrics.get('success_rate', 0.0):.3f}, "
                           f"φ_med={metrics.get('med_phi', float('nan')):.2f}°, "
                           f"θ_med={metrics.get('med_theta', float('nan')):.2f}°, "
                           f"r_med={metrics.get('med_r', float('nan')):.2f}m, "
@@ -2662,15 +2681,7 @@ class Trainer:
                         
                         self._eigenspectrum_logged = True
 
-        # Optional: auto-calibrate K logits on validation and save into best checkpoint
-        try:
-            if bool(getattr(mdl_cfg, "CALIBRATE_K_AFTER_TRAIN", True)):
-                print("🌡️ Running post-train K calibration on validation set...")
-                optimal_temp, calib_acc, high_snr_acc = self.calibrate_k_logits(va_loader, save_path=str(best_path))
-                # Also attach to in-memory model for immediate use in this session
-                self.model._k_calibration_temp = float(optimal_temp)
-        except Exception as e:
-            print(f"⚠️ K calibration skipped due to error: {e}")
+        # NOTE: K calibration removed - K-head removed, using MDL/MVDR for K estimation
         
         # Return objective for outer loops (HPO/automation)
         # - "surrogate": return best surrogate score (higher is better, negate for Optuna minimize)

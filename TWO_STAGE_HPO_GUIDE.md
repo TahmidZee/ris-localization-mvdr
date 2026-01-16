@@ -38,7 +38,7 @@ Time:             ~6-10 hours
 ### What Gets Explored
 - Architecture: D_MODEL, NUM_HEADS, dropout
 - Learning rate: log-uniform [1e-4, 4e-4]
-- Loss weights: lam_cov, lam_ang, lam_rng, lam_K
+- Loss weights: lam_cov, lam_ang, lam_rng
 - Inference: range_grid, newton_iter, shrink_alpha
 - Batch size: [64, 80]
 
@@ -101,18 +101,18 @@ Time:              ~4-6 hours per run = ~20-30 hours total
 - The #3 config on 10% might be #1 on full data
 - 5 runs is a good balance of coverage vs time
 
-### How to Run
+### How to Run (updated)
 
-**Option A: Bash**
-```bash
-cd /home/tahit/ris/MainMusic
-./run_stage2_refinement.sh
-```
+The legacy `run_stage2_refinement.*` scripts were removed during MVDR/K-head cleanup.
 
-**Option B: Python**
+- **Backbone refinement (full data)**: run `python -m ris_pytorch_pipeline.ris_pipeline train ...` with your chosen HPO config(s).
+- **SpectrumRefiner Stage-2 (Option B)**: after you have a good backbone checkpoint, train the refiner with:
+
 ```bash
-cd /home/tahit/ris/MainMusic
-python run_stage2_refinement.py
+python -m ris_pytorch_pipeline.ris_pipeline train-refiner \
+  --backbone_ckpt results_final_L16_12x12/checkpoints/best.pt \
+  --epochs 10 --use_shards --n_train 100000 --n_val 10000 \
+  --lam_heatmap 0.1 --grid_phi 61 --grid_theta 41
 ```
 
 ### What Happens
@@ -125,30 +125,10 @@ python run_stage2_refinement.py
 3. Compares final metrics across all 5 runs
 4. Reports winner
 
-### Expected Output
+### Expected Output (Stage-2 refiner)
 ```
-Extracting top 5 configs from Stage 1...
-✓ Top 5 configs extracted
-
-Training Config #1 of 5 (Trial #27)
-  Parameters: {"D_MODEL": 512, "lr": 0.000245, ...}
-  ...
-  ✓ Config #1 training completed
-
-Training Config #2 of 5 (Trial #15)
-  ...
-
-STAGE 2 RESULTS COMPARISON
-==========================
-Rank #1 (Trial #27): success
-  K_acc: 0.892
-  K_under: 0.045
-  AoA_RMSE: 1.23°
-  Success_rate: 0.812
-
-Rank #2 (Trial #15): success
-  K_acc: 0.878
-  ...
+[VAL] loss(first-batch)=...
+Epoch ... train ... val ...
 ```
 
 ### After Stage 2 Completes
@@ -173,7 +153,7 @@ Next AM  - Stage 1 completes (~6-10 hours)
 ### Day 2 (Overnight)
 ```
 Morning  - Start Stage 2 Refinement
-          ./run_stage2_refinement.sh
+          python -m ris_pytorch_pipeline.ris_pipeline train --epochs 50 --use_shards --n_train 100000 --n_val 10000
 
 Next AM  - Stage 2 completes (~20-30 hours)
           Compare metrics in results_final/stage2/
@@ -183,7 +163,7 @@ Next AM  - Stage 2 completes (~20-30 hours)
 ### Day 3
 ```
 Morning  - Tune thresholds on validation
-          - K_CONF_THRESH: [0.5, 0.6, 0.65, 0.7, 0.8]
+          - MVDR_THRESH_DB: [8, 10, 12, 14]
           - HYBRID_COV_BETA: [0.0, 0.2, 0.3, 0.5]
 
 Afternoon - Final test evaluation
@@ -219,13 +199,16 @@ print(f'Completed: {done}/50')
 ### Stage 2 Commands
 ```bash
 # Start Stage 2 (after Stage 1 completes)
-./run_stage2_refinement.sh
+python -m ris_pytorch_pipeline.ris_pipeline train --epochs 50 --use_shards --n_train 100000 --n_val 10000
+
+# Optional: Stage 2b (MVDR SpectrumRefiner)
+python -m ris_pytorch_pipeline.ris_pipeline train-refiner --backbone_ckpt <best.pt> --epochs 10 --use_shards
 
 # Monitor progress
-tail -f results_final/logs/stage2_rank*_*.log
+tail -f results_final/logs/*.log
 
-# Check which configs are done
-ls -la results_final/stage2/rank*/checkpoints/
+# Check checkpoints
+ls -la results_final_L16_12x12/checkpoints/
 ```
 
 ### After Both Stages
@@ -266,16 +249,16 @@ CUDA_VISIBLE_DEVICES=1 python train_ris.py --from_hpo config_rank2.json --epochs
 
 ### Q: How do I know which Stage 2 model is best?
 A: Compare these metrics:
-1. **K_acc** (higher is better) - most important
-2. **K_under** (lower is better) - critical for safety
-3. **AoA_RMSE** (lower is better)
-4. **Success_rate** (higher is better)
+1. **Angular/R range errors** (lower is better): e.g. φ/θ/r RMSE or medians
+2. **Success_rate** (higher is better): % scenes with all sources within tolerance
+3. **False positives**: detected sources / GT sources (closer to 1.0 is better)
 
-Usually pick the model with highest K_acc and lowest K_under.
+Usually pick the model that minimizes errors while keeping success_rate high and false positives controlled.
 
 ### Q: What if all Stage 2 models have similar metrics?
 A: Pick the one with:
-- Lowest K_under (fewer missed sources)
+- Lowest localization error (φ/θ/r RMSE/median)
+- Highest success_rate
 - Most stable training curve (check logs)
 - Smallest checkpoint size (simpler model)
 
@@ -289,9 +272,10 @@ A: Pick the one with:
 - Increase `n_warmup_steps` in hpo.py from 6 to 8-10
 - Or reduce `early_stop_patience` from 6 to 4
 
-**"K_acc stuck at 0.2"**
-- Check `lam_K` range is [0.05, 0.25]
-- Verify cost-sensitive K loss is enabled
+**"Detection is too noisy / too many false positives"**
+- Increase `MVDR_THRESH_DB` (more selective)
+- Increase NMS separation / reduce `max_sources`
+- Increase `HYBRID_COV_BETA` if shards have `R_samp`
 
 **"CUDA out of memory"**
 - Reduce batch_size range to [32, 64]
@@ -309,7 +293,7 @@ A: Pick the one with:
 
 **"Metrics don't improve from Stage 1"**
 - This is normal! 10% subset can overfit
-- Focus on K_under and robustness, not raw K_acc
+- Focus on robustness (SNR slices) and localization errors, not only surrogate score
 
 ---
 

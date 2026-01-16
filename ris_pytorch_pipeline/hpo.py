@@ -113,15 +113,11 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
         newton_it  = trial.suggest_int("newton_iter", 5, 15)            # MUSIC→Newton: 5-15 iters for NF support
         newton_lr  = trial.suggest_float("newton_lr", 0.3, 1.0)         # Step: 0.3-1.0 (conservative lower bound for NF)
         
-        # === ICC CRITICAL FIX: Rebalanced loss weights for clean HPO objective ===
-        # K-head was too heavy (0.25-0.45) → K_CE explodes (1.61 → 2.82), destabilizes matching
-        # cross/gap too weak → subspace structure doesn't form properly
-        lam_cov    = trial.suggest_float("lam_cov", 0.10, 0.25)     # Covariance learning weight (keep)
-        lam_ang    = trial.suggest_float("lam_ang", 0.50, 1.00)     # Angle weight (keep)
-        lam_rng    = trial.suggest_float("lam_rng", 0.30, 0.60)     # Range weight (keep)
-        lam_K      = trial.suggest_float("lam_K", 0.05, 0.30)       # widen top-end to 0.30 to reduce K_under if needed
-        # lam_cross, lam_gap computed from lam_cov in no-curriculum path (train.py)
-        # Target: lam_cross ≈ (2-3)e-3 * lam_cov, lam_gap ≈ (0.05-0.08) * lam_cov
+        # === Loss weights (K-head removed - using MVDR peak detection) ===
+        lam_cov    = trial.suggest_float("lam_cov", 0.10, 0.25)     # Covariance learning weight (primary)
+        lam_ang    = trial.suggest_float("lam_ang", 0.50, 1.00)     # Angle aux weight
+        lam_rng    = trial.suggest_float("lam_rng", 0.30, 0.60)     # Range aux weight
+        # NOTE: lam_K removed - K estimation now done via MDL/MVDR at inference
         shrink_alpha = trial.suggest_float("shrink_alpha", 0.10, 0.20)  # Tightened from [0.10, 0.25]
         softmax_tau = trial.suggest_float("softmax_tau", 0.15, 0.25)    # Keep same
         
@@ -135,8 +131,8 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
         return dict(
             D_MODEL=D_MODEL, NUM_HEADS=NUM_HEADS, dropout=dropout,
             lr=lr, range_grid=range_grid, newton_iter=newton_it, newton_lr=newton_lr,
-            lam_cov=lam_cov, lam_ang=lam_ang, lam_rng=lam_rng, lam_K=lam_K,
-            # lam_cross, lam_gap removed - curriculum handles them
+            lam_cov=lam_cov, lam_ang=lam_ang, lam_rng=lam_rng,
+            # NOTE: lam_K removed - using MVDR peak detection
             shrink_alpha=shrink_alpha, softmax_tau=softmax_tau, batch_size=batch_size,
             nf_mle_snr_threshold=nf_mle_snr_threshold, nf_mle_iters=nf_mle_iters
         )
@@ -193,21 +189,18 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
             print(f"[HPO Trial {trial.number}] Trainer created successfully", flush=True)
             
             # Populate _hpo_loss_weights so curriculum can access them
+            # NOTE: lam_K removed - using MVDR peak detection
             t._hpo_loss_weights = {
                 "lam_cov": s["lam_cov"],
                 "lam_ang": s["lam_ang"],
                 "lam_rng": s["lam_rng"],
-                "lam_K": s["lam_K"],
             }
             
-            # Apply loss weight suggestions
-            # Apply loss weight suggestions (curriculum will modulate these per phase)
-            # Curriculum handles lam_cross and lam_gap dynamically
-            t.loss_fn.lam_cov = s["lam_cov"]         # CRITICAL FIX: Overall covariance weight!
+            # Apply loss weight suggestions (K-head removed)
+            t.loss_fn.lam_cov = s["lam_cov"]         # Primary covariance weight
             t.loss_fn.lam_diag = 0.2  # 20% for diagonal (relative within NMSE)
             t.loss_fn.lam_off = 0.8   # 80% for off-diagonal (relative within NMSE)
             t.loss_fn.lam_aux = s["lam_ang"] + s["lam_rng"]  # Combined aux weight
-            t.loss_fn.lam_K = s["lam_K"]             # K-logits weight (will be downweighted in Phase 0/1)
             
             # Set reasonable defaults for missing loss parameters (not optimized by HPO)
             t.loss_fn.lam_ortho = 1e-3  # Orthogonality penalty

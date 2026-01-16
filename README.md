@@ -1,88 +1,172 @@
-# RIS MUSIC Pipeline
+# RIS Localization with MVDR (K-free)
 
-Deep learning + MUSIC-based localization for RIS (Reconfigurable Intelligent Surface) systems.
+Deep learning + **MVDR (Minimum Variance Distortionless Response)** K-free localization for RIS (Reconfigurable Intelligent Surface) systems.
 
-## Architecture Overview
+## Overview
 
-This pipeline separates concerns cleanly:
+This pipeline implements a hybrid approach combining:
+- **Neural network backbone** for covariance prediction from RIS measurements
+- **MVDR spectral estimation** for K-free multi-source localization
+- **Optional CNN refinement head** (`SpectrumRefiner`) for peak sharpening
 
-### Training & HPO (MUSIC-free)
-- Uses **surrogate metrics** (K accuracy, aux angle/range RMSE)
-- Fast, stable, no gating/penalty artifacts
-- Config: `VAL_PRIMARY="surrogate"`, `USE_MUSIC_METRICS_IN_VAL=False`
+**Key Features:**
+- ✅ **K-free**: No explicit K estimation needed (uses MVDR peak detection)
+- ✅ **Hybrid covariance**: Blends NN-predicted and sample covariance for robustness
+- ✅ **Two-stage training**: Backbone → optional SpectrumRefiner refinement
+- ✅ **Production-ready**: Complete HPO → training → evaluation pipeline
 
-### Final Evaluation (Full MUSIC)
-- Uses **2.5D GPU MUSIC** with hybrid covariance
-- Hungarian matching, MDL baseline comparison
-- Run separately via `eval_music_final.py`
+## Architecture
+
+```
+RIS Measurements (y, H, codes)
+    ↓
+Neural Network Backbone
+    ↓
+Covariance Factors (A_angle, A_range)
+    ↓
+Hybrid Covariance (R_blend = β·R_pred + (1-β)·R_samp)
+    ↓
+MVDR Spectrum Computation
+    ↓
+[Optional] SpectrumRefiner CNN
+    ↓
+Peak Detection (2D NMS)
+    ↓
+Source Locations (φ, θ, r)
+```
 
 ## Quick Start
 
-### 1. Generate Data Shards
+### 1. Install Dependencies
+
 ```bash
-python regenerate_shards_python.py
+pip install -r requirements.txt
 ```
 
-### 2. Run HPO (MUSIC-free)
+### 2. Generate Data Shards
+
 ```bash
-python run_hpo_manual.py --n_trials 50 --epochs 20
+python -m ris_pytorch_pipeline.ris_pipeline pregen-split \
+    --n-train 160000 \
+    --n-val 40000 \
+    --n-test 8000 \
+    --shard 25000 \
+    --out_dir data_shards_M64_L16
 ```
 
-### 3. Evaluate Best Checkpoint (Full MUSIC)
+### 3. Run HPO (Stage 1)
+
 ```bash
-python eval_music_final.py --checkpoint results_final_L16_12x12/checkpoints/best.pt
+python -m ris_pytorch_pipeline.ris_pipeline hpo \
+    --trials 50 \
+    --hpo-epochs 20 \
+    --space wide \
+    --early-stop-patience 6
 ```
 
-## Key Files
+### 4. Train Backbone (Stage 2)
 
-| File | Purpose |
-|------|---------|
-| `run_hpo_manual.py` | HPO with surrogate metrics (fast) |
-| `eval_music_final.py` | Full MUSIC evaluation (final) |
-| `train_manual.py` | Manual training script |
-| `verify_shards.py` | Verify data shard integrity |
-| `test_gpu_music.py` | Test GPU MUSIC implementation |
+```bash
+python -m ris_pytorch_pipeline.ris_pipeline train \
+    --epochs 50 \
+    --n_train 160000 \
+    --n_val 40000 \
+    --use_shards \
+    --from_hpo results_final_L16_12x12/hpo/best.json
+```
 
-## Configuration
+### 5. Train Refiner (Optional, Stage 3)
 
-Key config flags in `ris_pytorch_pipeline/configs.py`:
+```bash
+python -m ris_pytorch_pipeline.ris_pipeline train-refiner \
+    --backbone_ckpt results_final_L16_12x12/checkpoints/best.pt \
+    --epochs 10 \
+    --n_train 160000 \
+    --n_val 40000 \
+    --use_shards \
+    --lam_heatmap 0.1
+```
+
+### 6. Evaluate
+
+```bash
+python -m ris_pytorch_pipeline.ris_pipeline suite --tag final_eval
+```
+
+## Documentation
+
+- **[PRODUCTION_COMMAND_SEQUENCE.md](PRODUCTION_COMMAND_SEQUENCE.md)**: Complete production workflow with exact commands
+- **[TWO_STAGE_HPO_GUIDE.md](TWO_STAGE_HPO_GUIDE.md)**: Two-stage HPO strategy guide
+- **[IMPLEMENTATION_CHANGELOG.md](IMPLEMENTATION_CHANGELOG.md)**: Detailed changelog of all changes
+
+## Project Structure
+
+```
+ris_pytorch_pipeline/
+├── model.py              # HybridModel + SpectrumRefiner
+├── loss.py               # UltimateHybridLoss (covariance, angle, range, heatmap)
+├── train.py              # Trainer class (backbone + refiner stages)
+├── infer.py              # Inference pipeline (MVDR + optional refiner)
+├── eval_angles.py        # Evaluation metrics (MVDR localization)
+├── music_gpu.py          # MVDR/MUSIC GPU implementations
+├── configs.py            # System and model configurations
+├── hpo.py                # Hyperparameter optimization
+├── dataset.py            # Data loading and shard management
+└── ris_pipeline.py       # CLI entry point
+```
+
+## Key Configuration
+
+Main configuration in `ris_pytorch_pipeline/configs.py`:
 
 ```python
-# Validation mode
-VAL_PRIMARY = "surrogate"  # "surrogate" (fast), "k_loc" (MUSIC), "loss"
-USE_MUSIC_METRICS_IN_VAL = False  # False for training/HPO, True for final eval
+# System geometry
+M = 16              # BS antennas
+N_H, N_V = 12, 12   # RIS elements (12×12 UPA)
+L = 16              # Temporal snapshots
 
-# Surrogate metric weights
-SURROGATE_METRIC_WEIGHTS = {
-    "w_k_acc": 1.0,      # K accuracy weight
-    "w_aux_ang": 0.01,   # Aux angle RMSE penalty
-    "w_aux_r": 0.01,     # Aux range RMSE penalty
-}
+# MVDR inference
+MVDR_GRID_PHI = 181
+MVDR_GRID_THETA = 361
+MVDR_THRESH_DB = -10.0
+HYBRID_COV_BETA = 0.5
+
+# SpectrumRefiner (optional)
+USE_SPECTRUM_REFINER_IN_INFER = False
+REFINER_PEAK_THRESH = 0.5
+REFINER_NMS_MIN_SEP = 3.0
 ```
 
-## Results Directory Structure
+## Results Directory
 
 ```
 results_final_L16_12x12/
 ├── checkpoints/
 │   ├── best.pt          # Best model checkpoint
-│   └── last.pt          # Latest checkpoint
+│   └── swa.pt           # SWA checkpoint (if enabled)
 ├── hpo/
-│   ├── hpo.db           # Optuna study database
-│   ├── best.json        # Best trial hyperparameters
-│   └── hpo_*.log        # HPO logs
+│   ├── best.json        # Best HPO config
+│   └── hpo.db           # Optuna study database
 └── logs/
-    └── hpo_stage1_*.log # Training logs
+    └── train_*.log      # Training logs
 ```
 
-## Branch: feature/music-free-hpo
+## Citation
 
-This branch implements clean separation of:
-- **Training/HPO**: Surrogate metrics only (no MUSIC)
-- **Final Evaluation**: Full MUSIC pipeline
+If you use this code, please cite:
 
-Key changes:
-1. Added `_validate_surrogate_epoch()` - MUSIC-free validation
-2. Config flags `VAL_PRIMARY`, `USE_MUSIC_METRICS_IN_VAL`
-3. HPO uses surrogate score (K_acc - penalty)
-4. `eval_music_final.py` for offline MUSIC evaluation
+```bibtex
+@article{ris_mvdr_localization,
+  title={K-free RIS Localization using MVDR Spectral Estimation},
+  author={...},
+  year={2025}
+}
+```
+
+## License
+
+[Add your license here]
+
+## Contact
+
+[Add your contact information here]

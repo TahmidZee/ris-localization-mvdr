@@ -71,9 +71,11 @@ def build_sample_covariance_from_snapshots(y, H, codes, cfg, tikhonov_alpha=1e-3
         
         Build full-rank covariance from L diverse solutions via mean-centering and scatter matrix.
     """
-    # DEBUG: Print input shapes
-    print(f"     [DEBUG build_R_samp] y.shape={y.shape}, H.shape={H.shape}, codes.shape={codes.shape}", flush=True)
-    print(f"     [DEBUG build_R_samp] y norm={np.linalg.norm(y):.2e}, H norm={np.linalg.norm(H):.2e}, codes norm={np.linalg.norm(codes):.2e}", flush=True)
+    debug = bool(getattr(cfg, "DEBUG_BUILD_R_SAMP", False))
+    if debug:
+        # DEBUG: Print input shapes
+        print(f"     [DEBUG build_R_samp] y.shape={y.shape}, H.shape={H.shape}, codes.shape={codes.shape}", flush=True)
+        print(f"     [DEBUG build_R_samp] y norm={np.linalg.norm(y):.2e}, H norm={np.linalg.norm(H):.2e}, codes norm={np.linalg.norm(codes):.2e}", flush=True)
     
     L = y.shape[0]
     M = y.shape[1]
@@ -125,7 +127,7 @@ def build_sample_covariance_from_snapshots(y, H, codes, cfg, tikhonov_alpha=1e-3
         alpha_scaled = tikhonov_alpha * trace_Phi_H_Phi / N
         reg_ell = Phi_ell_H_Phi + alpha_scaled * np.eye(N, dtype=np.complex128)
         
-        if ell == 0:  # Debug first snapshot only
+        if debug and ell == 0:  # Debug first snapshot only
             print(f"     [DEBUG LS] ell={ell}: Phi_ell.shape={Phi_ell.shape}, ||Phi_ell||_F={np.linalg.norm(Phi_ell,'fro'):.2e}", flush=True)
             print(f"     [DEBUG LS] ell={ell}: y_ell.shape={y_ell.shape}, ||y_ell||={np.linalg.norm(y_ell):.2e}", flush=True)
             print(f"     [DEBUG LS] ell={ell}: trace(Phi^H Phi)={trace_Phi_H_Phi:.2e}, α_scaled={alpha_scaled:.2e}", flush=True)
@@ -135,14 +137,15 @@ def build_sample_covariance_from_snapshots(y, H, codes, cfg, tikhonov_alpha=1e-3
         except np.linalg.LinAlgError:
             a_snapshots[ell] = np.linalg.lstsq(reg_ell, Phi_ell_H_y, rcond=None)[0]
         
-        if ell == 0:  # Debug first snapshot solve
+        if debug and ell == 0:  # Debug first snapshot solve
             print(f"     [DEBUG LS] ell={ell}: ||a_snapshots[ell]||={np.linalg.norm(a_snapshots[ell]):.2e}", flush=True)
     
     # Mean-center the snapshots to remove DC mode (CRITICAL!)
     a_mean = np.mean(a_snapshots, axis=0, keepdims=True)
     a_centered = a_snapshots - a_mean
     
-    print(f"     [DEBUG LS] ||a_mean||={np.linalg.norm(a_mean):.2e}, ||a_centered||_F={np.linalg.norm(a_centered,'fro'):.2e}", flush=True)
+    if debug:
+        print(f"     [DEBUG LS] ||a_mean||={np.linalg.norm(a_mean):.2e}, ||a_centered||_F={np.linalg.norm(a_centered,'fro'):.2e}", flush=True)
     
     # Form scatter matrix: R_samp = (1/(L-1)) Σ_ℓ a_c[ℓ] a_c[ℓ]^H
     R_samp = np.zeros((N, N), dtype=np.complex128)

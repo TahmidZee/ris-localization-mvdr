@@ -212,6 +212,28 @@ class SysConfig:
         self.HYBRID_COV_BLEND = True          # Enable hybrid covariance blending (R_pred + R_samp)
         self.HYBRID_COV_BETA = 0.30           # Blend weight for sample covariance (0.30 for HPO, 0.40 for final)
         self.HYBRID_COV_DEBUG = True          # Set True for hybrid covariance diagnostics (ONE-TIME PRINT)
+
+        # === MVDR (K-free) inference defaults ===
+        # Used by ris_pytorch_pipeline.infer.hybrid_estimate_final (MVDR-first).
+        self.MVDR_GRID_PHI = 361
+        self.MVDR_GRID_THETA = 181
+        self.MVDR_THRESH_DB = 12.0
+        self.MVDR_DELTA_SCALE = 1e-2
+        self.MVDR_DO_REFINEMENT = True
+        # If True and a SpectrumRefiner is loaded, inference will run:
+        # MVDR spectrum -> SpectrumRefiner -> peak detection (instead of peak-picking on raw MVDR).
+        self.USE_SPECTRUM_REFINER_IN_INFER = False
+        # Refiner peak selection threshold (probability map). If None, fallback to top-K peaks.
+        self.REFINER_PEAK_THRESH = 0.5
+        # Minimum NMS separation in grid cells for refined heatmap peak picking.
+        self.REFINER_NMS_MIN_SEP = 2
+
+        # === SpectrumRefiner Stage-2 defaults (Option B) ===
+        # Use much coarser grids during training for speed.
+        self.REFINER_GRID_PHI = 61
+        self.REFINER_GRID_THETA = 41
+        # If None/empty, use estimator defaults (log-spaced near-field planes)
+        self.REFINER_R_PLANES = None
         
         # === Validation & Checkpointing Strategy ===
         # VAL_PRIMARY options:
@@ -225,8 +247,9 @@ class SysConfig:
         self.USE_MUSIC_METRICS_IN_VAL = False
         
         # Weights for surrogate validation score (when VAL_PRIMARY="surrogate")
+        # NOTE: K-head removed. Surrogate score is now based on loss + aux errors only.
         self.SURROGATE_METRIC_WEIGHTS = {
-            "w_k_acc": 1.0,       # Weight for K accuracy (maximize)
+            "w_loss": 1.0,        # Weight for validation loss (minimize)
             "w_aux_ang": 0.01,    # Penalty for aux angle RMSE (deg)
             "w_aux_r": 0.01,      # Penalty for aux range RMSE (m)
         }
@@ -247,40 +270,27 @@ class SysConfig:
         self.INIT_CKPT = ""
         # Recommended loss weights per phase (used by Trainer when present)
         self.PHASE_LOSS = {
+            # NOTE: K-head removed - using MVDR peak detection instead
             "geom": {
                 "lam_cov": 0.5,
                 "lam_subspace_align": 0.5,
                 "lam_aux": 1.0,
-                "lam_K": 0.1,
                 "lam_peak_contrast": 0.0,
-            },
-            "k_only": {
-                "lam_cov": 0.1,
-                "lam_subspace_align": 0.0,
-                "lam_aux": 0.5,
-                "lam_K": 1.5,
-                "lam_peak_contrast": 0.0,
-                # CRITICAL: Disable SVD-based losses to prevent NaN gradients
-                "lam_gap": 0.0,
-                "lam_margin": 0.0,
             },
             "joint": {
                 "lam_cov": 0.1,
                 "lam_subspace_align": 0.5,
                 "lam_aux": 1.0,
-                # Boost K weight to unstick K learning in joint training.
-                "lam_K": 1.0,
                 "lam_peak_contrast": 0.1,
             },
+            # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
+            "refiner": {
+                "lam_cov": 0.0,
+                "lam_subspace_align": 0.0,
+                "lam_aux": 0.0,
+                "lam_peak_contrast": 0.0,
+            },
         }
-        
-        self.K_CONF_THRESH = 0.65             # Confidence threshold for K-head vs MDL fallback (tune on val)
-
-        # --- K-head mode ---
-        # "softmax": 5-way classification over K in {1..K_MAX}
-        # "ordinal": predict 4 logits for P(K>t), t=1..K_MAX-1; decode by thresholding and summing.
-        self.K_HEAD_MODE = "ordinal"
-        self.K_ORD_THRESH = 0.5
         
         # === PHASE 2 CRITICAL FIXES: Joint Newton & Hungarian ===
         self.USE_JOINT_NEWTON = True          # Enable joint {φ,θ,r} Newton refinement (sub-degree polish!)
@@ -330,8 +340,7 @@ class ModelConfig:
         self.SHRINK_BASE_ALPHA = 1e-3
         self.DELTA_GAP = 0.10
         
-        # --- robust K estimation ---
-        self.K_CONF_THRESH = 0.6  # 0.6 in-dist; 0.8 for wide FOV/SNR
+        # --- PSD parameterization ---
         self.EPS_PSD = 1e-4  # diagonal loading for PSD parameterization
         
         # --- head LR multiplier ---
@@ -343,12 +352,26 @@ class ModelConfig:
         # --- subspace alignment loss ---
         self.LAM_ALIGN = 0.002  # subspace alignment penalty - keep modest for 12x12 (larger eigengap)
         self.ALIGN_ON_PRED = True  # if True: use shrink(R̂), if False: use R_true (train-test coupling)
+
+        # --- covariance factor blending (match loss/infer) ---
+        # R_pred = A_angle A_angle^H + LAM_RANGE_FACTOR * A_range A_range^H
+        self.LAM_RANGE_FACTOR = 0.3
         
         # --- AntiDiagPool feature extraction ---
         self.USE_ANTIDIAG_POOL = True  # enable anti-diagonal pooling for covariance features
         
         # --- θ loss emphasis (C12) ---
         self.THETA_LOSS_SCALE = 1.5  # Multiply θ loss by this factor for better elevation
+
+        # --- SpectrumRefiner / heatmap supervision (optional) ---
+        # Enable by setting LAM_HEATMAP > 0 and making the model output 'refined_spectrum'.
+        self.LAM_HEATMAP = 0.0
+        self.HEATMAP_SIGMA_PHI = 2.0
+        self.HEATMAP_SIGMA_THETA = 2.0
+
+        # --- Debugging / assertions ---
+        # If True, UltimateHybridLoss will raise when covariance outputs do not require grads in TRAIN.
+        self.STRICT_GRAD_ASSERTS = False
         
         # --- CUDNN policy ---
         self.DETERMINISTIC_TRAINING = True  # True: reproducible but slower, False: faster but non-deterministic

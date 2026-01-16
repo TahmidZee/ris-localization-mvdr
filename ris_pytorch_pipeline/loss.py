@@ -59,29 +59,30 @@ class UltimateHybridLoss(nn.Module):
     Structured loss for hybrid CNN+Transformer with covariance surrogate
     and geometric auxiliaries.
 
-    Terms:
+    Terms (K-free version for MVDR localization):
       • NMSE (diag/off-diag, per-element, size-invariant)
       • Stiefel orthogonality (QR retraction first)
       • Cross-term consistency (light Gram matching)
-      • Eigengap hinge at K (small margin)
-      • K cardinality classification (optional)
+      • Eigengap hinge (for covariance quality)
       • Aux L2 on (phi, theta, range[log-space]) (lam_aux)
       • Chamfer on angles (radians) (lam_peak)
-      • Small linear range term normalized by span (optional, 0.02)
+      • Subspace alignment (training-inference alignment)
+      • Heatmap supervision for SpectrumRefiner (optional)
+      
+    NOTE: K classification removed - using MVDR peak detection instead.
 
     Weights are set externally with a 3-phase curriculum in Trainer.
     """
 
     def __init__(
         self,
-        lam_cov: float   = 0.10,    # Reweighted: NMSE as regularizer
+        lam_cov: float   = 0.10,    # Covariance NMSE weight (primary objective)
         lam_cov_pred: float = 0.02,  # Small auxiliary NMSE on R_pred to prevent hiding
         lam_diag: float = 0.2,
         lam_off: float  = 0.8,
         lam_ortho: float = 1e-3,
         lam_cross: float = 0.0,
         lam_gap: float   = 0.012,
-        lam_K: float     = 0.50,    # Primary: K classification
         lam_aux: float   = 1.00,    # Primary: angle/range guidance
         lam_peak: float  = 0.20,    # Moderate peak regularizer
         lam_margin: float = 0.1,
@@ -89,24 +90,30 @@ class UltimateHybridLoss(nn.Module):
         gap_margin: float = 0.03,
         lam_subspace_align: float = 0.50,  # Primary: subspace alignment
         lam_peak_contrast: float = 0.0,   # Will be set from config
+        lam_heatmap: float = 0.0,   # SpectrumRefiner heatmap supervision
+        heatmap_sigma_phi: float = 2.0,   # Gaussian blob sigma (grid cells)
+        heatmap_sigma_theta: float = 2.0,
     ):
         super().__init__()
-        self.lam_cov   = lam_cov   # NEW: Covariance NMSE weight (CRITICAL!)
-        self.lam_cov_pred = lam_cov_pred  # NEW: Aux penalty on predicted covariance
+        self.lam_cov   = lam_cov   # Covariance NMSE weight (CRITICAL!)
+        self.lam_cov_pred = lam_cov_pred  # Aux penalty on predicted covariance
         self.lam_diag  = lam_diag
         self.lam_off   = lam_off
         self.lam_ortho = lam_ortho
         self.lam_cross = lam_cross
         self.lam_gap   = lam_gap
-        self.lam_K     = lam_K
         self.lam_aux   = lam_aux
         self.lam_peak  = lam_peak
         self.lam_margin = lam_margin
         self.lam_range_factor = lam_range_factor
         self.gap_margin = gap_margin
-        self.lam_blind_K = 0.0  # blind-K regularization weight (OFF per paper)
-        self.lam_subspace_align = lam_subspace_align  # NEW: Subspace alignment loss
-        self.lam_peak_contrast = lam_peak_contrast     # NEW: Peak contrast loss
+        self.lam_subspace_align = lam_subspace_align  # Subspace alignment loss
+        self.lam_peak_contrast = lam_peak_contrast     # Peak contrast loss
+        
+        # SpectrumRefiner heatmap supervision
+        self.lam_heatmap = lam_heatmap
+        self.heatmap_sigma_phi = heatmap_sigma_phi
+        self.heatmap_sigma_theta = heatmap_sigma_theta
 
     # -------- helpers --------
 
@@ -427,51 +434,6 @@ class UltimateHybridLoss(nn.Module):
                 margins.append(torch.zeros((), device=R.device, dtype=R.real.dtype))
         return torch.stack(margins).mean()
     
-    def _blind_k_regularizer(self, R_hat, K_true):
-        """
-        MDL/AIC consistency penalty: minimize MDL/AIC at true K on learned R̂.
-        Boosts generalization when SNR or mismatch shifts.
-        """
-        B, N, _ = R_hat.shape
-        penalties = []
-        
-        for b in range(B):
-            k_true = int(K_true[b].item())
-            if k_true <= 0 or k_true >= N:
-                penalties.append(torch.tensor(0.0, device=R_hat.device))
-                continue
-                
-            # Eigenvalues for MDL computation
-            evals = torch.linalg.eigvals(R_hat[b]).real  # [N]
-            evals = torch.sort(evals, descending=True)[0]  # Sort descending
-            evals = torch.clamp(evals, min=1e-12)
-            
-            # MDL criterion for k_true vs neighboring values
-            T = 100  # Assume reasonable snapshot count for penalty
-            def mdl_score(k):
-                if k >= N or k < 0:
-                    return torch.tensor(1e6, device=R_hat.device)
-                noise_evals = evals[k:]
-                if len(noise_evals) == 0:
-                    return torch.tensor(1e6, device=R_hat.device)
-                geo_mean = torch.exp(torch.log(noise_evals).mean())
-                arith_mean = noise_evals.mean()
-                ratio = arith_mean / (geo_mean + 1e-12)
-                penalty = T * (N - k) * torch.log(ratio) + 0.5 * k * (2*N - k) * torch.log(T)
-                return penalty
-            
-            # Penalty if neighboring K values have lower MDL than true K
-            mdl_true = mdl_score(k_true)
-            mdl_prev = mdl_score(k_true - 1) if k_true > 0 else torch.tensor(1e6, device=R_hat.device)
-            mdl_next = mdl_score(k_true + 1) if k_true < N-1 else torch.tensor(1e6, device=R_hat.device)
-            
-            # Penalty if true K doesn't have minimum MDL
-            min_neighbor = torch.min(mdl_prev, mdl_next)
-            penalty = F.relu(min_neighbor - mdl_true)  # Only penalize if neighbors are better
-            penalties.append(penalty)
-        
-        return torch.stack(penalties).mean()
-
     def _angle_chamfer(self, phi_p, theta_p, phi_t, theta_t, mask):
         """
         Chamfer distance on angles (radians).
@@ -488,6 +450,77 @@ class UltimateHybridLoss(nn.Module):
         d2 = (d2 * mask).sum(-1) / (mask.sum(-1) + 1e-9)
         return (d1 + d2).mean()
 
+    def _heatmap_loss(self, refined_spectrum, phi_gt, theta_gt, K_true, 
+                      grid_phi, grid_theta):
+        """
+        Compute loss for SpectrumRefiner heatmap supervision.
+        
+        Creates Gaussian blobs at GT source locations and computes 
+        focal loss between refined spectrum and GT heatmap.
+        
+        Args:
+            refined_spectrum: [B, 1, G_phi, G_theta] from SpectrumRefiner
+            phi_gt: [B, K_max] GT azimuth in radians
+            theta_gt: [B, K_max] GT elevation in radians
+            K_true: [B] number of active sources
+            grid_phi: [G_phi] phi grid values in radians
+            grid_theta: [G_theta] theta grid values in radians
+            
+        Returns:
+            loss: scalar focal loss value
+        """
+        B = refined_spectrum.shape[0]
+        G_phi = refined_spectrum.shape[2]
+        G_theta = refined_spectrum.shape[3]
+        device = refined_spectrum.device
+        
+        # Create meshgrid for distance computation
+        phi_mesh = grid_phi.view(1, G_phi, 1).expand(B, -1, G_theta)
+        theta_mesh = grid_theta.view(1, 1, G_theta).expand(B, G_phi, -1)
+        
+        # Grid spacing for sigma conversion
+        d_phi = (grid_phi[-1] - grid_phi[0]) / (G_phi - 1)
+        d_theta = (grid_theta[-1] - grid_theta[0]) / (G_theta - 1)
+        
+        sigma_phi_rad = self.heatmap_sigma_phi * d_phi
+        sigma_theta_rad = self.heatmap_sigma_theta * d_theta
+        
+        # Initialize GT heatmap
+        gt_heatmap = torch.zeros(B, G_phi, G_theta, device=device)
+        
+        # Add Gaussian blob for each GT source
+        for b in range(B):
+            K = int(K_true[b].item())
+            for k in range(K):
+                phi_k = phi_gt[b, k]
+                theta_k = theta_gt[b, k]
+                
+                # Squared distance normalized by sigma
+                d_phi_sq = ((phi_mesh[b] - phi_k) / sigma_phi_rad) ** 2
+                d_theta_sq = ((theta_mesh[b] - theta_k) / sigma_theta_rad) ** 2
+                
+                # Gaussian blob
+                blob = torch.exp(-0.5 * (d_phi_sq + d_theta_sq))
+                
+                # Max-blend (allows overlapping sources)
+                gt_heatmap[b] = torch.maximum(gt_heatmap[b], blob)
+        
+        # Add channel dim: [B, 1, G_phi, G_theta]
+        gt_heatmap = gt_heatmap.unsqueeze(1)
+        
+        # Focal loss for sparse target handling (α=0.25, γ=2.0)
+        p = refined_spectrum.clamp(1e-7, 1 - 1e-7)
+        alpha = 0.25
+        gamma = 2.0
+        
+        pos_weight = alpha * (1 - p) ** gamma
+        neg_weight = (1 - alpha) * p ** gamma
+        
+        pos_loss = -pos_weight * gt_heatmap * torch.log(p)
+        neg_loss = -neg_weight * (1 - gt_heatmap) * torch.log(1 - p)
+        
+        return (pos_loss + neg_loss).mean()
+
     # -------- forward & debug --------
 
     def forward(self, y_pred: dict, y_true: dict) -> torch.Tensor:
@@ -495,9 +528,42 @@ class UltimateHybridLoss(nn.Module):
         device = next(iter(y_pred.values())).device if len(y_pred) else y_true["K"].device
         B = y_true["K"].shape[0]
         
-        # HARD GUARDS: Ensure critical weights are non-zero
-        assert self.lam_cov > 0, f"❌ CRITICAL: lam_cov must be > 0, got {self.lam_cov}"
-        assert self.lam_cov < 100, f"⚠️ WARNING: lam_cov unusually large: {self.lam_cov}"
+        # Guard against invalid weights (0 is valid for phase-specific ablations like K-only diagnostics)
+        if self.lam_cov < 0:
+            raise ValueError(f"lam_cov must be >= 0, got {self.lam_cov}")
+
+        # Fast-path: SpectrumRefiner-only supervision
+        # If the user sets all other weights to 0 and provides refined_spectrum, avoid
+        # the heavy covariance/aux computations.
+        only_heatmap = (
+            (self.lam_heatmap > 0.0)
+            and ("refined_spectrum" in y_pred)
+            and (self.lam_cov == 0.0)
+            and (self.lam_cov_pred == 0.0)
+            and (self.lam_ortho == 0.0)
+            and (self.lam_cross == 0.0)
+            and (self.lam_gap == 0.0)
+            and (self.lam_margin == 0.0)
+            and (self.lam_aux == 0.0)
+            and (self.lam_peak == 0.0)
+            and (self.lam_subspace_align == 0.0)
+            and (self.lam_peak_contrast == 0.0)
+        )
+        if only_heatmap:
+            K_true = y_true["K"].long().to(device)
+            ptr_gt = y_true["ptr"].to(device).float()
+            phi_t = ptr_gt[:, :cfg.K_MAX]
+            theta_t = ptr_gt[:, cfg.K_MAX:2*cfg.K_MAX]
+
+            # Build grids (radians) from config FOV
+            phi_range = getattr(cfg, 'RANGE_PHI', (-60, 60))  # degrees
+            theta_range = getattr(cfg, 'RANGE_THETA', (-30, 30))  # degrees
+            G_phi = y_pred['refined_spectrum'].shape[2]
+            G_theta = y_pred['refined_spectrum'].shape[3]
+            grid_phi = torch.linspace(phi_range[0] * math.pi / 180, phi_range[1] * math.pi / 180, G_phi, device=device)
+            grid_theta = torch.linspace(theta_range[0] * math.pi / 180, theta_range[1] * math.pi / 180, G_theta, device=device)
+
+            return self.lam_heatmap * self._heatmap_loss(y_pred['refined_spectrum'], phi_t, theta_t, K_true, grid_phi, grid_theta)
 
         # GT unpack
         K_true = y_true["K"].long().to(device)
@@ -557,17 +623,28 @@ class UltimateHybridLoss(nn.Module):
             trh = torch.diagonal(R_hat, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)
             R_hat = R_hat / trh.view(-1, 1, 1)
         
-        # CRITICAL: Verify R_hat has gradients enabled ONLY during training
+        # Gradient-path sanity check (optional).
+        # IMPORTANT: During SpectrumRefiner-only training (or frozen-backbone phases),
+        # it is expected that covariance outputs do NOT require gradients.
         is_train = torch.is_grad_enabled() and self.training
-        if is_train:
-            # If using R_blend, it may not require gradients (R_samp is detached)
-            # This is correct behavior - gradients flow through R_pred component
-            if 'R_blend' not in y_pred:
-                assert R_hat.requires_grad, "❌ R_hat does not require gradients during TRAIN! Check for detach() calls."
+        if is_train and (not R_hat.requires_grad):
+            strict = bool(getattr(mdl_cfg, "STRICT_GRAD_ASSERTS", False))
+            if strict:
+                which = "R_blend" if ('R_blend' in y_pred) else "R_hat"
+                raise AssertionError(
+                    f"❌ {which} does not require gradients during TRAIN. "
+                    f"If you are training only SpectrumRefiner, set lam_cov/aux weights to 0 or disable STRICT_GRAD_ASSERTS."
+                )
             else:
-                # R_blend should require grad (through R_pred component)
-                assert R_hat.requires_grad, "❌ R_blend must require gradients during TRAIN! Check R_pred component."
-        # In eval/no-grad, it's fine if R_hat.requires_grad == False
+                if not hasattr(self, "_gradpath_warned"):
+                    which = "R_blend" if ('R_blend' in y_pred) else "R_hat"
+                    print(
+                        f"[WARN] {which}.requires_grad=False during TRAIN. "
+                        "This is OK for frozen-backbone / refiner-only training, "
+                        "but covariance-related losses will not backprop into the covariance predictor.",
+                        flush=True,
+                    )
+                    self._gradpath_warned = True
 
         # aux preds
         phi_p   = y_pred.get("phi_soft",   torch.zeros_like(phi_t))
@@ -657,77 +734,7 @@ class UltimateHybridLoss(nn.Module):
         # Expert fix: Re-enabled subspace margin regularizer with SVD (now safe)
         loss_margin = self._subspace_margin_regularizer(R_hat, K_true) if (self.lam_margin > 0.0) else torch.tensor(0.0, device=device)
 
-        loss_K = torch.tensor(0.0, device=device)
-        k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
-        if self.lam_K > 0.0 and k_mode == "ordinal" and ("k_ord_logits" in y_pred):
-            # Ordinal / cumulative K: logits for P(K>t), t=1..K_MAX-1
-            ord_logits = y_pred["k_ord_logits"].to(device)  # [B, K_MAX-1]
-            assert ord_logits.shape[-1] == cfg.K_MAX - 1, f"Expected k_ord_logits dim {cfg.K_MAX-1}, got {ord_logits.shape}"
-            assert K_true.min() >= 1 and K_true.max() <= cfg.K_MAX, \
-                f"K labels out of range: min={K_true.min()}, max={K_true.max()}, expected [1, {cfg.K_MAX}]"
-
-            # targets: y_t = 1 if K_true > t else 0, for t=1..K_MAX-1
-            t_grid = torch.arange(1, cfg.K_MAX, device=device).view(1, -1)  # [1, K_MAX-1]
-            tgt_ord = (K_true.view(-1, 1) > t_grid).float()  # [B, K_MAX-1]
-
-            # Cost-sensitive weighting: underestimation == false negatives on these ordinal tasks.
-            w_under = float(getattr(mdl_cfg, "K_UNDER_WEIGHT", 2.0))
-            w_over = float(getattr(mdl_cfg, "K_OVER_WEIGHT", 1.0))
-            bce = F.binary_cross_entropy_with_logits(ord_logits, tgt_ord, reduction="none")  # [B, K_MAX-1]
-            weights = tgt_ord * w_under + (1.0 - tgt_ord) * w_over
-            loss_K = (weights * bce).mean()
-
-            if not hasattr(self, '_k_loss_debug_printed'):
-                with torch.no_grad():
-                    probs = torch.sigmoid(ord_logits)
-                    thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
-                    k_pred = 1 + (probs > thr).sum(dim=-1)
-                print(f"[K-LOSS DEBUG][ordinal] lam_K={self.lam_K:.3f}, BCE_w={loss_K.item():.4f}, lam_K*BCE={self.lam_K*loss_K.item():.4f}")
-                print(f"[K-LOSS DEBUG][ordinal] K_true dist: {[int((K_true==k).sum()) for k in range(1, cfg.K_MAX+1)]}")
-                print(f"[K-LOSS DEBUG][ordinal] K_pred dist: {[int((k_pred==k).sum()) for k in range(1, cfg.K_MAX+1)]}")
-                self._k_loss_debug_printed = True
-
-        elif self.lam_K > 0.0 and ("k_logits" in y_pred):
-            # Softmax K (legacy): 5-way classification over K in {1..K_MAX}
-            logits = y_pred["k_logits"].to(device)
-            C = logits.shape[-1]
-
-            # CRITICAL UNIT TEST: Verify K labels and head dimensions match
-            assert C == cfg.K_MAX, f"K-head output ({C}) != K_MAX ({cfg.K_MAX})"
-            assert K_true.min() >= 1 and K_true.max() <= cfg.K_MAX, \
-                f"K labels out of range: min={K_true.min()}, max={K_true.max()}, expected [1, {cfg.K_MAX}]"
-
-            # K ranges from 1 to K_MAX, so we map to 0-indexed classes: K-1
-            tgt = (K_true - 1).clamp_min(0).clamp_max(C - 1)
-
-            # Phase 2: Add label smoothing (0.05) for better K-head generalization
-            label_smoothing = getattr(mdl_cfg, "K_LABEL_SMOOTHING", 0.05)
-
-            # COST-SENSITIVE K LOSS: Penalize underestimation more than overestimation
-            w_under = float(getattr(mdl_cfg, "K_UNDER_WEIGHT", 2.0))  # default 2x penalty
-            w_over = float(getattr(mdl_cfg, "K_OVER_WEIGHT", 1.0))    # default 1x (no extra penalty)
-
-            # Compute per-sample CE (no reduction)
-            ce_per_sample = F.cross_entropy(logits, tgt, label_smoothing=label_smoothing, reduction='none')  # [B]
-
-            with torch.no_grad():
-                k_pred = logits.argmax(dim=-1)  # 0-indexed
-                under_mask = (k_pred < tgt).float()
-                over_mask = (k_pred > tgt).float()
-                correct_mask = (k_pred == tgt).float()
-                sample_weights = correct_mask + w_under * under_mask + w_over * over_mask
-
-            loss_K = (sample_weights * ce_per_sample).mean()
-
-            if not hasattr(self, '_k_loss_debug_printed'):
-                ce_raw = F.cross_entropy(logits, tgt, reduction='mean').item()
-                print(f"[K-LOSS DEBUG] lam_K={self.lam_K:.3f}, CE_raw={ce_raw:.4f}, "
-                      f"CE_weighted={loss_K.item():.4f}, lam_K*CE={self.lam_K * loss_K.item():.4f}")
-                print(f"[K-LOSS DEBUG] K_true dist: {[int((K_true==k).sum()) for k in range(1, cfg.K_MAX+1)]}")
-                print(f"[K-LOSS DEBUG] K_pred dist: {[int((k_pred==k).sum()) for k in range(cfg.K_MAX)]}")
-                print(f"[K-LOSS DEBUG] logits mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
-                print(f"[K-LOSS DEBUG] sample_weights mean={sample_weights.mean().item():.4f}")
-                self._k_loss_debug_printed = True
+        # NOTE: K-loss removed - using MVDR peak detection instead (K-free localization)
 
         # Aux: wrapped Huber on angles + Huber on log-range
         phi_huber = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
@@ -749,13 +756,8 @@ class UltimateHybridLoss(nn.Module):
             # Expert fix: Re-enabled subspace alignment with SVD + projector (now safe)
             Rc = y_pred['R_blend'] if 'R_blend' in y_pred else R_hat
             loss_align = self._subspace_align(Rc, phi_p, theta_p, r_p, K_true)
-        
-        # Blind-K regularization: MDL/AIC consistency on learned covariance
-        loss_blind_k = torch.tensor(0.0, device=device)
-        if self.lam_blind_K > 0.0:
-            loss_blind_k = self._blind_k_regularizer(R_hat, K_true)
 
-        # NEW: Training-inference alignment losses (TEMPORARILY DISABLED)
+        # Training-inference alignment losses
         loss_subspace_align = 0.0
         loss_peak_contrast = 0.0
         # Expert fix: Re-enabled subspace alignment loss (GT-based, no eigendecomposition)
@@ -785,33 +787,65 @@ class UltimateHybridLoss(nn.Module):
                 print(f"[LOSS DEBUG] Peak contrast: DISABLED (weight={self.lam_peak_contrast})")
                 self._peak_contrast_logged = True
 
+        # SpectrumRefiner heatmap supervision (optional)
+        loss_heatmap = torch.tensor(0.0, device=device)
+        if self.lam_heatmap > 0.0 and 'refined_spectrum' in y_pred:
+            # Need grid coordinates for heatmap loss
+            # Use default FOV from config
+            phi_range = getattr(cfg, 'RANGE_PHI', (-60, 60))  # degrees
+            theta_range = getattr(cfg, 'RANGE_THETA', (-30, 30))  # degrees
+            G_phi = y_pred['refined_spectrum'].shape[2]
+            G_theta = y_pred['refined_spectrum'].shape[3]
+            
+            # Create grid in radians
+            grid_phi = torch.linspace(
+                phi_range[0] * math.pi / 180, 
+                phi_range[1] * math.pi / 180, 
+                G_phi, device=device
+            )
+            grid_theta = torch.linspace(
+                theta_range[0] * math.pi / 180, 
+                theta_range[1] * math.pi / 180, 
+                G_theta, device=device
+            )
+            
+            loss_heatmap = self._heatmap_loss(
+                y_pred['refined_spectrum'], phi_t, theta_t, K_true,
+                grid_phi, grid_theta
+            )
+            
+            if not hasattr(self, '_heatmap_loss_logged'):
+                print(f"[LOSS DEBUG] Heatmap loss: {loss_heatmap.item():.6f} @ weight={self.lam_heatmap}")
+                self._heatmap_loss_logged = True
+        else:
+            if not hasattr(self, '_heatmap_loss_logged'):
+                has_refined = 'refined_spectrum' in y_pred
+                print(f"[LOSS DEBUG] Heatmap loss: DISABLED (weight={self.lam_heatmap}, has_spectrum={has_refined})")
+                self._heatmap_loss_logged = True
+
         total = (
-            self.lam_cov * loss_nmse  # CRITICAL FIX: Add lam_cov weight!
-            + self.lam_cov_pred * loss_nmse_pred  # NEW: Aux pressure on R_pred
+            self.lam_cov * loss_nmse  # Primary: Covariance NMSE
+            + self.lam_cov_pred * loss_nmse_pred  # Aux pressure on R_pred
             + self.lam_ortho * loss_ortho
             + self.lam_cross * loss_cross
             + self.lam_gap   * loss_gap
             + self.lam_margin * loss_margin
-            + self.lam_K     * loss_K
             + self.lam_aux   * aux_l2
-            + self.lam_peak  * peak_l2        # FIX: Add missing Chamfer/peak angle loss
-            + self.lam_blind_K * loss_blind_k  # Blind-K regularization
+            + self.lam_peak  * peak_l2  # Chamfer/peak angle loss
             + 0.02           * range_raw
             + getattr(mdl_cfg, "LAM_ALIGN", 0.0) * loss_align
-            + self.lam_subspace_align * loss_subspace_align  # NEW: Subspace alignment loss
-            + self.lam_peak_contrast * loss_peak_contrast     # NEW: Peak contrast loss
+            + self.lam_subspace_align * loss_subspace_align  # Subspace alignment loss
+            + self.lam_peak_contrast * loss_peak_contrast     # Peak contrast loss
+            + self.lam_heatmap * loss_heatmap                 # SpectrumRefiner supervision
         )
         
-        # CRITICAL DEBUG: Log loss breakdown (once per run)
+        # Log loss breakdown (once per run)
         if not hasattr(self, '_loss_breakdown_printed'):
-            k_contrib = self.lam_K * loss_K.item() if isinstance(loss_K, torch.Tensor) else 0
             aux_contrib = self.lam_aux * aux_l2.item() if isinstance(aux_l2, torch.Tensor) else 0
             cov_contrib = self.lam_cov * loss_nmse.item() if isinstance(loss_nmse, torch.Tensor) else 0
             print(f"[LOSS BREAKDOWN] total={total.item():.4f}")
             print(f"  lam_cov*nmse    = {self.lam_cov:.3f} * {loss_nmse.item():.4f} = {cov_contrib:.4f}")
-            print(f"  lam_K*loss_K    = {self.lam_K:.3f} * {loss_K.item():.4f} = {k_contrib:.4f}")
             print(f"  lam_aux*aux_l2  = {self.lam_aux:.3f} * {aux_l2.item():.4f} = {aux_contrib:.4f}")
-            print(f"  Expected K-contrib at chance: {self.lam_K:.3f} * ln(5) ≈ {self.lam_K * 1.609:.4f}")
             self._loss_breakdown_printed = True
         
         return total
@@ -881,14 +915,6 @@ class UltimateHybridLoss(nn.Module):
 
         gap=(self._eigengap_hinge(R_hat,K_true).item() if self.lam_gap>0.0 else 0.0)
 
-        Kce=0.0
-        if self.lam_K>0.0 and ("k_logits" in y_pred):
-            logits=y_pred["k_logits"].to(device)
-            C=logits.shape[-1]
-            # K ranges from 1 to K_MAX, map to 0-indexed: K-1
-            tgt=(K_true-1).clamp_min(0).clamp_max(C-1)
-            Kce=F.cross_entropy(logits,tgt).item()
-
         phi_p=y_pred.get("phi_soft",torch.zeros_like(phi_t))
         theta_p=y_pred.get("theta_soft",torch.zeros_like(theta_t))
         r_p=y_pred.get("r_soft",torch.zeros_like(r_t))
@@ -929,7 +955,6 @@ class UltimateHybridLoss(nn.Module):
             ortho=ortho,              # Orthogonality penalty
             cross=cross,              # Cross-term
             loss_gap=gap,             # Eigengap hinge
-            loss_K_raw=Kce,           # K classification CE
             aux=aux_l2,               # Combined aux loss
             phi_huber=phi_huber_sum.item(),  # Angle error
             rng_err_log=rng_err_log.item(),  # Range log error

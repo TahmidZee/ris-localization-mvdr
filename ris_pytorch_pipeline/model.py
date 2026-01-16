@@ -183,78 +183,8 @@ class HybridModel(nn.Module):
         else:
             self.fusion_with_antidiag = nn.Identity()  # Pass-through when disabled
 
-        # --- K classification head with spectral features ---
-        # K ranges from 1 to K_MAX (1,2,3,4,5), so we need K_MAX classes (5)
-        # We'll map K → K-1 for 0-indexed class labels
+        # NOTE: K-head removed - using MVDR peak detection instead (K-free localization)
         
-        # Spectral feature projection (MUST be in __init__ for optimizer!)
-        # Features: 6 top eigenvalues + 1 tail mean + 5 eigenvalue gaps = 12 dims
-        spec_dim = 12
-        self.k_spec_proj = nn.Sequential(
-            nn.Linear(spec_dim, D // 4),
-            nn.GELU(),
-            nn.Linear(D // 4, D // 4)
-        )
-        self.k_fuse = nn.Linear(D + D // 4, D)
-        
-        # K classification head with enhanced spectral features
-        # Features: [gaps(K_MAX), ratios(K_MAX), log_slopes(K_MAX), mdl(K_MAX), mdl_onehot(K_MAX), λ1(1), λN(1)] = 5*K_MAX + 2
-        k_feat_dim = 5*cfg.K_MAX + 2
-        self.k_mlp = nn.Sequential(
-            nn.LayerNorm(k_feat_dim),
-            nn.Linear(k_feat_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, cfg.K_MAX)
-        )
-
-        # Ordinal K head (recommended): logits for P(K > t), t=1..K_MAX-1
-        # Shape: [B, K_MAX-1] (for K_MAX=5 → 4 logits)
-        self.k_ord_mlp = nn.Sequential(
-            nn.LayerNorm(k_feat_dim),
-            nn.Linear(k_feat_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, cfg.K_MAX - 1)
-        )
-        
-        # SOTA FIX: Direct K-MLP bypass from main features (ensemble with spectral)
-        # This gives K-head a direct gradient path that works from step 1
-        # Ensemble: 0.5 * spectral_path + 0.5 * direct_path
-        self.k_direct_mlp = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, cfg.K_MAX)
-        )
-
-        self.k_direct_ord_mlp = nn.Sequential(
-            nn.LayerNorm(D),
-            nn.Linear(D, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, cfg.K_MAX - 1)
-        )
-        
-        # Learnable logit scale for K-head
-        self.k_logit_scale = nn.Parameter(torch.ones(1))
-        
-        # Initialize K-head with larger weights for better learning
-        nn.init.xavier_uniform_(self.k_mlp[1].weight, gain=1.0)
-        nn.init.xavier_uniform_(self.k_mlp[3].weight, gain=1.0)
-        nn.init.xavier_uniform_(self.k_direct_mlp[1].weight, gain=1.0)
-        nn.init.xavier_uniform_(self.k_direct_mlp[3].weight, gain=1.0)
-        nn.init.xavier_uniform_(self.k_ord_mlp[1].weight, gain=1.0)
-        nn.init.xavier_uniform_(self.k_ord_mlp[3].weight, gain=1.0)
-        nn.init.xavier_uniform_(self.k_direct_ord_mlp[1].weight, gain=1.0)
-        nn.init.xavier_uniform_(self.k_direct_ord_mlp[3].weight, gain=1.0)
-        # FIXED: Initialize bias with small positive values for class priors
-        nn.init.constant_(self.k_mlp[1].bias, 0.1)
-        nn.init.constant_(self.k_mlp[3].bias, 0.1)
-        nn.init.constant_(self.k_direct_mlp[1].bias, 0.1)
-        nn.init.constant_(self.k_direct_mlp[3].bias, 0.1)
-        nn.init.constant_(self.k_ord_mlp[1].bias, 0.1)
-        nn.init.constant_(self.k_ord_mlp[3].bias, 0.1)
-        nn.init.constant_(self.k_direct_ord_mlp[1].bias, 0.1)
-        nn.init.constant_(self.k_direct_ord_mlp[3].bias, 0.1)
-
         # --- soft-argmax grid head for angles ---
         G = getattr(mdl_cfg, 'INFERENCE_GRID_SIZE_COARSE', 61)
         # Asymmetric FOV: φ ±60° (120° total), θ ±30° (60° total)
@@ -284,20 +214,20 @@ class HybridModel(nn.Module):
         self,
         freeze_backbone: bool = False,
         freeze_aux: bool = False,
-        freeze_k: bool = False,
+        freeze_cov: bool = False,
     ):
         """
         Control which parts of the model are trainable for phase-specific runs.
-        - freeze_backbone: freeze feature extractor + covariance predictors
+        - freeze_backbone: freeze feature extractor
         - freeze_aux: freeze auxiliary angle/range heads
-        - freeze_k: freeze K classification head
+        - freeze_cov: freeze covariance factor predictors
         """
         def _set(mods, flag: bool):
             for m in mods:
                 for p in m.parameters():
                     p.requires_grad = not flag
 
-        # Backbone: feature stacks and covariance factor predictors
+        # Backbone: feature stacks
         backbone_modules = [
             m for m in [
                 getattr(self, "y_conv1", None),
@@ -312,7 +242,7 @@ class HybridModel(nn.Module):
             ] if m is not None
         ]
 
-        # Covariance factor heads (should remain trainable even if backbone is frozen in K-only phase)
+        # Covariance factor heads
         factor_modules = [
             m for m in [
                 getattr(self, "cov_fact_angle", None),
@@ -329,24 +259,9 @@ class HybridModel(nn.Module):
             ] if m is not None
         ]
 
-        # K head
-        k_modules = [
-            m for m in [
-                getattr(self, "k_spec_proj", None),
-                getattr(self, "k_fuse", None),
-                getattr(self, "k_mlp", None),
-                getattr(self, "k_direct_mlp", None),
-            ] if m is not None
-        ]
-
         _set(backbone_modules, freeze_backbone)
-        # Keep factor modules tied to k freeze flag (trainable in K-only phase)
-        _set(factor_modules, freeze_k)
+        _set(factor_modules, freeze_cov)
         _set(aux_modules, freeze_aux)
-        _set(k_modules, freeze_k)
-        # k_logit_scale is a parameter tensor (not in a module list)
-        if hasattr(self, "k_logit_scale"):
-            self.k_logit_scale.requires_grad = not freeze_k
     
     def _hermitize_trace_norm(self, R):
         """Hermitize and trace-normalize covariance matrix"""
@@ -460,81 +375,8 @@ class HybridModel(nn.Module):
         aux_range  = self.aux_range(feats_enhanced)                        # [B, K]  (positive)
         aux_ptr    = torch.cat([aux_angles, aux_range], dim=1)             # [B, 3K]
 
-        # --- Enhanced K-head with stable spectral features ---
-        # =========================
-        # Measurement-domain K features (MxM) — more statistically stable at small L
-        # =========================
-        # y: [B,L,M,2] RI → complex [B,L,M]
-        y_c = torch.complex(y[..., 0].float(), y[..., 1].float())  # [B, L, M]
-        # Ryy = (1/L) y^H y  (M×M)
-        # NOTE: y_c is [B,L,M] so y^H is [B,M,L]
-        # Use actual snapshot count from the batch (safer if L changes later).
-        L_eff = float(y_c.shape[1])
-        Ryy = (y_c.conj().transpose(-2, -1) @ y_c) / max(L_eff, 1.0)  # [B, M, M]
-        Ryy = 0.5 * (Ryy + Ryy.conj().transpose(-2, -1))
-
-        # =========================
-        # RIS-domain K features (NxN) — kept as auxiliary, but NOT used for MDL decisions at L=16
-        # =========================
-        def _vec2c_k(v):
-            v = v.float()
-            xr, xi = v[:, ::2], v[:, 1::2]
-            return torch.complex(xr.view(-1, cfg.N, cfg.K_MAX), xi.view(-1, cfg.N, cfg.K_MAX))
-
-        A_for_k = _vec2c_k(cf_ang)  # [B, N, K]
-        R_pred_k = A_for_k @ A_for_k.conj().transpose(-2, -1)  # [B, N, N]
-        
-        # Enhanced eigenvalue features for K-head (stable vectorized approach)
-        with torch.amp.autocast('cuda', enabled=False):
-            # --- eigenfeatures from MEASUREMENT DOMAIN (M×M) ---
-            evals_yy = torch.linalg.eigvalsh(Ryy.detach()).real  # ascending
-            evals_yy = torch.flip(evals_yy, dims=[-1])           # descending [B,M]
-            # Pad to length K_MAX+1 indexing convenience (M is 16 so this is fine)
-            gaps_yy = evals_yy[:, :cfg.K_MAX] - evals_yy[:, 1:cfg.K_MAX+1]
-            csum_yy = torch.cumsum(evals_yy, dim=-1)
-            total_yy = csum_yy[:, -1].unsqueeze(-1).clamp_min(1e-9)
-            ratios_yy = csum_yy[:, :cfg.K_MAX] / total_yy
-            log_evals_yy = torch.log(torch.clamp(evals_yy, min=1e-12))
-            log_slopes_yy = log_evals_yy[:, :cfg.K_MAX] - log_evals_yy[:, 1:cfg.K_MAX+1]
-
-            # MDL scores on M×M covariance (more stable at small L)
-            Mdim = evals_yy.shape[-1]
-            T = int(cfg.L)
-            mdl_yy = torch.zeros(evals_yy.shape[0], cfg.K_MAX, device=evals_yy.device)
-            logT = torch.log(torch.tensor(float(max(T, 2)), device=evals_yy.device))
-            for k in range(1, cfg.K_MAX + 1):
-                k_idx = k - 1
-                noise = evals_yy[:, k:].clamp_min(1e-12)
-                gm = torch.exp(torch.mean(torch.log(noise), dim=-1))
-                am = torch.mean(noise, dim=-1)
-                Lk = (T * (Mdim - k)) * torch.log(am / gm + 1e-12)
-                mdl_yy[:, k_idx] = Lk + 0.5 * k * (2 * Mdim - k) * logT
-
-            k_mdl_idx_yy = torch.argmin(mdl_yy, dim=-1)  # 0-indexed
-            k_mdl_onehot_yy = F.one_hot(k_mdl_idx_yy, num_classes=cfg.K_MAX).float()
-
-            # Feature vector: measurement-domain spectrum stats + mdl info
-            k_feats = torch.cat(
-                [gaps_yy, ratios_yy, log_slopes_yy, mdl_yy, k_mdl_onehot_yy, evals_yy[:, :1], evals_yy[:, -1:]],
-                dim=-1
-            )
-            
-            # PHASE 1 FIX: Removed per-sample normalization (was killing gradients when std≈0)
-            # The k_mlp has LayerNorm internally, so this normalization is redundant AND harmful.
-        
-        # SOTA FIX: Ensemble spectral path with direct path for robust K estimation
-        # Spectral path: eigenvalue-based features (good when R̂ is clean)
-        # Direct path: from main feature vector (works even when eigvals are messy)
-        k_logits_spectral = self.k_mlp(k_feats)
-        k_logits_direct = self.k_direct_mlp(feats_enhanced)
-
-        # Ordinal K logits (recommended decoding)
-        k_ord_logits_spectral = self.k_ord_mlp(k_feats)
-        k_ord_logits_direct = self.k_direct_ord_mlp(feats_enhanced)
-        
-        # Ensemble: average both paths (could also be learned weights)
-        k_logits = (0.5 * k_logits_spectral + 0.5 * k_logits_direct) * self.k_logit_scale
-        k_ord_logits = (0.5 * k_ord_logits_spectral + 0.5 * k_ord_logits_direct) * self.k_logit_scale
+        # NOTE: K-head removed - using MVDR peak detection instead (K-free localization)
+        # The number of sources is determined by peak detection on MVDR spectrum
 
         return {
             "cov_fact_angle": cf_ang,
@@ -542,6 +384,344 @@ class HybridModel(nn.Module):
             "phi_theta_r":    aux_ptr,
             "phi_soft":       phi_soft,
             "theta_soft":     theta_soft,
-            "k_logits":       k_logits,
-            "k_ord_logits":   k_ord_logits,
         }
+
+
+# =============================================================================
+# SpectrumRefiner CNN - Learned Denoising/Sharpening of Physics-Based Spectrum
+# =============================================================================
+
+class SpectrumRefiner(nn.Module):
+    """
+    Small U-Net-like CNN that takes a physics-based MVDR spectrum and learns
+    to sharpen peaks and suppress noise. Outputs a probability heatmap where
+    peaks indicate source locations.
+    
+    Architecture:
+        - Input: [B, 1, H, W] MVDR spectrum (2D slice at a range plane)
+        - Encoder: 3 conv blocks with downsampling
+        - Bottleneck: dilated convolutions for large receptive field
+        - Decoder: 3 conv blocks with upsampling + skip connections
+        - Output: [B, 1, H, W] refined probability map (sigmoid activation)
+    
+    Training:
+        - Supervised with Gaussian blobs centered at GT source (φ, θ) locations
+        - BCE loss between refined map and GT heatmap
+    
+    Inference:
+        - Apply to each range plane of MVDR spectrum
+        - Extract peaks via NMS on refined maps
+    """
+    
+    def __init__(self, in_channels: int = 1, base_filters: int = 32, 
+                 use_skip: bool = True, use_batch_norm: bool = True):
+        super().__init__()
+        self.use_skip = use_skip
+        self.use_batch_norm = use_batch_norm
+        
+        F = base_filters  # 32 base filters
+        
+        # ========== Encoder ==========
+        # Block 1: [B, 1, H, W] -> [B, F, H/2, W/2]
+        self.enc1 = self._conv_block(in_channels, F, stride=2)
+        
+        # Block 2: [B, F, H/2, W/2] -> [B, 2F, H/4, W/4]
+        self.enc2 = self._conv_block(F, F*2, stride=2)
+        
+        # Block 3: [B, 2F, H/4, W/4] -> [B, 4F, H/8, W/8]
+        self.enc3 = self._conv_block(F*2, F*4, stride=2)
+        
+        # ========== Bottleneck with Dilated Convolutions ==========
+        # Large receptive field without downsampling
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(F*4, F*4, 3, padding=2, dilation=2),
+            nn.BatchNorm2d(F*4) if use_batch_norm else nn.Identity(),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(F*4, F*4, 3, padding=4, dilation=4),
+            nn.BatchNorm2d(F*4) if use_batch_norm else nn.Identity(),
+            nn.ReLU(inplace=True),
+        )
+        
+        # ========== Decoder with Skip Connections ==========
+        # Block 3: [B, 4F, H/8, W/8] -> [B, 2F, H/4, W/4]
+        self.dec3_up = nn.ConvTranspose2d(F*4, F*2, kernel_size=2, stride=2)
+        self.dec3_conv = self._conv_block(F*4 if use_skip else F*2, F*2, stride=1)
+        
+        # Block 2: [B, 2F, H/4, W/4] -> [B, F, H/2, W/2]
+        self.dec2_up = nn.ConvTranspose2d(F*2, F, kernel_size=2, stride=2)
+        self.dec2_conv = self._conv_block(F*2 if use_skip else F, F, stride=1)
+        
+        # Block 1: [B, F, H/2, W/2] -> [B, F/2, H, W]
+        self.dec1_up = nn.ConvTranspose2d(F, F//2, kernel_size=2, stride=2)
+        self.dec1_conv = self._conv_block(F//2 + in_channels if use_skip else F//2, F//2, stride=1)
+        
+        # ========== Output Head ==========
+        self.output_conv = nn.Conv2d(F//2, 1, kernel_size=1)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _conv_block(self, in_ch, out_ch, stride=1):
+        """Double convolution block with optional downsampling"""
+        layers = [
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1),
+            nn.BatchNorm2d(out_ch) if self.use_batch_norm else nn.Identity(),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1),
+            nn.BatchNorm2d(out_ch) if self.use_batch_norm else nn.Identity(),
+            nn.ReLU(inplace=True),
+        ]
+        return nn.Sequential(*layers)
+    
+    def _init_weights(self):
+        """Initialize weights for stable training"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+    
+    @staticmethod
+    def _match_hw(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """
+        Match spatial dims (H,W) of `x` to `ref` by center-cropping or symmetric padding.
+        This makes the refiner robust to odd input sizes (e.g. 181×361).
+        """
+        Hr, Wr = ref.shape[-2], ref.shape[-1]
+        H, W = x.shape[-2], x.shape[-1]
+
+        # Center-crop if too large
+        if H > Hr:
+            dh = H - Hr
+            top = dh // 2
+            x = x[:, :, top:top + Hr, :]
+        if W > Wr:
+            dw = W - Wr
+            left = dw // 2
+            x = x[:, :, :, left:left + Wr]
+
+        # Symmetric pad if too small
+        H2, W2 = x.shape[-2], x.shape[-1]
+        if (H2 < Hr) or (W2 < Wr):
+            pad_h = max(0, Hr - H2)
+            pad_w = max(0, Wr - W2)
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
+
+        return x
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, 1, H, W] - Physics-based spectrum (MVDR or MUSIC)
+               Values should be normalized to [0, 1] or log-scaled
+        
+        Returns:
+            out: [B, 1, H, W] - Refined probability map (sigmoid output)
+        """
+        # Encoder
+        e1 = self.enc1(x)      # [B, F, H/2, W/2]
+        e2 = self.enc2(e1)     # [B, 2F, H/4, W/4]
+        e3 = self.enc3(e2)     # [B, 4F, H/8, W/8]
+        
+        # Bottleneck
+        b = self.bottleneck(e3)  # [B, 4F, H/8, W/8]
+        
+        # Decoder with skip connections
+        d3 = self.dec3_up(b)   # [B, 2F, H/4, W/4]
+        d3 = self._match_hw(d3, e2)
+        if self.use_skip:
+            d3 = torch.cat([d3, e2], dim=1)  # [B, 4F, H/4, W/4]
+        d3 = self.dec3_conv(d3)  # [B, 2F, H/4, W/4]
+        
+        d2 = self.dec2_up(d3)  # [B, F, H/2, W/2]
+        d2 = self._match_hw(d2, e1)
+        if self.use_skip:
+            d2 = torch.cat([d2, e1], dim=1)  # [B, 2F, H/2, W/2]
+        d2 = self.dec2_conv(d2)  # [B, F, H/2, W/2]
+        
+        d1 = self.dec1_up(d2)  # [B, F/2, H, W]
+        d1 = self._match_hw(d1, x)
+        if self.use_skip:
+            d1 = torch.cat([d1, x], dim=1)  # [B, F/2+1, H, W]
+        d1 = self.dec1_conv(d1)  # [B, F/2, H, W]
+        
+        # Output with sigmoid for probability
+        out = torch.sigmoid(self.output_conv(d1))  # [B, 1, H, W]
+        
+        return out
+
+
+class SpectrumRefinerLoss(nn.Module):
+    """
+    Loss function for training SpectrumRefiner.
+    
+    Creates Gaussian blob heatmaps at GT source locations and computes
+    BCE loss between refined spectrum and GT heatmap.
+    """
+    
+    def __init__(self, sigma_phi: float = 2.0, sigma_theta: float = 2.0,
+                 focal_alpha: float = 0.25, focal_gamma: float = 2.0,
+                 use_focal: bool = True):
+        """
+        Args:
+            sigma_phi: Gaussian blob std in phi direction (grid cells)
+            sigma_theta: Gaussian blob std in theta direction (grid cells)
+            focal_alpha: Focal loss alpha parameter
+            focal_gamma: Focal loss gamma parameter
+            use_focal: Use focal loss instead of BCE (better for sparse targets)
+        """
+        super().__init__()
+        self.sigma_phi = sigma_phi
+        self.sigma_theta = sigma_theta
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.use_focal = use_focal
+    
+    def _create_gaussian_heatmap(self, phi_gt, theta_gt, K_true, 
+                                  grid_phi, grid_theta, device):
+        """
+        Create Gaussian blob heatmap at GT source locations.
+        
+        Args:
+            phi_gt: [B, K_max] GT azimuth in radians
+            theta_gt: [B, K_max] GT elevation in radians
+            K_true: [B] number of active sources
+            grid_phi: [G_phi] phi grid values in radians
+            grid_theta: [G_theta] theta grid values in radians
+            device: torch device
+            
+        Returns:
+            heatmap: [B, 1, G_phi, G_theta] with Gaussian blobs at GT locations
+        """
+        B = phi_gt.shape[0]
+        G_phi = len(grid_phi)
+        G_theta = len(grid_theta)
+        
+        # Create meshgrid for distance computation
+        phi_mesh = grid_phi.view(1, G_phi, 1).expand(B, -1, G_theta)
+        theta_mesh = grid_theta.view(1, 1, G_theta).expand(B, G_phi, -1)
+        
+        # Initialize heatmap
+        heatmap = torch.zeros(B, G_phi, G_theta, device=device)
+        
+        # Grid spacing for sigma conversion
+        d_phi = (grid_phi[-1] - grid_phi[0]) / (G_phi - 1)
+        d_theta = (grid_theta[-1] - grid_theta[0]) / (G_theta - 1)
+        
+        sigma_phi_rad = self.sigma_phi * d_phi
+        sigma_theta_rad = self.sigma_theta * d_theta
+        
+        # Add Gaussian blob for each GT source
+        for b in range(B):
+            K = int(K_true[b].item())
+            for k in range(K):
+                phi_k = phi_gt[b, k]
+                theta_k = theta_gt[b, k]
+                
+                # Compute squared distance normalized by sigma
+                d_phi_sq = ((phi_mesh[b] - phi_k) / sigma_phi_rad) ** 2
+                d_theta_sq = ((theta_mesh[b] - theta_k) / sigma_theta_rad) ** 2
+                
+                # Gaussian blob
+                blob = torch.exp(-0.5 * (d_phi_sq + d_theta_sq))
+                
+                # Max-blend (allows overlapping sources)
+                heatmap[b] = torch.maximum(heatmap[b], blob)
+        
+        # Add channel dimension
+        return heatmap.unsqueeze(1)  # [B, 1, G_phi, G_theta]
+    
+    def forward(self, pred_heatmap, phi_gt, theta_gt, K_true, grid_phi, grid_theta):
+        """
+        Compute loss between predicted heatmap and GT Gaussian blobs.
+        
+        Args:
+            pred_heatmap: [B, 1, G_phi, G_theta] from SpectrumRefiner
+            phi_gt: [B, K_max] GT azimuth in radians
+            theta_gt: [B, K_max] GT elevation in radians  
+            K_true: [B] number of active sources
+            grid_phi: [G_phi] phi grid values in radians
+            grid_theta: [G_theta] theta grid values in radians
+            
+        Returns:
+            loss: scalar loss value
+        """
+        device = pred_heatmap.device
+        
+        # Create GT heatmap
+        gt_heatmap = self._create_gaussian_heatmap(
+            phi_gt, theta_gt, K_true, grid_phi, grid_theta, device
+        )
+        
+        if self.use_focal:
+            # Focal loss for sparse target handling
+            # FL = -α(1-p)^γ log(p) for positive, -α p^γ log(1-p) for negative
+            p = pred_heatmap.clamp(1e-7, 1 - 1e-7)
+            
+            pos_weight = self.focal_alpha * (1 - p) ** self.focal_gamma
+            neg_weight = (1 - self.focal_alpha) * p ** self.focal_gamma
+            
+            pos_loss = -pos_weight * gt_heatmap * torch.log(p)
+            neg_loss = -neg_weight * (1 - gt_heatmap) * torch.log(1 - p)
+            
+            loss = (pos_loss + neg_loss).mean()
+        else:
+            # Standard BCE
+            loss = F.binary_cross_entropy(pred_heatmap, gt_heatmap, reduction='mean')
+        
+        return loss
+
+
+def create_spectrum_refiner_with_pretrained_backbone(backbone_model, 
+                                                      freeze_backbone: bool = True):
+    """
+    Factory function to create a combined model with:
+    1. Pretrained backbone (HybridModel) for covariance prediction
+    2. SpectrumRefiner for spectrum sharpening
+    
+    Args:
+        backbone_model: Pretrained HybridModel
+        freeze_backbone: Whether to freeze backbone weights
+        
+    Returns:
+        Combined model that takes raw inputs and outputs refined spectrum
+    """
+    if freeze_backbone:
+        for param in backbone_model.parameters():
+            param.requires_grad = False
+    
+    refiner = SpectrumRefiner(in_channels=1, base_filters=32)
+    
+    class CombinedModel(nn.Module):
+        def __init__(self, backbone, refiner):
+            super().__init__()
+            self.backbone = backbone
+            self.refiner = refiner
+        
+        def forward(self, y, H, codes, mvdr_spectrum, snr_db=None, R_samp=None):
+            """
+            Args:
+                y, H, codes: Raw inputs for backbone
+                mvdr_spectrum: [B, 1, G_phi, G_theta] precomputed MVDR spectrum
+                snr_db, R_samp: Optional backbone inputs
+                
+            Returns:
+                dict with backbone outputs + refined_spectrum
+            """
+            # Run backbone
+            backbone_out = self.backbone(y, H, codes, snr_db=snr_db, R_samp=R_samp)
+            
+            # Refine spectrum
+            refined = self.refiner(mvdr_spectrum)
+            
+            backbone_out['refined_spectrum'] = refined
+            return backbone_out
+    
+    return CombinedModel(backbone_model, refiner)

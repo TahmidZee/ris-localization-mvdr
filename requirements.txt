@@ -1,0 +1,12 @@
+# Core dependencies for RIS MVDR Localization Pipeline
+torch>=2.0.0
+numpy>=1.21.0
+scipy>=1.7.0
+optuna>=3.0.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+tqdm>=4.60.0
+einops>=0.4.0
+
+# Optional: for AI-Subspace-Methods baseline
+# git+https://github.com/TahmidZee/AI-Subspace-Methods.git@1114656744c38ea7f6ec08a7d2a5bcc365f0ce3d#egg=ai_subspace_methods

@@ -950,3 +950,111 @@ def music2d_from_cov_factor(cf_ang, K, cfg, *, shrink=None, grid_phi=181, grid_t
         return phi_deg, theta_deg, r_deg, S, phi_grid_deg, theta_grid_deg
     else:
         return phi_deg, theta_deg, S, phi_grid_deg, theta_grid_deg
+
+
+# =============================================================================
+# MVDR-based evaluation (K-free alternative to MUSIC)
+# =============================================================================
+
+def mvdr_localize(R, cfg, *, grid_phi=361, grid_theta=181, threshold_db=12.0,
+                  max_sources=5, do_refinement=True, delta_scale=1e-2, device="cuda"):
+    """
+    K-free multi-source localization using MVDR spectrum.
+    
+    This is the recommended entry point for localization without K estimation.
+    Sources are detected via peak detection on the MVDR spectrum.
+    
+    Args:
+        R: Covariance matrix [N, N] complex (R_blend recommended)
+        cfg: Configuration object
+        grid_phi: Azimuth grid resolution
+        grid_theta: Elevation grid resolution
+        threshold_db: Detection threshold (dB below max)
+        max_sources: Maximum sources to detect
+        do_refinement: Whether to do local 3D refinement
+        delta_scale: MVDR diagonal loading scale
+        device: 'cuda' or 'cpu'
+        
+    Returns:
+        phi_deg: Detected azimuth angles (degrees) [n_sources]
+        theta_deg: Detected elevation angles (degrees) [n_sources]
+        r_m: Detected ranges (meters) [n_sources]
+        spectrum: 2D MVDR spectrum [grid_phi, grid_theta]
+    """
+    from .music_gpu import mvdr_detect_sources
+    
+    # Run MVDR detection
+    sources, spectrum = mvdr_detect_sources(
+        R, cfg, device=device,
+        grid_phi=grid_phi, grid_theta=grid_theta,
+        delta_scale=delta_scale,
+        threshold_db=threshold_db,
+        max_sources=max_sources,
+        do_refinement=do_refinement
+    )
+    
+    # Extract arrays
+    if len(sources) == 0:
+        return np.array([]), np.array([]), np.array([]), spectrum
+    
+    phi_deg = np.array([s[0] for s in sources], dtype=np.float32)
+    theta_deg = np.array([s[1] for s in sources], dtype=np.float32)
+    r_m = np.array([s[2] for s in sources], dtype=np.float32)
+    
+    return phi_deg, theta_deg, r_m, spectrum
+
+
+def eval_scene_mvdr(R, phi_gt, theta_gt, r_gt, cfg, *,
+                    threshold_db=12.0, max_sources=5, device="cuda",
+                    success_tol_phi=5.0, success_tol_theta=5.0, success_tol_r=1.0):
+    """
+    Evaluate MVDR localization on a single scene.
+    
+    Args:
+        R: Covariance matrix [N, N] complex (R_blend recommended)
+        phi_gt: Ground truth azimuth (degrees) [K]
+        theta_gt: Ground truth elevation (degrees) [K]
+        r_gt: Ground truth range (meters) [K]
+        cfg: Configuration object
+        threshold_db: Detection threshold
+        max_sources: Maximum sources to detect
+        device: 'cuda' or 'cpu'
+        success_tol_*: Success tolerance thresholds
+        
+    Returns:
+        metrics: dict with RMSE, success flag, K_detected, etc.
+    """
+    # Run MVDR localization
+    phi_pred, theta_pred, r_pred, _ = mvdr_localize(
+        R, cfg, device=device,
+        threshold_db=threshold_db,
+        max_sources=max_sources
+    )
+    
+    K_gt = len(phi_gt)
+    K_det = len(phi_pred)
+    
+    # Empty prediction case
+    if K_det == 0:
+        return {
+            "rmse_phi": np.nan,
+            "rmse_theta": np.nan,
+            "rmse_r": np.nan,
+            "K_detected": 0,
+            "K_gt": K_gt,
+            "success_flag": False,
+        }
+    
+    # Use Hungarian matching to evaluate
+    metrics = eval_scene_angles_ranges(
+        phi_pred, theta_pred, r_pred,
+        phi_gt, theta_gt, r_gt,
+        success_tol_phi=success_tol_phi,
+        success_tol_theta=success_tol_theta,
+        success_tol_r=success_tol_r
+    )
+    
+    metrics["K_detected"] = K_det
+    metrics["K_gt"] = K_gt
+    
+    return metrics

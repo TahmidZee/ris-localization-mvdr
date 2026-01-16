@@ -1,10 +1,11 @@
 
 import numpy as np, torch
 from .configs import cfg, mdl_cfg
-from .model import HybridModel
+from .model import HybridModel, SpectrumRefiner
 from .physics import nearfield_vec, shrink
 from pathlib import Path
 import json
+import torch.nn.functional as F
 
 
 def _load_hpo_best_dict(p=None):
@@ -63,8 +64,8 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
     
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
     
-    # Try to get architecture from checkpoint first
-    arch = ckpt.get("arch")
+    # Try to get architecture from checkpoint first (if ckpt is a dict wrapper)
+    arch = ckpt.get("arch") if isinstance(ckpt, dict) else None
     if arch is None:
         # Fallback to HPO configuration
         try:
@@ -86,7 +87,24 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
         mdl_cfg.DROPOUT = arch.get("dropout", mdl_cfg.DROPOUT)
         
         model = HybridModel()
-        missing_keys, unexpected_keys = model.load_state_dict(ckpt["model"], strict=False)
+
+        # Support multiple checkpoint formats:
+        # - raw state_dict
+        # - {"model": state_dict}
+        # - {"backbone": state_dict, "refiner": state_dict} (refiner-assisted inference)
+        refiner_sd = None
+        if isinstance(ckpt, dict) and ("backbone" in ckpt or "refiner" in ckpt):
+            sd = ckpt.get("backbone", ckpt.get("model", {}))
+            refiner_sd = ckpt.get("refiner")
+        elif isinstance(ckpt, dict) and "model" in ckpt:
+            sd = ckpt["model"]
+        elif isinstance(ckpt, dict):
+            # Heuristic: treat as raw state_dict
+            sd = ckpt
+        else:
+            raise ValueError(f"Unsupported checkpoint type: {type(ckpt)}")
+
+        missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
         
         # Report missing/unexpected keys for debugging
         if missing_keys:
@@ -105,9 +123,18 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
             else:
                 print(f"    - {unexpected_keys[0]} ... and {len(unexpected_keys)-1} more")
         
-        # Store calibrated temperature if available
-        if "k_calibration_temp" in ckpt:
-            model._k_calibration_temp = ckpt["k_calibration_temp"]
+        # Attach SpectrumRefiner if present
+        if refiner_sd is not None:
+            try:
+                refiner = SpectrumRefiner().to(next(model.parameters()).device)
+                refiner.load_state_dict(refiner_sd, strict=False)
+                refiner.eval()
+                # Attach to model for inference usage
+                model._spectrum_refiner = refiner
+                print("✅ Loaded SpectrumRefiner weights from checkpoint")
+            except Exception as e:
+                print(f"⚠️  Failed to load SpectrumRefiner from checkpoint: {e}")
+
         model.eval()
         return model
         
@@ -171,177 +198,201 @@ def newton_refine(phi0, theta0, r0, Un, iters=None, lr=None):
 def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
                          do_newton=True, use_hpo_knobs=True, hpo_json=None,
                          prefer_logits=True):
-    # --- HPO knobs (safe for inference only) ---
-    knobs = _infer_knobs_from_hpo(hpo_json) if use_hpo_knobs else dict(
-        range_grid=getattr(mdl_cfg, "INFERENCE_GRID_SIZE_RANGE", 61),
-        newton_iter=getattr(mdl_cfg, "NEWTON_ITER", 5),
-        newton_lr=getattr(mdl_cfg, "NEWTON_LR", 0.1),
+    """
+    MVDR-first inference (K-free).
+
+    This function keeps the legacy name for compatibility with benchmarking scripts,
+    but internally it runs **MVDR peak detection** on the effective blended covariance.
+
+    Returns:
+        phi_list, theta_list in **radians**, r_list in meters.
+    """
+    from .covariance_utils import build_effective_cov_np
+    from .music_gpu import mvdr_detect_sources, get_gpu_estimator
+
+    # --- helpers ---
+    def _to_numpy(x):
+        if x is None:
+            return None
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return x
+
+    def _ri_to_c_np(x_ri):
+        x_ri = _to_numpy(x_ri)
+        if x_ri is None:
+            return None
+        if np.iscomplexobj(x_ri):
+            return x_ri
+        if x_ri.shape[-1] == 2:
+            return x_ri[..., 0] + 1j * x_ri[..., 1]
+        return x_ri.astype(np.complex64)
+
+    def _to_ri_t(z_cplx: torch.Tensor) -> torch.Tensor:
+        return torch.stack([z_cplx.real, z_cplx.imag], dim=-1)
+
+    # --- device ---
+    dev = next(model.parameters()).device
+    device_str = "cuda" if (dev.type == "cuda" and torch.cuda.is_available()) else "cpu"
+
+    # --- unpack sample ---
+    # Accept either complex inputs (*_cplx) or RI inputs (default dataset format).
+    y_c = _ri_to_c_np(sample.get("y_cplx", sample.get("y")))
+    H_c = _ri_to_c_np(sample.get("H_cplx", sample.get("H")))
+    C_c = _ri_to_c_np(sample.get("codes_cplx", sample.get("codes")))
+    if y_c is None or H_c is None or C_c is None:
+        raise ValueError("sample must contain y/H/codes (either *_cplx complex or RI [...,2])")
+
+    # y: [L,M], H: [L,M] (feature path), codes: [L,N]
+    y_t = torch.from_numpy(y_c).to(torch.complex64).unsqueeze(0).to(dev)
+    H_t = torch.from_numpy(H_c).to(torch.complex64).unsqueeze(0).to(dev)
+    C_t = torch.from_numpy(C_c).to(torch.complex64).unsqueeze(0).to(dev)
+
+    snr_db = float(sample.get("snr_db", sample.get("snr", 10.0)))
+
+    # --- model forward (no grad) ---
+    with torch.no_grad():
+        pred = model(_to_ri_t(y_t), _to_ri_t(H_t), _to_ri_t(C_t), snr_db=None, R_samp=None)
+
+    # --- build R_pred from factors (match loss.py fallback) ---
+    def _vec2c_flat(v_flat: np.ndarray) -> np.ndarray:
+        v_flat = v_flat.astype(np.float32)
+        xr, xi = v_flat[::2], v_flat[1::2]
+        return (xr + 1j * xi).reshape(cfg.N, cfg.K_MAX).astype(np.complex64)
+
+    A_ang = _vec2c_flat(_to_numpy(pred["cov_fact_angle"][0]))
+    A_rng = _vec2c_flat(_to_numpy(pred["cov_fact_range"][0]))
+    lam_range_factor = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+    R_pred = (A_ang @ A_ang.conj().T) + lam_range_factor * (A_rng @ A_rng.conj().T)
+
+    # --- optional R_samp (hybrid blending) ---
+    R_samp = None
+    if sample.get("R_samp") is not None:
+        R_samp = _ri_to_c_np(sample.get("R_samp"))
+    elif sample.get("H_full") is not None:
+        # Build R_samp from snapshots using full channel (preferred)
+        try:
+            from .angle_pipeline import build_sample_covariance_from_snapshots
+            H_full_c = _ri_to_c_np(sample.get("H_full"))  # [M,N]
+            H_stack = np.repeat(H_full_c[None, :, :], y_c.shape[0], axis=0)  # [L,M,N]
+            R_samp = build_sample_covariance_from_snapshots(y_c, H_stack, C_c, cfg, tikhonov_alpha=1e-3)
+        except Exception:
+            R_samp = None
+
+    beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
+    R_eff = build_effective_cov_np(
+        R_pred,
+        R_samp=R_samp,
+        beta=beta if (R_samp is not None) else 0.0,
+        diag_load=True,
+        apply_shrink=True,
+        snr_db=snr_db,
+        target_trace=float(cfg.N),
     )
 
-    def to_ri_t(z): return torch.stack([z.real, z.imag], dim=-1)
-    device = next(model.parameters()).device
-    # Handle both y_cplx and y formats
-    if "y_cplx" in sample:
-        y = torch.from_numpy(sample["y_cplx"]).to(torch.complex64).unsqueeze(0).to(device)
-        H = torch.from_numpy(sample["H_cplx"]).to(torch.complex64).unsqueeze(0).to(device)
+    # --- MVDR detection (K-free) ---
+    max_sources = int(force_K) if (force_K is not None) else int(cfg.K_MAX)
+
+    use_refiner = bool(getattr(cfg, "USE_SPECTRUM_REFINER_IN_INFER", False)) and hasattr(model, "_spectrum_refiner")
+    if use_refiner:
+        # Refiner-assisted inference:
+        # 1) low-rank MVDR spectrum max over range planes (from factors)
+        # 2) SpectrumRefiner -> probability heatmap
+        # 3) 2D NMS peak picking
+        # 4) per-peak range selection over r_planes
+
+        est = get_gpu_estimator(cfg, device=device_str)
+        grid_phi = torch.linspace(
+            np.deg2rad(float(getattr(cfg, "PHI_MIN_DEG", -60.0))),
+            np.deg2rad(float(getattr(cfg, "PHI_MAX_DEG", 60.0))),
+            int(getattr(cfg, "MVDR_GRID_PHI", 361)),
+            device=est.device,
+            dtype=torch.float32,
+        )
+        grid_theta = torch.linspace(
+            np.deg2rad(float(getattr(cfg, "THETA_MIN_DEG", -30.0))),
+            np.deg2rad(float(getattr(cfg, "THETA_MAX_DEG", 30.0))),
+            int(getattr(cfg, "MVDR_GRID_THETA", 181)),
+            device=est.device,
+            dtype=torch.float32,
+        )
+        r_planes = getattr(cfg, "REFINER_R_PLANES", None) or est.default_r_planes_mvdr
+
+        # Build low-rank factors F = [A_ang, sqrt(lam)*A_rng]
+        F_b = np.concatenate([A_ang, np.sqrt(lam_range_factor) * A_rng], axis=1).astype(np.complex64)
+        F_t = torch.as_tensor(F_b, device=est.device, dtype=torch.complex64)
+
+        delta_scale = float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2))
+        spec = est.mvdr_spectrum_max_2_5d_lowrank(F_t, grid_phi, grid_theta, r_planes, delta_scale=delta_scale)  # [G_phi,G_theta]
+        spec = spec.unsqueeze(0).unsqueeze(0)  # [1,1,G_phi,G_theta]
+
+        refiner = getattr(model, "_spectrum_refiner")
+        refiner = refiner.to(est.device)
+        refiner.eval()
+        prob = refiner(spec)  # [1,1,G_phi,G_theta]
+
+        # 2D NMS peak detection
+        min_sep = int(getattr(cfg, "REFINER_NMS_MIN_SEP", 2))
+        thr = float(getattr(cfg, "REFINER_PEAK_THRESH", 0.5))
+        prob2d = prob[0, 0]
+        ksize = 2 * min_sep + 1
+        pooled = F.max_pool2d(prob2d[None, None], kernel_size=ksize, stride=1, padding=min_sep)[0, 0]
+        is_max = (prob2d >= pooled) & (prob2d >= thr)
+        idx = torch.nonzero(is_max, as_tuple=False)
+        if idx.numel() == 0:
+            # fallback: take top-k by prob
+            flat = prob2d.flatten()
+            topk = min(max_sources, flat.numel())
+            vals, inds = torch.topk(flat, k=topk, largest=True)
+            idx = torch.stack([inds // prob2d.shape[1], inds % prob2d.shape[1]], dim=1)
+
+        # Sort peaks by probability desc
+        vals = prob2d[idx[:, 0], idx[:, 1]]
+        order = torch.argsort(vals, descending=True)
+        idx = idx[order][:max_sources]
+
+        # Convert to angles and pick best range plane per peak
+        sources = []
+        for (pi, ti) in idx.tolist():
+            phi = float(torch.rad2deg(grid_phi[pi]).item())
+            theta = float(torch.rad2deg(grid_theta[ti]).item())
+
+            # Find best r by evaluating MVDR at this (phi,theta) over r_planes
+            phi_g = grid_phi[pi:pi+1]
+            theta_g = grid_theta[ti:ti+1]
+            best_r = float(r_planes[0])
+            best_v = -1.0
+            for r in r_planes:
+                A1 = est._steering_nearfield_grid(phi_g, theta_g, float(r)).reshape(1, -1)  # [1,N]
+                v = est._compute_spectrum_mvdr_lowrank(A1.to(torch.complex64), F_t, delta_scale=delta_scale)[0].item()
+                if v > best_v:
+                    best_v = float(v)
+                    best_r = float(r)
+            conf = float(prob2d[pi, ti].item())
+            sources.append((phi, theta, best_r, conf))
     else:
-        # Convert y from [L, M, 2] to complex (handle both numpy and torch)
-        y_data = sample["y"]
-        if torch.is_tensor(y_data):
-            y_data = y_data.numpy()
-        y_real = y_data[:, :, 0]
-        y_imag = y_data[:, :, 1]
-        y_complex = y_real + 1j * y_imag
-        y = torch.from_numpy(y_complex).to(torch.complex64).unsqueeze(0).to(device)
-        
-        # Convert H from [L, N, 2] to complex (handle both numpy and torch)
-        H_data = sample["H"]
-        if torch.is_tensor(H_data):
-            H_data = H_data.numpy()
-        H_real = H_data[:, :, 0]
-        H_imag = H_data[:, :, 1]
-        H_complex = H_real + 1j * H_imag
-        H = torch.from_numpy(H_complex).to(torch.complex64).unsqueeze(0).to(device)
-    
-    codes_data = sample["codes"]
-    if torch.is_tensor(codes_data):
-        codes_data = codes_data.numpy()
-    # Convert codes from [L, N, 2] to complex [L, N]
-    codes_complex = codes_data[:, :, 0] + 1j * codes_data[:, :, 1]
-    codes = torch.from_numpy(codes_complex).to(torch.complex64).unsqueeze(0).to(device)
-    y_ri = to_ri_t(y)
-    H_ri = to_ri_t(H)
-    codes_ri = to_ri_t(codes)
-    # Optional: build R_samp from snapshots for hybrid-aware K-head
-    try:
-        from .angle_pipeline import build_sample_covariance_from_snapshots
-        L_snap = y_complex.shape[0]
-        H_stack = np.repeat(H_complex[None, :, :], L_snap, axis=0)  # [L, M, N]
-        R_samp_np = build_sample_covariance_from_snapshots(y_complex, H_stack, codes_complex, cfg)
-        R_samp_t = torch.from_numpy(R_samp_np).to(torch.complex64).unsqueeze(0).to(device)  # [1,N,N]
-    except Exception:
-        R_samp_t = None
-    with torch.no_grad():
-        pred = model(y_ri, H_ri, codes_ri, R_samp=R_samp_t)
+        sources, _ = mvdr_detect_sources(
+            R_eff,
+            cfg,
+            device=device_str,
+            grid_phi=int(getattr(cfg, "MVDR_GRID_PHI", 361)),
+            grid_theta=int(getattr(cfg, "MVDR_GRID_THETA", 181)),
+            delta_scale=float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2)),
+            threshold_db=float(getattr(cfg, "MVDR_THRESH_DB", 12.0)),
+            max_sources=max_sources,
+            do_refinement=bool(do_newton),
+            prepared=True,
+        )
 
-    # angle subspace factor -> Rhat
-    Aflat = pred["cov_fact_angle"][0].detach().cpu().numpy()
-    A_cplx = (Aflat[::2] + 1j*Aflat[1::2]).reshape(cfg.N, cfg.K_MAX)
-    Rhat = A_cplx @ A_cplx.conj().T
-    
-    # --- make Rhat well-behaved for IC ---
-    Rhat = 0.5*(Rhat + Rhat.conj().T)
-    Rhat /= (np.trace(Rhat).real + 1e-9)
-    Rhat = shrink(Rhat, sample.get("snr_db", 10.0), base=mdl_cfg.SHRINK_BASE_ALPHA)
-
-    # --- prefer model's own K logits if present ---
-    k_from_logits, nn_conf = None, 0.0
-    k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
-    if k_mode == "ordinal" and ("k_ord_logits" in pred):
-        ord_logits = pred["k_ord_logits"][0].detach().cpu()  # [K_MAX-1]
-        probs = torch.sigmoid(ord_logits)
-        thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
-        k_from_logits = int(1 + int((probs > thr).sum().item()))
-        # confidence heuristic in [0,1]: 1 means far from 0.5 thresholds
-        nn_conf = float((torch.mean(torch.abs(probs - 0.5)) * 2.0).clamp(0.0, 1.0).item())
-    elif "k_logits" in pred:
-        k_temp = getattr(model, '_k_calibration_temp', 1.0)
-        k_logits_scaled = pred["k_logits"][0].detach().cpu() / max(float(k_temp), 1e-6)
-        pK = torch.softmax(k_logits_scaled, -1).numpy()
-        k_from_logits = int(np.argmax(pK)) + 1  # Map from class index (0-4) to K (1-5)
-        nn_conf = float(np.max(pK))
-
-    T_snap = int(sample["codes"].shape[0])
-    # Prefer MDL/AIC on measurement-domain covariance (M×M) — much more stable when L is small.
-    K_mdl = None
-    try:
-        # y is torch complex [1, L, M]
-        y_np = y.detach().cpu().numpy()[0]  # [L, M] complex
-        Ryy = (y_np.conj().T @ y_np) / max(T_snap, 1)  # [M, M]
-        Ryy = 0.5 * (Ryy + Ryy.conj().T)
-        # Apply shrinkage like other inference covariances
-        Ryy = shrink(Ryy, sample.get("snr_db", 10.0), base=mdl_cfg.SHRINK_BASE_ALPHA)
-        kmax_eff = min(int(cfg.K_MAX), int(Ryy.shape[0]) - 1)
-        K_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="mdl", kmax=kmax_eff)
-        if K_mdl == 0:
-            K_mdl = estimate_k_ic_from_cov(Ryy, T_snap, method="aic", kmax=kmax_eff)
-    except Exception:
-        # Fallback to old behavior if anything goes wrong
-        K_mdl = estimate_k_ic_from_cov(Rhat, T_snap, method="mdl", kmax=cfg.K_MAX)
-        if K_mdl == 0:
-            K_mdl = estimate_k_ic_from_cov(Rhat, T_snap, method="aic", kmax=cfg.K_MAX)
-    K_mdl = int(max(1, min(K_mdl, cfg.K_MAX, int(cfg.L)-1)))
-
-    if force_K is not None:
-        K_hat = int(force_K)
-    elif prefer_logits and (k_from_logits is not None):
-        # Confidence-gated NN vs MDL
-        thr = float(getattr(cfg, "K_CONF_THRESH", 0.65))
-        K_nn = min(max(1, k_from_logits), cfg.K_MAX)
-        K_hat = K_mdl if (nn_conf < thr) else K_nn
-    else:
-        # Fallback purely on information criteria
-        K_hat = K_mdl
-
-    # near-field subspace rank limit
-    K_hat = int(max(1, min(K_hat, cfg.K_MAX, int(cfg.L)-1)))
-    if K_hat == 0:
+    if len(sources) == 0:
         return [], [], []
 
-    # SOTA FIX: Use unified angle pipeline (MUSIC → Parabolic → Newton)
-    # This is the SAME stack as training evaluation for consistency
-    # Replaces old aux head which was causing train-test mismatch
-    from .angle_pipeline import angle_pipeline
-    
-    # Get covariance factor for MUSIC
-    cf_ang = pred["cov_fact_angle"][0].detach().cpu().numpy()  # [N*2, K_MAX] real
-    cf_cplx = (cf_ang[::2] + 1j*cf_ang[1::2]).reshape(cfg.N, cfg.K_MAX)  # [N, K_MAX] complex
-    
-    # Run unified angle pipeline: MUSIC → Parabolic → Newton
-    phi_est, theta_est, info = angle_pipeline(
-        cf_cplx, K_hat, cfg,
-        use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
-        use_adaptive_shrink=True,
-        use_parabolic=getattr(cfg, "MUSIC_PEAK_REFINE", True),
-        use_newton=getattr(cfg, "USE_NEWTON_REFINE", True),
-        device="cpu",  # Inference is typically single-sample, CPU is fine
-        # Align inference with train-eval: pass snapshots for hybrid blending
-        y_snapshots=y[0].detach().cpu().numpy(),
-        H_snapshots=H[0].detach().cpu().numpy(),
-        codes_snapshots=codes[0].detach().cpu().numpy(),
-        blend_beta=float(getattr(cfg, "HYBRID_COV_BETA", 0.0)),
-    )
+    phi_deg = np.array([s[0] for s in sources], dtype=np.float32)
+    theta_deg = np.array([s[1] for s in sources], dtype=np.float32)
+    r_m = np.array([s[2] for s in sources], dtype=np.float32)
 
-    # range subspace factor -> R_r
-    A_rflat = pred["cov_fact_range"][0].detach().cpu().numpy()
-    A_rcplx = (A_rflat[::2] + 1j*A_rflat[1::2]).reshape(cfg.N, cfg.K_MAX)
-    R_r = A_rcplx @ A_rcplx.conj().T
-    R_r = shrink(R_r, sample["snr_db"], base=mdl_cfg.SHRINK_BASE_ALPHA)
-
-    # MUSIC over range grid (use HPO range_grid) - use float64 for better EVD accuracy
-    r_est = []
-    r_grid = np.linspace(cfg.RANGE_R[0], cfg.RANGE_R[1], int(knobs["range_grid"]))
-    R_r_f64 = R_r.astype(np.complex128)  # Cast to float64 for EVD
-    vals, vecs = np.linalg.eigh(R_r_f64)
-    Un = vecs[:, :-K_hat].astype(np.complex64)  # Convert back to float32
-    for idx,(phi, theta) in enumerate(zip(phi_est, theta_est)):
-        # Vectorized steering on the r-grid for this (phi, theta)
-        a_grid = np.stack(
-            [nearfield_vec(cfg, float(phi), float(theta), float(rg)) for rg in r_grid], axis=1
-        ).astype(np.complex64)  # [N, G]
-        # Projected energy (denominator)
-        P_den = np.real(np.sum((Un.conj().T @ a_grid) * (Un.conj().T @ a_grid).conj(), axis=0))  # [G]
-        r_best = float(r_grid[int(np.argmin(P_den))])  # maximize 1/den  == minimize den
-        
-        if do_newton:
-            # pass HPO-tuned iters/LR to your Newton (limit iterations for speed)
-            phi_ref, theta_ref, r_ref = newton_refine(phi, theta, r_best, Un,
-                                                      iters=min(knobs["newton_iter"], 3),
-                                                      lr=knobs["newton_lr"])
-            phi_est[idx], theta_est[idx] = phi_ref, theta_ref
-            r_best = r_ref
-        r_est.append(float(r_best))
-    return list(map(float,phi_est)), list(map(float,theta_est)), r_est
+    # Return radians for compatibility with existing evaluation code
+    return np.deg2rad(phi_deg).tolist(), np.deg2rad(theta_deg).tolist(), r_m.tolist()
 
 
 def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_source="aux"):
@@ -381,23 +432,24 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
     with torch.no_grad():
         pred = model(to_ri_t(y), to_ri_t(H), to_ri_t(codes), R_samp=R_samp_t)
 
-    # K from model head (match K_HEAD_MODE; keep softmax fallback for legacy checkpoints)
+    # K estimation: use MDL (K-head removed)
     if force_K is not None:
         K_hat = int(force_K)
     else:
-        k_mode = str(getattr(cfg, "K_HEAD_MODE", "softmax")).lower()
-        if k_mode == "ordinal" and ("k_ord_logits" in pred):
-            probs = torch.sigmoid(pred["k_ord_logits"][0].detach().cpu())
-            thr = float(getattr(cfg, "K_ORD_THRESH", 0.5))
-            k_from_head = int(1 + int((probs > thr).sum().item()))
-            K_hat = int(np.clip(k_from_head, 1, cfg.K_MAX))
-        elif "k_logits" in pred:
-            k_temp = getattr(model, '_k_calibration_temp', 1.0)
-            pK = torch.softmax(pred["k_logits"][0] / max(float(k_temp), 1e-6), -1)
-            k_from_logits = int(torch.argmax(pK).item()) + 1  # Map from class index to K
-            K_hat = int(np.clip(k_from_logits, 1, cfg.K_MAX)) if prefer_logits else max(1, int(cfg.K_MAX/2))
-        else:
-            K_hat = 1
+        # Fallback to MDL on R_blend/sample covariance
+        try:
+            if 'R_blend' in pred:
+                R_est = pred['R_blend'][0].detach().cpu().numpy()
+            else:
+                # Build from factors
+                cf_ang = pred["cov_fact_angle"][0].detach().cpu().numpy()
+                cf_cplx = (cf_ang[::2] + 1j*cf_ang[1::2]).reshape(cfg.N, cfg.K_MAX)
+                R_est = cf_cplx @ cf_cplx.conj().T
+            L_snap = y.shape[1] if hasattr(y, 'shape') else cfg.L
+            K_hat = estimate_k_ic_from_cov(R_est, L_snap, method="mdl", kmax=cfg.K_MAX)
+            K_hat = max(1, min(K_hat, cfg.K_MAX))
+        except Exception:
+            K_hat = 1  # Fallback
 
     KMAX = int(cfg.K_MAX)
     
