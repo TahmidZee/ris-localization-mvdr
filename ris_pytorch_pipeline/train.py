@@ -1247,17 +1247,24 @@ class Trainer:
                 if epoch == 1 and bi == 0:
                     grad_norm_before = torch.nn.utils.clip_grad_norm_(train_params, float('inf'))
                     print(f"[GRAD SANITIZE] Before: ||g||_2={grad_norm_before:.3e}", flush=True)
-                
-                # Expert fix: Conservative gradient sanitization to avoid masking AMP overflow
-                # Only zero out NaN gradients, leave inf gradients alone (AMP will handle them)
+
+                # Fail-fast policy: detect non-finite gradients AFTER unscale (AMP uses these).
+                # For HPO, we prefer to abort the trial immediately rather than "sanitize" and silently stop learning.
+                has_nonfinite_grad = False
                 for p in train_params:
-                    if p.grad is not None:
-                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=float('inf'), neginf=float('-inf'))
-                
-                # Expert fix: Log gradient norms after sanitization
-                if epoch == 1 and bi == 0:
-                    grad_norm_after = torch.nn.utils.clip_grad_norm_(train_params, float('inf'))
-                    print(f"[GRAD SANITIZE] After: ||g||_2={grad_norm_after:.3e}", flush=True)
+                    if p.grad is None:
+                        continue
+                    if not torch.isfinite(p.grad).all():
+                        has_nonfinite_grad = True
+                        break
+                if has_nonfinite_grad:
+                    if bool(getattr(cfg, "HPO_MODE", False)) and bool(getattr(cfg, "HPO_FAIL_FAST_ON_NONFINITE_GRADS", True)):
+                        raise RuntimeError(f"Non-finite gradients detected (ep={epoch}, batch={bi}). Aborting HPO trial.")
+                    # Non-HPO: skip the step cleanly (do not sanitize to zeros; that masks instability).
+                    self.opt.zero_grad(set_to_none=True)
+                    self.scaler.update()
+                    print(f"[GRAD] ep={epoch} batch={bi} nonfinite_grad=True -> step skipped", flush=True)
+                    continue
                 
                 # Gradient clipping (AFTER sanitization, BEFORE step)
                 if self.clip_norm and self.clip_norm > 0:
@@ -1295,9 +1302,11 @@ class Trainer:
                 g_total, grad_count, none_count = total_grad_norm(train_params)
                 g_total = float(g_total.detach().cpu())
                 
-                # Expert fix: Check for AMP overflow
-                overflow = any(v > 0.0 for v in found_inf_map.values())
-                ok = (not overflow) and math.isfinite(g_total) and (g_total > 1e-12)
+                # AMP overflow/skip detection:
+                # - internal found_inf_map can be stale; scale drop is the reliable signal.
+                scale_before_step = float(self.scaler.get_scale()) if (hasattr(self, "scaler") and self.scaler is not None) else 1.0
+                overflow_hint = any(v > 0.0 for v in found_inf_map.values())
+                ok = (not overflow_hint) and math.isfinite(g_total) and (g_total > 1e-12)
 
                 # Expert fix: Log gradient status for ALL batches in first epoch
                 # DEBUG: Print for EVERY batch, not just epoch 1
@@ -1310,23 +1319,29 @@ class Trainer:
                 # CRITICAL: Skip step if gradients are non-finite or overflow detected
                 if not ok:
                     if epoch == 1:
-                        print(f"[STEP] batch={bi} SKIPPED - overflow={overflow} ||g||_2={g_total:.3e}", flush=True)
+                        print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
                     self.opt.zero_grad(set_to_none=True)
                     self.scaler.update()  # Still update scaler state
                 else:
                     # Step optimizer (with AMP scaler)
                     self.scaler.step(self.opt)
                     self.scaler.update()
+                    scale_after_step = float(self.scaler.get_scale()) if (hasattr(self, "scaler") and self.scaler is not None) else scale_before_step
+                    scaler_skipped = (scale_after_step < scale_before_step)
                     self.opt.zero_grad(set_to_none=True)
                     print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
-                    stepped = True
+                    stepped = (not scaler_skipped)
                     
                     # Expert fix: Log when step is actually taken
                     if epoch == 1:
-                        print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
+                        if scaler_skipped:
+                            print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
+                        else:
+                            print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
                     
-                    # Expert fix: Track steps taken
-                    self._steps_taken += 1
+                    # Expert fix: Track steps taken (only when optimizer step actually applied)
+                    if stepped:
+                        self._steps_taken += 1
                     if epoch == 1 and bi < 3:
                         lrs = [g['lr'] for g in self.opt.param_groups]
                         print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
@@ -1339,10 +1354,11 @@ class Trainer:
                         self._param_vec_prev = vec_now.detach().clone()
                         print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
                     
-                    self._ema_update()
+                    if stepped:
+                        self._ema_update()
                     
                     # Update SWA model if in SWA phase
-                    if self.swa_started:
+                    if stepped and self.swa_started:
                         self._swa_update()
 
                 # CRITICAL FIX: Clear intermediate tensors to prevent memory leaks
@@ -2236,7 +2252,7 @@ class Trainer:
                 
                 if not phase_controlled:
                     # ICC CRITICAL FIX: When curriculum is OFF (HPO), set lam_cross and lam_gap explicitly
-                    # Use HPO base weights with STRONGER cross/gap regularization for proper subspace structure
+                    # Use HPO base weights with conservative structure regularization for numerical stability.
                     # FIX: Check if dict is non-empty, not just if attribute exists
                     if self._hpo_loss_weights:
                         hpo_lam_cov = self._hpo_loss_weights.get("lam_cov", 1.0)
@@ -2250,7 +2266,12 @@ class Trainer:
                             self.loss_fn.lam_peak = 0.0
                         else:
                             self.loss_fn.lam_cross = 2.5e-3 * hpo_lam_cov  # INCREASED from 1.5e-3: (2-3)e-3 * lam_cov for subspace shaping
-                            self.loss_fn.lam_gap = 0.065 * hpo_lam_cov     # INCREASED from 0.04: (0.05-0.08) * lam_cov for gap penalty
+                            # HPO stability: disable SVD-heavy eigengap/margin regularizers unless explicitly enabled.
+                            if bool(getattr(cfg, "HPO_MODE", False)) and bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
+                                self.loss_fn.lam_gap = 0.0
+                                self.loss_fn.lam_margin = 0.0
+                            else:
+                                self.loss_fn.lam_gap = 0.065 * hpo_lam_cov     # (0.05-0.08) * lam_cov for gap penalty
                     else:
                         # No HPO weights - use default values
                         self.loss_fn.lam_cov = 1.0  # CRITICAL: Ensure main covariance weight is set!
@@ -2261,9 +2282,18 @@ class Trainer:
                             self.loss_fn.lam_gap = 0.0
                             self.loss_fn.lam_ortho = 0.0
                             self.loss_fn.lam_peak = 0.0
+                        else:
+                            if bool(getattr(cfg, "HPO_MODE", False)) and bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
+                                self.loss_fn.lam_gap = 0.0
+                                self.loss_fn.lam_margin = 0.0
                     
-                    # Update structure loss weights (subspace align + peak contrast) based on phase
-                    self._update_structure_loss_weights(ep, epochs)
+                    # Update structure loss weights (subspace align + peak contrast) based on phase.
+                    # HPO stability: disable these unless explicitly enabled.
+                    if bool(getattr(cfg, "HPO_MODE", False)) and bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
+                        self.loss_fn.lam_subspace_align = 0.0
+                        self.loss_fn.lam_peak_contrast = 0.0
+                    else:
+                        self._update_structure_loss_weights(ep, epochs)
             
             # NOTE: K-weight ramping removed - K-head no longer used (MVDR peak detection instead)
             

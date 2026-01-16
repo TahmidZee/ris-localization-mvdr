@@ -149,6 +149,9 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
         snap = {k: getattr(mdl_cfg, k, None) for k in keys}
 
         try:
+            # Mark HPO mode for Trainer (fail-fast on NaN grads, disable unstable loss terms by default)
+            cfg.HPO_MODE = True
+
             # Disable EMA, SWA, and curriculum for HPO trials
             # CRITICAL FIX: Curriculum causes validation loss to spike when K-weight increases,
             # triggering early stopping before model can learn K properly
@@ -202,12 +205,22 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
             t.loss_fn.lam_off = 0.8   # 80% for off-diagonal (relative within NMSE)
             t.loss_fn.lam_aux = s["lam_ang"] + s["lam_rng"]  # Combined aux weight
             
-            # Set reasonable defaults for missing loss parameters (not optimized by HPO)
+            # Set reasonable defaults for missing loss parameters (not optimized by HPO).
+            # IMPORTANT: keep HPO stable (avoid SVD/QR-heavy regularizers in early search).
             t.loss_fn.lam_ortho = 1e-3  # Orthogonality penalty
-            t.loss_fn.lam_peak = 0.05   # Chamfer/peak angle loss
-            t.loss_fn.lam_margin = 0.1  # Subspace margin regularizer
+            t.loss_fn.lam_peak = 0.05   # Chamfer/peak angle loss (ok)
+            if bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
+                t.loss_fn.lam_gap = 0.0
+                t.loss_fn.lam_margin = 0.0
+                t.loss_fn.lam_subspace_align = 0.0
+                t.loss_fn.lam_peak_contrast = 0.0
+                # Also disable the legacy mdl_cfg align knob used by some schedules
+                mdl_cfg.LAM_ALIGN = 0.0
+            else:
+                t.loss_fn.lam_margin = 0.1  # Subspace margin regularizer
             t.loss_fn.lam_range_factor = 0.3  # Range factor in covariance
-            mdl_cfg.LAM_ALIGN = 0.002  # Subspace alignment penalty
+            if not bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
+                mdl_cfg.LAM_ALIGN = 0.002  # Subspace alignment penalty
 
             # HPO subset: Use reasonable subset for effective HPO
             # Updated 2025-11-26: New dataset is 100K train / 10K val / 10K test
@@ -247,6 +260,7 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
             
             return float(best_val)
         finally:
+            cfg.HPO_MODE = False
             # restore mdl_cfg
             for k, v in snap.items():
                 if v is None:

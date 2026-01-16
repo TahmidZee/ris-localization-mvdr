@@ -122,6 +122,14 @@ class SysConfig:
         self.USE_MDL_K_FOR_BLIND = False
         self.DEFAULT_NEWTON_FROM_HPO = True
         self.DEFAULT_RANGE_GRID_FROM_HPO = True
+
+        # --- HPO / numerical stability policies ---
+        # When running Optuna HPO, prefer fail-fast behavior on non-finite gradients so
+        # broken trials are pruned quickly instead of "silently not learning".
+        self.HPO_MODE = False
+        self.HPO_FAIL_FAST_ON_NONFINITE_GRADS = True
+        # Disable fragile loss terms during HPO by default (SVD/QR-heavy regularizers).
+        self.HPO_DISABLE_UNSTABLE_LOSS_TERMS = True
     
     def _build_2d_dft_codebook(self):
         """
