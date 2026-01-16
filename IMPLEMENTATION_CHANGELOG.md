@@ -32,6 +32,8 @@ This document details all code changes made to transition from a K-head classifi
 - ✅ **Added CLI entrypoint** `python -m ris_pytorch_pipeline.ris_pipeline train-refiner` for Stage-2 refiner training.
 - ✅ **Removed MDL from the production inference decision path** (kept only for ablations/debug where needed).
 - ✅ **Repo hygiene cleanup**: committed deletion of legacy archives + removed a dangling submodule-style gitlink (`AI-Subspace-Methods`) and ignored local copies.
+- ✅ **Disabled eigengap/margin regularizers entirely** (`lam_gap`, `lam_margin`) to eliminate SVD-based backward instability during backbone training/HPO.
+- ✅ **Removed per-sample QR retraction inside the loss** (rely on orthogonality penalty instead) and **detached SVD subspaces** in alignment loss to avoid fragile linear-algebra backprop.
 
 ### Stage-2 SpectrumRefiner Training (Option B) — New Additions
 

@@ -82,10 +82,12 @@ class UltimateHybridLoss(nn.Module):
         lam_off: float  = 0.8,
         lam_ortho: float = 1e-3,
         lam_cross: float = 0.0,
-        lam_gap: float   = 0.012,
+        # Eigengap/margin regularizers are disabled in the current system (MVDR+Refiner).
+        # They rely on SVD/eigenvalue backprop and were a major source of NaN gradients in HPO.
+        lam_gap: float   = 0.0,
         lam_aux: float   = 1.00,    # Primary: angle/range guidance
         lam_peak: float  = 0.20,    # Moderate peak regularizer
-        lam_margin: float = 0.1,
+        lam_margin: float = 0.0,
         lam_range_factor: float = 0.3,  # weight for range factor in cov computation
         gap_margin: float = 0.03,
         lam_subspace_align: float = 0.50,  # Primary: subspace alignment
@@ -171,7 +173,9 @@ class UltimateHybridLoss(nn.Module):
         eye = torch.eye(N, device=R_cov.device, dtype=R_cov.dtype)
         R = 0.5*(R_cov + R_cov.conj().transpose(-2,-1)) + eps * eye
 
+        # IMPORTANT: detach SVD outputs to avoid backprop through SVD (numerical instability).
         U, S, Vh = torch.linalg.svd(R, full_matrices=False)  # U: [B,N,N], S desc
+        U = U.detach()
         A_pred = _steer_torch(phi_pred[:, :cfg.K_MAX], theta_pred[:, :cfg.K_MAX], r_pred[:, :cfg.K_MAX])  # [B,N,Kmax]
 
         losses = []
@@ -602,16 +606,8 @@ class UltimateHybridLoss(nn.Module):
         else:
             A_range = torch.zeros_like(A_angle)
 
-        # QR retraction per-batch with true K
-        Aq = []
-        for b in range(B):
-            k = int(K_true[b].item())
-            if k <= 0:
-                Aq.append(A_angle[b]); continue
-            Q, _ = torch.linalg.qr(A_angle[b, :, :k].to(torch.complex64), mode='reduced')
-            Qpad = torch.zeros_like(A_angle[b]); Qpad[:, :k] = Q
-            Aq.append(Qpad)
-        A_angle = torch.stack(Aq, dim=0)
+        # NOTE: QR retraction removed (it was a frequent source of NaN gradients early in training).
+        # We rely on the orthogonality penalty directly on A_angle instead.
 
         # Use R_blend if available (training-inference alignment), otherwise construct R_hat from factors
         if 'R_blend' in y_pred:
@@ -725,14 +721,14 @@ class UltimateHybridLoss(nn.Module):
         else:
             loss_cross = torch.tensor(0.0, device=device)
 
-        # Expert fix: Re-enabled eigengap loss with SVD (now safe)
-        if 'R_blend' in y_pred and self.lam_gap > 0.0:
-            loss_gap = self._eigengap_hinge(y_pred['R_blend'], K_true)
-        else:
-            loss_gap = torch.tensor(0.0, device=device)
-        
-        # Expert fix: Re-enabled subspace margin regularizer with SVD (now safe)
-        loss_margin = self._subspace_margin_regularizer(R_hat, K_true) if (self.lam_margin > 0.0) else torch.tensor(0.0, device=device)
+        # Eigengap / margin terms are disabled in this system.
+        # If someone sets non-zero weights, ignore them (do not run SVD-based backward).
+        if (self.lam_gap != 0.0) or (self.lam_margin != 0.0):
+            if not hasattr(self, "_gap_margin_disabled_warned"):
+                print("[WARN] lam_gap/lam_margin are disabled (ignored). Set them to 0.0 for clarity.", flush=True)
+                self._gap_margin_disabled_warned = True
+        loss_gap = torch.tensor(0.0, device=device)
+        loss_margin = torch.tensor(0.0, device=device)
 
         # NOTE: K-loss removed - using MVDR peak detection instead (K-free localization)
 
@@ -828,8 +824,6 @@ class UltimateHybridLoss(nn.Module):
             + self.lam_cov_pred * loss_nmse_pred  # Aux pressure on R_pred
             + self.lam_ortho * loss_ortho
             + self.lam_cross * loss_cross
-            + self.lam_gap   * loss_gap
-            + self.lam_margin * loss_margin
             + self.lam_aux   * aux_l2
             + self.lam_peak  * peak_l2  # Chamfer/peak angle loss
             + 0.02           * range_raw

@@ -495,7 +495,9 @@ class Trainer:
         # Set reasonable defaults for missing loss parameters (same as HPO)
         self.loss_fn.lam_ortho = 1e-3  # Orthogonality penalty
         self.loss_fn.lam_peak = 0.05   # Chamfer/peak angle loss
-        self.loss_fn.lam_margin = 0.1  # Subspace margin regularizer
+        # Eigengap/margin disabled globally
+        self.loss_fn.lam_gap = 0.0
+        self.loss_fn.lam_margin = 0.0
         self.loss_fn.lam_range_factor = 0.3  # Range factor in covariance
         mdl_cfg.LAM_ALIGN = 0.002  # Subspace alignment penalty
         
@@ -519,11 +521,9 @@ class Trainer:
         # NOTE: lam_K removed - using MVDR peak detection instead
         if "lam_peak_contrast" in weights:
             self.loss_fn.lam_peak_contrast = float(weights["lam_peak_contrast"])
-        # CRITICAL: Also apply SVD-based loss weights to prevent NaN gradients
-        if "lam_gap" in weights:
-            self.loss_fn.lam_gap = float(weights["lam_gap"])
-        if "lam_margin" in weights:
-            self.loss_fn.lam_margin = float(weights["lam_margin"])
+        # Eigengap/margin disabled globally (ignore any config values).
+        self.loss_fn.lam_gap = 0.0
+        self.loss_fn.lam_margin = 0.0
         print(f"🎯 Applied phase '{phase}' loss weights: "
               f"lam_cov={self.loss_fn.lam_cov:.3f}, "
               f"lam_subspace_align={self.loss_fn.lam_subspace_align:.3f}, "
@@ -1702,12 +1702,12 @@ class Trainer:
             
             # Covariance structure terms (scaled by cov weight)
             self.loss_fn.lam_cross = 1e-3 * hpo_lam_cov
-            self.loss_fn.lam_gap   = 0.03 * hpo_lam_cov
+            self.loss_fn.lam_gap   = 0.0
             
             # Fixed terms (not from HPO)
             self.loss_fn.lam_ortho = 1e-3
             self.loss_fn.lam_peak = 0.05
-            self.loss_fn.lam_margin = 0.1
+            self.loss_fn.lam_margin = 0.0
             self.loss_fn.lam_range_factor = 0.3
             
             # Higher dropout in early phase
@@ -1723,12 +1723,12 @@ class Trainer:
             
             # Covariance structure terms
             self.loss_fn.lam_cross = 1e-3 * hpo_lam_cov
-            self.loss_fn.lam_gap   = 0.05 * hpo_lam_cov
+            self.loss_fn.lam_gap   = 0.0
             
             # Fixed terms
             self.loss_fn.lam_ortho = 1e-3
             self.loss_fn.lam_peak = 0.05
-            self.loss_fn.lam_margin = 0.1
+            self.loss_fn.lam_margin = 0.0
             self.loss_fn.lam_range_factor = 0.3
             
             dropout = max(float(getattr(mdl_cfg, "DROPOUT", 0.10)), 0.10)
@@ -1746,12 +1746,12 @@ class Trainer:
             progress = (epoch - phase3_start) / max(1, total_epochs - phase3_start)
             progress = max(0, min(1, progress))  # clamp to [0,1]
             self.loss_fn.lam_cross = (1e-3 + progress * 1e-3) * hpo_lam_cov  # 1e-3 → 2e-3, scaled
-            self.loss_fn.lam_gap   = 0.06 * hpo_lam_cov
+            self.loss_fn.lam_gap   = 0.0
             
             # Fixed terms
             self.loss_fn.lam_ortho = 1e-3
             self.loss_fn.lam_peak = 0.05
-            self.loss_fn.lam_margin = 0.1
+            self.loss_fn.lam_margin = 0.0
             self.loss_fn.lam_range_factor = 0.3
     
     def _tau_schedule(self, epoch: int, total_epochs: int) -> float:

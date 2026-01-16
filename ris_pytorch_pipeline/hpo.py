@@ -217,7 +217,9 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
                 # Also disable the legacy mdl_cfg align knob used by some schedules
                 mdl_cfg.LAM_ALIGN = 0.0
             else:
-                t.loss_fn.lam_margin = 0.1  # Subspace margin regularizer
+                # Eigengap/margin disabled globally (kept for backward-compat only).
+                t.loss_fn.lam_gap = 0.0
+                t.loss_fn.lam_margin = 0.0
             t.loss_fn.lam_range_factor = 0.3  # Range factor in covariance
             if not bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
                 mdl_cfg.LAM_ALIGN = 0.002  # Subspace alignment penalty
