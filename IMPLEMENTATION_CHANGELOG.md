@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 16, 2026 (Guardrails + MVDR low-rank equivalence test + peak-level validation metrics)
+**Last Updated:** January 16, 2026 (Stability: factor column normalization + peak-contrast clamp fix)
 
 ---
 
@@ -97,7 +97,28 @@ Run:
 python -m ris_pytorch_pipeline.regression_tests mvdr_lowrank --n 5
 ```
 
-### 5) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
+### 5) Factor magnitude leash (prevents overflow before conditioning)
+
+**Files:** `ris_pytorch_pipeline/loss.py`, `ris_pytorch_pipeline/train.py`
+
+Added **column normalization** on complex covariance factors (`A_angle`, `A_range`) right after they are formed from the real/imag interleaved vectors. This prevents factor magnitudes from spiking before trace normalization / conditioning, which was a source of occasional non-finite gradients.
+
+The normalization is controlled by config knobs:
+- `FACTOR_COLNORM_ENABLE` (default: True)
+- `FACTOR_COLNORM_EPS` (default: 1e-6)
+- `FACTOR_COLNORM_MAX` (default: 1e3)
+
+This is safe because downstream covariance is trace-normalized anyway; we're just preventing pathological intermediate values that can overflow in fp32/complex64.
+
+### 6) Fixed `_peak_contrast_loss()` tensor clamp bug
+
+**File:** `ris_pytorch_pipeline/loss.py`
+
+The peak contrast loss was using Python's `max(denom, 1e-12)` where `denom` is a torch tensor, which doesn't behave as intended. Fixed to use `torch.clamp(denom, min=1e-12)` for proper tensor operations.
+
+Even though this loss is often disabled (weight=0), fixing it removes a class of "did this term actually do anything?" ambiguity.
+
+### 7) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
 
 **File:** `ris_pytorch_pipeline/train.py` (+ defaults in `configs.py`)
 
