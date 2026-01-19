@@ -32,7 +32,19 @@ def _range_huber_loss(pred_r, gt_r, delta=0.2):
 def _vec2c(v):
     v = v.float()
     xr, xi = v[:, ::2], v[:, 1::2]
-    return torch.complex(xr.view(-1, cfg.N, cfg.K_MAX), xi.view(-1, cfg.N, cfg.K_MAX))
+    A = torch.complex(xr.view(-1, cfg.N, cfg.K_MAX), xi.view(-1, cfg.N, cfg.K_MAX)).to(torch.complex64)
+
+    # Magnitude leash: normalize columns to prevent rare huge factor spikes from overflowing
+    # before downstream conditioning/trace-normalization.
+    if bool(getattr(cfg, "FACTOR_COLNORM_ENABLE", True)):
+        eps = float(getattr(cfg, "FACTOR_COLNORM_EPS", 1e-6))
+        max_norm = float(getattr(cfg, "FACTOR_COLNORM_MAX", 1e3))
+        col = torch.linalg.norm(A, dim=-2, keepdim=True).clamp_min(eps)  # [B,1,K]
+        # Optional upper bound (keeps division from magnifying tiny columns too much)
+        if max_norm > 0:
+            col = col.clamp(max=max_norm)
+        A = A / col
+    return A
 
 def _steer_torch(phi, theta, r):
     B, K = phi.shape
@@ -359,7 +371,8 @@ class UltimateHybridLoss(nn.Module):
                             # MUSIC spectrum: 1 / (a^H G a) where G is noise projector
                             # For simplicity, use R_pred directly (approximation)
                             denom = torch.real(a.conj() @ R_pred[b] @ a)
-                            spectrum[i, j] = 1.0 / max(denom, 1e-12)
+                            denom = torch.clamp(denom, min=1e-12)
+                            spectrum[i, j] = 1.0 / denom
                     
                     # Contrastive loss: GT (center) should be higher than neighbors
                     gt_value = spectrum[stencil_size//2, stencil_size//2]  # Center

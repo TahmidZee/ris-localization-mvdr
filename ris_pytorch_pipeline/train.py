@@ -75,7 +75,16 @@ def build_R_pred_from_factor_vecs(cf_ang: torch.Tensor, cf_rng: torch.Tensor, *,
 
     def _vec2c(v: torch.Tensor) -> torch.Tensor:
         xr, xi = v[:, ::2], v[:, 1::2]  # [B, N*Kmax]
-        return torch.complex(xr.view(B, N, Kmax), xi.view(B, N, Kmax)).to(torch.complex64)
+        A = torch.complex(xr.view(B, N, Kmax), xi.view(B, N, Kmax)).to(torch.complex64)
+        # Magnitude leash (match loss.py): normalize columns before AA^H.
+        if bool(getattr(cfg, "FACTOR_COLNORM_ENABLE", True)):
+            eps = float(getattr(cfg, "FACTOR_COLNORM_EPS", 1e-6))
+            max_norm = float(getattr(cfg, "FACTOR_COLNORM_MAX", 1e3))
+            col = torch.linalg.norm(A, dim=-2, keepdim=True).clamp_min(eps)  # [B,1,K]
+            if max_norm > 0:
+                col = col.clamp(max=max_norm)
+            A = A / col
+        return A
 
     Aang = _vec2c(cf_ang)
     Arng = _vec2c(cf_rng)
