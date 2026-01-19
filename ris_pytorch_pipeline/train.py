@@ -929,6 +929,20 @@ class Trainer:
         running = 0.0
         iters = len(loader) if max_batches is None else min(len(loader), max_batches)
         
+        # Log gating: avoid massive logs during HPO/full training unless explicitly enabled.
+        epoch_dbg = bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False))
+        loopcheck_dbg = bool(getattr(cfg, "TRAIN_LOOPCHECK_DEBUG", False))
+        log_every = int(getattr(cfg, "TRAIN_BATCH_LOG_EVERY", 0))
+        log_first = int(getattr(cfg, "TRAIN_BATCH_LOG_FIRST", 0))
+        log_every = max(0, log_every)
+        log_first = max(0, log_first)
+        def _should_log_batch(bi: int) -> bool:
+            if bi < log_first:
+                return True
+            if log_every <= 0:
+                return False
+            return (bi % log_every == 0) or (bi == iters - 1)
+        
         # Expert fix: Initialize parameter vector for drift tracking (if first epoch)
         if not hasattr(self, "_param_vec_prev"):
             with torch.no_grad():
@@ -937,36 +951,38 @@ class Trainer:
         # Expert debug: Print LR every epoch
         lrs = [g['lr'] for g in self.opt.param_groups]
         print(f"[LR] epoch={epoch} groups={['backbone','head']} lr={lrs}", flush=True)
-        print(f"[EPOCH DEBUG] epoch={epoch} iters={iters} len(loader)={len(loader)}", flush=True)
-        print(f"[EPOCH DEBUG] entering for loop over loader...", flush=True)
-        import sys; sys.stdout.flush(); sys.stderr.flush()
+        if epoch_dbg:
+            print(f"[EPOCH DEBUG] epoch={epoch} iters={iters} len(loader)={len(loader)}", flush=True)
+            print(f"[EPOCH DEBUG] entering for loop over loader...", flush=True)
+            import sys; sys.stdout.flush(); sys.stderr.flush()
 
         # DEBUG: Try to manually get first batch
-        try:
-            print(f"[EPOCH DEBUG] testing manual iter(loader)...", flush=True)
-            test_iter = iter(loader)
-            print(f"[EPOCH DEBUG] iter() succeeded, calling next()...", flush=True)
-            test_batch = next(test_iter)
-            print(f"[EPOCH DEBUG] next() succeeded, got batch with keys: {list(test_batch.keys()) if isinstance(test_batch, dict) else 'not a dict'}", flush=True)
-            del test_iter, test_batch
-        except StopIteration:
-            print(f"[EPOCH DEBUG] StopIteration - loader is EMPTY!", flush=True)
-            return 0.0
-        except Exception as e:
-            print(f"[EPOCH DEBUG] EXCEPTION during manual iter: {type(e).__name__}: {e}", flush=True)
-            import traceback; traceback.print_exc()
-            return 0.0
-        
-        print(f"[EPOCH DEBUG] manual test passed, now doing real for loop...", flush=True)
+        if epoch_dbg:
+            try:
+                print(f"[EPOCH DEBUG] testing manual iter(loader)...", flush=True)
+                test_iter = iter(loader)
+                print(f"[EPOCH DEBUG] iter() succeeded, calling next()...", flush=True)
+                test_batch = next(test_iter)
+                print(f"[EPOCH DEBUG] next() succeeded, got batch with keys: {list(test_batch.keys()) if isinstance(test_batch, dict) else 'not a dict'}", flush=True)
+                del test_iter, test_batch
+            except StopIteration:
+                print(f"[EPOCH DEBUG] StopIteration - loader is EMPTY!", flush=True)
+                return 0.0
+            except Exception as e:
+                print(f"[EPOCH DEBUG] EXCEPTION during manual iter: {type(e).__name__}: {e}", flush=True)
+                import traceback; traceback.print_exc()
+                return 0.0
+            
+            print(f"[EPOCH DEBUG] manual test passed, now doing real for loop...", flush=True)
 
         batch_count = 0
         for bi, batch in enumerate(loader):
             batch_count += 1
-            if batch_count == 1:
+            if epoch_dbg and batch_count == 1:
                 print(f"[EPOCH DEBUG] got first batch in for loop, bi={bi}", flush=True)
             if bi >= iters: break
             self._batches_seen += 1  # Expert fix: Track batch counter
-            if bi == 0:
+            if epoch_dbg and bi == 0:
                 print(f"[EPOCH DEBUG] epoch={epoch} fetching batch 0", flush=True)
             y, H, C, ptr, K, R_in, snr, H_full, R_samp = self._unpack_any_batch(batch)
             
@@ -1255,7 +1271,8 @@ class Trainer:
                     torch.cuda.synchronize()
                 print("[TIMING] backward: start", flush=True)
             self.scaler.scale(loss).backward()
-            print(f"[LOOP-CHECK] bi={bi} did_backward", flush=True)  # Verify loop fix
+            if loopcheck_dbg and _should_log_batch(bi):
+                print(f"[LOOP-CHECK] bi={bi} did_backward", flush=True)  # Verify loop fix
             if _dbg_timing and epoch == 1 and bi == 0:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -1264,7 +1281,8 @@ class Trainer:
             # CRITICAL: Accumulate loss for EVERY batch BEFORE optimizer step
             batch_loss_val = float(loss.detach().item()) * grad_accumulation
             running += batch_loss_val
-            print(f"[BATCH] ep={epoch} bi={bi} batch_loss={batch_loss_val:.4f} running={running:.4f}", flush=True)
+            if _should_log_batch(bi):
+                print(f"[BATCH] ep={epoch} bi={bi} batch_loss={batch_loss_val:.4f} running={running:.4f}", flush=True)
             
             # Only step optimizer every grad_accumulation steps
             if (bi + 1) % grad_accumulation == 0 or (bi + 1) == iters:
@@ -1284,7 +1302,8 @@ class Trainer:
                     current_scale = -1.0
 
                 if epoch == 1 and bi < 3:
-                    print(f"[AMP] scale={current_scale} found_inf={found_inf_map}", flush=True)
+                    if epoch_dbg:
+                        print(f"[AMP] scale={current_scale} found_inf={found_inf_map}", flush=True)
                 
                 train_params = list(self.refiner.parameters()) if (self.train_refiner_only and self.refiner is not None) else list(self.model.parameters())
 
@@ -1378,8 +1397,9 @@ class Trainer:
 
                 # Expert fix: Log gradient status for ALL batches in first epoch
                 # DEBUG: Print for EVERY batch, not just epoch 1
-                print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow_hint={overflow_hint}", flush=True)
-                import sys; sys.stdout.flush(); sys.stderr.flush()
+                if _should_log_batch(bi):
+                    print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow_hint={overflow_hint}", flush=True)
+                    import sys; sys.stdout.flush(); sys.stderr.flush()
                 
                 # Initialize stepped flag
                 stepped = False
@@ -1387,7 +1407,8 @@ class Trainer:
                 # CRITICAL: Skip step if gradients are non-finite or overflow detected
                 if not ok:
                     if epoch == 1:
-                        print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
+                        if _should_log_batch(bi):
+                            print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
                     self.opt.zero_grad(set_to_none=True)
                     self.scaler.update()  # Still update scaler state
                 else:
@@ -1397,22 +1418,26 @@ class Trainer:
                     scale_after_step = float(self.scaler.get_scale()) if (hasattr(self, "scaler") and self.scaler is not None) else scale_before_step
                     scaler_skipped = (scale_after_step < scale_before_step)
                     self.opt.zero_grad(set_to_none=True)
-                    print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
+                    if loopcheck_dbg and _should_log_batch(bi):
+                        print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
                     stepped = (not scaler_skipped)
                     
                     # Expert fix: Log when step is actually taken
                     if epoch == 1:
                         if scaler_skipped:
-                            print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
+                            if _should_log_batch(bi):
+                                print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
                         else:
-                            print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
+                            if _should_log_batch(bi):
+                                print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
                     
                     # Expert fix: Track steps taken (only when optimizer step actually applied)
                     if stepped:
                         self._steps_taken += 1
                     if epoch == 1 and bi < 3:
                         lrs = [g['lr'] for g in self.opt.param_groups]
-                        print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
+                        if epoch_dbg:
+                            print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
                     
                     # Expert fix: Parameter drift probe - measure BEFORE EMA update
                     with torch.no_grad():
@@ -1420,7 +1445,8 @@ class Trainer:
                         vec_now = torch.nn.utils.parameters_to_vector([p.detach().float() for p in vec_src if p.requires_grad])
                         delta = (vec_now - getattr(self, "_param_vec_prev", vec_now)).norm().item()
                         self._param_vec_prev = vec_now.detach().clone()
-                        print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
+                        if _should_log_batch(bi):
+                            print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
                     
                     if stepped:
                         self._ema_update()
@@ -1433,8 +1459,9 @@ class Trainer:
                 # NOTE: running is already accumulated BEFORE this block
                 del y, H, C, ptr, K, R_in, snr, R_true_c, R_true, labels, loss
 
-        # DEBUG: Print how many batches were processed (OUTSIDE for loop)
-        print(f"[EPOCH DEBUG] epoch={epoch} processed {batch_count} batches", flush=True)
+        if epoch_dbg:
+            # DEBUG: Print how many batches were processed (OUTSIDE for loop)
+            print(f"[EPOCH DEBUG] epoch={epoch} processed {batch_count} batches", flush=True)
 
         # Expert fix: Update schedulers only after actual steps
         # NOTE: 'stepped' is only valid for the last batch - scheduler step happens once per epoch
@@ -1446,7 +1473,8 @@ class Trainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        print(f"[EPOCH DEBUG] epoch={epoch} done, avg_loss={running / max(1, iters):.4f}", flush=True)
+        if epoch_dbg:
+            print(f"[EPOCH DEBUG] epoch={epoch} done, avg_loss={running / max(1, iters):.4f}", flush=True)
         return running / max(1, iters)
 
     @torch.no_grad()
@@ -2631,9 +2659,11 @@ class Trainer:
             if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', True):
                 self._apply_curriculum(ep, epochs)
 
-            print(f"[EPOCH DEBUG] calling _train_one_epoch ep={ep+1}", flush=True)
+            if bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)):
+                print(f"[EPOCH DEBUG] calling _train_one_epoch ep={ep+1}", flush=True)
             tr_loss = self._train_one_epoch(tr_loader, ep + 1, epochs, max_train_batches, grad_accumulation)
-            print(f"[EPOCH DEBUG] finished _train_one_epoch ep={ep+1} train_loss={tr_loss}", flush=True)
+            if bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)):
+                print(f"[EPOCH DEBUG] finished _train_one_epoch ep={ep+1} train_loss={tr_loss}", flush=True)
 
             # validate with best available model (SWA > EMA > regular)
             # Log per-term debug info every 3 epochs or last epoch

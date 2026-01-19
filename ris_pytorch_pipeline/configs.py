@@ -130,6 +130,14 @@ class SysConfig:
         self.HPO_FAIL_FAST_ON_NONFINITE_GRADS = True
         # Disable fragile loss terms during HPO by default (SVD/QR-heavy regularizers).
         self.HPO_DISABLE_UNSTABLE_LOSS_TERMS = True
+
+        # --- Training / HPO log verbosity ---
+        # The training loop has very detailed instrumentation for debugging stalls and non-finite grads.
+        # Defaults below keep logs readable for long HPO runs; flip these on only when debugging.
+        self.TRAIN_EPOCH_DEBUG = False          # verbose epoch-level loader diagnostics
+        self.TRAIN_LOOPCHECK_DEBUG = False      # prints loop-check markers each batch
+        self.TRAIN_BATCH_LOG_EVERY = 0          # 0 = disable per-batch loss/grad/step logs; else log every N batches
+        self.TRAIN_BATCH_LOG_FIRST = 0          # always log first N batches of each epoch (even if TRAIN_BATCH_LOG_EVERY=0)
     
     def _build_2d_dft_codebook(self):
         """
