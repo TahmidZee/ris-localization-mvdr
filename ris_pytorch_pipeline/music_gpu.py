@@ -57,8 +57,11 @@ class GPUMusicEstimator:
         self.N_H = int(getattr(cfg, "N_H", 12))
         self.N_V = int(getattr(cfg, "N_V", 12))
         self.N = self.N_H * self.N_V
-        self.d_h = float(getattr(cfg, "d_H", 0.5))  # wavelengths
-        self.d_v = float(getattr(cfg, "d_V", 0.5))  # wavelengths
+        # IMPORTANT: In this codebase, cfg.d_H / cfg.d_V are in **meters** (see configs.py and dataset.py).
+        # Older versions of this module treated them as “wavelength units” and multiplied by λ again, which
+        # breaks steering vectors and produces near-flat spectra (MVDR/MUSIC) even on GT covariances.
+        self.d_h = float(getattr(cfg, "d_H", 0.5 * float(getattr(cfg, "WAVEL", 0.3))))  # meters
+        self.d_v = float(getattr(cfg, "d_V", self.d_h))  # meters
         self.lam = float(getattr(cfg, "WAVEL", 0.0625))  # meters
         self.k0 = 2.0 * np.pi / self.lam
         
@@ -72,20 +75,12 @@ class GPUMusicEstimator:
         self.r_min = float(getattr(cfg, "R_MIN", 0.5))
         self.r_max = float(getattr(cfg, "R_MAX", 10.0))
         
-        # Pre-compute element positions (centered UPA), in BOTH wavelengths and meters
-        # Matches physics.py convention exactly
-        h_idx_wl = torch.arange(-(self.N_H - 1)//2, (self.N_H + 1)//2, dtype=torch.float32) * self.d_h  # wavelengths
-        v_idx_wl = torch.arange(-(self.N_V - 1)//2, (self.N_V + 1)//2, dtype=torch.float32) * self.d_v  # wavelengths
-        h_idx_m  = h_idx_wl * self.lam  # meters
-        v_idx_m  = v_idx_wl * self.lam  # meters
-        
-        # Mesh grid with xy indexing (matches physics.py)
-        h_mesh_wl, v_mesh_wl = torch.meshgrid(h_idx_wl, v_idx_wl, indexing='xy')
-        h_mesh_m,  v_mesh_m  = torch.meshgrid(h_idx_m,  v_idx_m,  indexing='xy')
-        # Flatten
-        self.h_flat = h_mesh_wl.reshape(-1).to(self.device)  # [N] wavelengths (for far-field)
-        self.v_flat = v_mesh_wl.reshape(-1).to(self.device)  # [N] wavelengths
-        self.h_flat_m = h_mesh_m.reshape(-1).to(self.device)  # [N] meters (for near-field)
+        # Pre-compute element positions (centered UPA) in **meters**.
+        # Matches physics.py / dataset.py convention exactly.
+        h_idx_m = torch.arange(-(self.N_H - 1)//2, (self.N_H + 1)//2, dtype=torch.float32) * self.d_h  # meters
+        v_idx_m = torch.arange(-(self.N_V - 1)//2, (self.N_V + 1)//2, dtype=torch.float32) * self.d_v  # meters
+        h_mesh_m, v_mesh_m = torch.meshgrid(h_idx_m, v_idx_m, indexing='xy')
+        self.h_flat_m = h_mesh_m.reshape(-1).to(self.device)  # [N] meters
         self.v_flat_m = v_mesh_m.reshape(-1).to(self.device)  # [N] meters
         
         # Pre-compute h^2 + v^2 for near-field (meters^2)
@@ -143,10 +138,10 @@ class GPUMusicEstimator:
         
         # Term 1: h[n] * sin_phi[i] * cos_theta[j]
         phi_theta = sin_phi[:, None] * cos_theta[None, :]  # [G_phi, G_theta]
-        h_term = phi_theta[:, :, None] * self.h_flat[None, None, :]  # [G_phi, G_theta, N]
+        h_term = phi_theta[:, :, None] * self.h_flat_m[None, None, :]  # [G_phi, G_theta, N]
         
         # Term 2: v[n] * sin_theta[j]
-        v_term = sin_theta[None, :, None] * self.v_flat[None, None, :]  # [1, G_theta, N]
+        v_term = sin_theta[None, :, None] * self.v_flat_m[None, None, :]  # [1, G_theta, N]
         
         # Total phase and steering vector
         phase = self.k0 * (h_term + v_term)  # [G_phi, G_theta, N]

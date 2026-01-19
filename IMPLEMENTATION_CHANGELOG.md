@@ -97,7 +97,18 @@ Run:
 python -m ris_pytorch_pipeline.regression_tests mvdr_lowrank --n 5
 ```
 
-### 5) Factor magnitude leash (prevents overflow before conditioning)
+### 5) CRITICAL: Fixed GPU steering-vector spacing units (meters vs “wavelength units”)
+
+**File:** `ris_pytorch_pipeline/music_gpu.py`
+
+The GPU estimator previously treated `cfg.d_H` / `cfg.d_V` as “wavelength units” and multiplied by `λ` again to get meters.
+In this repo, `cfg.d_H` / `cfg.d_V` are **already meters** (see `configs.py` and dataset generation in `dataset.py`).
+
+This unit mismatch produced **near-flat MVDR/MUSIC spectra** (low PSSR) and made peak-based metrics appear broken (often zero recall).
+
+**Fix:** treat `cfg.d_H` / `cfg.d_V` as meters and build steering vectors using meter positions consistently (planar + near-field).
+
+### 6) Factor magnitude leash (prevents overflow before conditioning)
 
 **Files:** `ris_pytorch_pipeline/loss.py`, `ris_pytorch_pipeline/train.py`
 
@@ -110,7 +121,7 @@ The normalization is controlled by config knobs:
 
 This is safe because downstream covariance is trace-normalized anyway; we're just preventing pathological intermediate values that can overflow in fp32/complex64.
 
-### 6) Fixed `_peak_contrast_loss()` tensor clamp bug
+### 7) Fixed `_peak_contrast_loss()` tensor clamp bug
 
 **File:** `ris_pytorch_pipeline/loss.py`
 
@@ -118,7 +129,7 @@ The peak contrast loss was using Python's `max(denom, 1e-12)` where `denom` is a
 
 Even though this loss is often disabled (weight=0), fixing it removes a class of "did this term actually do anything?" ambiguity.
 
-### 7) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
+### 8) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
 
 **File:** `ris_pytorch_pipeline/train.py` (+ defaults in `configs.py`)
 
