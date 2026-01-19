@@ -219,100 +219,82 @@ class UltimateHybridLoss(nn.Module):
         Returns:
             Loss scalar (fraction of energy in wrong subspace)
         """
-        from .configs import cfg
-        import numpy as np
-        
+        # IMPORTANT: cfg.d_H / cfg.d_V are in **meters** in this repo (see configs.py / dataset.py).
+        # Keep steering consistent with physics.nearfield_vec and music_gpu.py.
         B, N = R_pred.shape[:2]
         device = R_pred.device
         dtype = R_pred.dtype
-        
-        # Geometry for steering vectors (same as inference)
-        N_H = getattr(cfg, 'N_H', 12)
-        N_V = getattr(cfg, 'N_V', 12)
-        d_h = getattr(cfg, 'd_H', 0.5)  # wavelengths
-        d_v = getattr(cfg, 'd_V', 0.5)  # wavelengths
-        lam = getattr(cfg, 'WAVEL', 0.3)  # meters
-        k0 = 2.0 * np.pi / lam
-        
-        # Generate sensor coordinates (centered, in meters)
-        h_idx = np.arange(-(N_H - 1)//2, (N_H + 1)//2) * d_h * lam
-        v_idx = np.arange(-(N_V - 1)//2, (N_V + 1)//2) * d_v * lam
-        x_grid, y_grid = np.meshgrid(h_idx, v_idx, indexing='xy')
-        x = torch.from_numpy(x_grid.ravel()).to(device, dtype=torch.float32)
-        y = torch.from_numpy(y_grid.ravel()).to(device, dtype=torch.float32)
-        
+
+        # ptr_gt may arrive as chunked [B, 3*Kmax]; convert to [B, Kmax, 3] for convenience.
+        Kmax = int(getattr(cfg, "K_MAX", 5))
+        if isinstance(ptr_gt, torch.Tensor) and ptr_gt.dim() == 2 and ptr_gt.shape[1] >= 3 * Kmax:
+            phi = ptr_gt[:, :Kmax]
+            theta = ptr_gt[:, Kmax:2 * Kmax]
+            rr = ptr_gt[:, 2 * Kmax:3 * Kmax]
+            ptr_gt = torch.stack([phi, theta, rr], dim=-1)  # [B,Kmax,3]
+        if (not isinstance(ptr_gt, torch.Tensor)) or (ptr_gt.dim() != 3) or (ptr_gt.shape[-1] != 3):
+            return torch.tensor(0.0, device=device)
+
+        # Geometry (meters)
+        N_H = int(getattr(cfg, "N_H", 12))
+        N_V = int(getattr(cfg, "N_V", 12))
+        d_h_m = float(getattr(cfg, "d_H", 0.15))
+        d_v_m = float(getattr(cfg, "d_V", d_h_m))
+        k0 = float(getattr(cfg, "k0", 2.0 * math.pi / float(getattr(cfg, "WAVEL", 0.3))))
+
+        # Sensor coordinates (centered UPA), meters
+        h_idx = torch.arange(-(N_H - 1) // 2, (N_H + 1) // 2, device=device, dtype=torch.float32) * d_h_m
+        v_idx = torch.arange(-(N_V - 1) // 2, (N_V + 1) // 2, device=device, dtype=torch.float32) * d_v_m
+        x_grid, y_grid = torch.meshgrid(h_idx, v_idx, indexing="xy")
+        x = x_grid.reshape(-1)  # [N]
+        y = y_grid.reshape(-1)  # [N]
+        hv_sq = (x * x + y * y).view(1, -1)  # [1,N]
+
+        # Optional one-time debug
+        if bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)) and (not hasattr(self, "_subspace_align_internal_logged")):
+            print(f"[SUBSPACE DEBUG] B={B}, N={N}, ptr_gt.shape={tuple(ptr_gt.shape)}", flush=True)
+            self._subspace_align_internal_logged = True
+
         total_loss = torch.tensor(0.0, device=device)
         valid_batches = 0
-        
-        # DEBUG: Print once to see what we're working with
-        if not hasattr(self, '_subspace_align_internal_logged'):
-            print(f"[SUBSPACE DEBUG] B={B}, N={N}, ptr_gt.shape={ptr_gt.shape}")
-            print(f"[SUBSPACE DEBUG] K_true={K_true.tolist()}")
-            self._subspace_align_internal_logged = True
-        
+
         for b in range(B):
             K = int(K_true[b].item())
             if K <= 0 or K >= N:
                 continue
-                
-            try:
-                # Build A_gt from GT angles/ranges using canonical steering (no grad)
-                A_cols = []
-                for k in range(K):
-                    # Expert fix: ptr_gt is already in radians, don't convert again!
-                    phi_rad = float(ptr_gt[b, k, 0].item())
-                    theta_rad = float(ptr_gt[b, k, 1].item())
-                    r_m = ptr_gt[b, k, 2].item()
-                    
-                    # Build near-field steering vector (same as inference)
-                    sin_phi = np.sin(phi_rad)
-                    cos_theta = np.cos(theta_rad)
-                    sin_theta = np.sin(theta_rad)
-                    
-                    # Phase (curvature term with correct sign)
-                    x_np = x.cpu().numpy()
-                    y_np = y.cpu().numpy()
-                    dist = r_m - x_np * sin_phi * cos_theta - y_np * sin_theta + (x_np**2 + y_np**2) / (2.0 * r_m)
-                    phase = k0 * (r_m - dist)
-                    
-                    # Steering vector (unit-norm)
-                    a = np.exp(1j * phase)
-                    a = a / np.sqrt(np.sum(np.abs(a)**2))
-                    
-                    # Convert to torch (detached, no grad)
-                    a_torch = torch.from_numpy(a).to(device, dtype=dtype)
-                    A_cols.append(a_torch)
-                
-                # Stack into A_gt [N, K]
-                A_gt = torch.stack(A_cols, dim=1)  # [N, K]
-                
-                # Build projector onto GT signal subspace (stable solve)
-                G = A_gt.conj().T @ A_gt  # [K, K] Gramian
-                eye_k = torch.eye(K, dtype=dtype, device=device)
-                G_reg = G + 1e-4 * eye_k  # Regularization for stability
-                P = A_gt @ torch.linalg.solve(G_reg, A_gt.conj().T)  # [N, N]
-                
-                # Orthogonal projector
-                eye_N = torch.eye(N, dtype=dtype, device=device)
-                P_perp = eye_N - P
-                
-                # Energy in wrong subspace vs total energy
-                R_b = R_pred[b]
-                num = torch.linalg.norm(P_perp @ R_b @ P_perp, ord='fro') ** 2
-                den = torch.linalg.norm(R_b, ord='fro') ** 2 + 1e-12
-                
-                loss_b = (num / den).real
-                total_loss = total_loss + loss_b
-                valid_batches += 1
-                
-            except Exception as e:
-                # Skip problematic batches
-                continue
-        
-        if valid_batches > 0:
-            return total_loss / valid_batches
-        else:
-            return torch.tensor(0.0, device=device)
+
+            # GT (radians/meters)
+            phi_rad = ptr_gt[b, :K, 0].to(torch.float32)
+            theta_rad = ptr_gt[b, :K, 1].to(torch.float32)
+            r_m = ptr_gt[b, :K, 2].to(torch.float32).clamp_min(1e-6)
+
+            sin_phi = torch.sin(phi_rad)
+            cos_theta = torch.cos(theta_rad)
+            sin_theta = torch.sin(theta_rad)
+
+            # phase = k0 * (planar - curvature) where planar=x*sinφ*cosθ + y*sinθ
+            planar = (sin_phi * cos_theta).unsqueeze(1) * x.view(1, -1) + sin_theta.unsqueeze(1) * y.view(1, -1)  # [K,N]
+            curvature = hv_sq / (2.0 * r_m.unsqueeze(1))  # [K,N]
+            phase = k0 * (planar - curvature)  # [K,N]
+            A_gt = (torch.exp(1j * phase) / math.sqrt(float(N))).to(dtype)  # [K,N] complex
+            A_gt = A_gt.transpose(0, 1).contiguous()  # [N,K]
+
+            # Projector onto GT signal subspace
+            G = A_gt.conj().transpose(-2, -1) @ A_gt  # [K,K]
+            eye_k = torch.eye(K, dtype=dtype, device=device)
+            G_reg = G + 1e-4 * eye_k
+            P = A_gt @ torch.linalg.solve(G_reg, A_gt.conj().transpose(-2, -1))  # [N,N]
+
+            eye_N = torch.eye(N, dtype=dtype, device=device)
+            P_perp = eye_N - P
+
+            R_b = R_pred[b]
+            num = torch.linalg.norm(P_perp @ R_b @ P_perp, ord="fro") ** 2
+            den = torch.linalg.norm(R_b, ord="fro") ** 2 + 1e-12
+            total_loss = total_loss + (num / den).real
+            valid_batches += 1
+
+        return (total_loss / valid_batches) if valid_batches > 0 else torch.tensor(0.0, device=device)
     
     def _peak_contrast_loss(self, R_pred, phi_gt, theta_gt, K_true):
         """

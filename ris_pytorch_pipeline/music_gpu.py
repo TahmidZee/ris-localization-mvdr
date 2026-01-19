@@ -404,9 +404,12 @@ class GPUMusicEstimator:
         G_phi, G_theta, N = A.shape
         A_flat = A.reshape(-1, N)  # [G_phi*G_theta, N]
         
-        # Efficient: (A @ R_inv) * A.conj() summed over N
-        AR = torch.matmul(A_flat, R_inv)  # [G_phi*G_theta, N]
-        denom = torch.real((AR * A_flat.conj()).sum(dim=1))  # [G_phi*G_theta]
+        # MVDR/Capon denominator is: a^H R_inv a
+        # With A_flat as row-vectors [P,N], compute per-row quadratic form:
+        #   denom[p] = Re( conj(a_p) @ R_inv @ a_p^T )
+        # This must use conj(A_flat) on the left (NOT on the right), otherwise you get a R_inv a^H.
+        AR = torch.matmul(A_flat.conj(), R_inv)  # [P, N]
+        denom = torch.real((AR * A_flat).sum(dim=1))  # [P]
         denom = torch.clamp(denom, min=1e-12)
         
         return (1.0 / denom).reshape(G_phi, G_theta).float()
@@ -445,15 +448,15 @@ class GPUMusicEstimator:
         M = I + (1.0 / delta.to(G.real.dtype)) * G
         M_inv = torch.linalg.inv(M)
 
-        # IMPORTANT: Match the convention used by _compute_spectrum_mvdr(), which computes:
-        #   denom = Re( (a @ R_inv) · conj(a) )  == Re( a R_inv a^H )
-        # Using Woodbury:
-        #   denom = (1/δ)||a||^2 - (1/δ^2) * u M^{-1} u^H, where u = a F  (row-vector)
+        # Denominator uses the MVDR/Capon quadratic form: a^H R^{-1} a
+        # With R = F F^H + δ I, Woodbury gives:
+        #   a^H R^{-1} a = (1/δ)||a||^2 - (1/δ^2) v^H (I + (1/δ) G)^{-1} v
+        # where v = F^H a and G = F^H F.
         #
-        # This is numerically more consistent than using v = F^H a (which corresponds to a^H R_inv a).
-        U = A_flat @ F  # [P, K_lr]
-        UM = U @ M_inv  # [P, K_lr]
-        quad = torch.real((UM * U.conj()).sum(dim=1))  # [P]
+        # For all steering rows at once, compute V = F^H A^T -> [K_lr, P].
+        V = F.conj().transpose(0, 1) @ A_flat.transpose(0, 1)  # [K_lr, P]
+        MV = M_inv @ V  # [K_lr, P]
+        quad = torch.real((V.conj() * MV).sum(dim=0))  # [P]
 
         # ||a||^2 (should be ~1, but compute to be safe)
         a_norm2 = torch.real((A_flat.conj() * A_flat).sum(dim=1))  # [P]

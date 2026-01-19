@@ -507,7 +507,7 @@ def _nearfield_steering(phi_rad, theta_rad, r, N_H, N_V, d_h, d_v, lam):
         theta_rad: Elevation angle in radians
         r: Range in meters
         N_H, N_V: Array dimensions
-        d_h, d_v: Element spacing in WAVELENGTHS (NOT meters!)
+        d_h, d_v: Element spacing in METERS
         lam: Wavelength (meters)
     
     Returns:
@@ -517,7 +517,9 @@ def _nearfield_steering(phi_rad, theta_rad, r, N_H, N_V, d_h, d_v, lam):
     
     # CRITICAL: Use EXACT same indexing as physics.py
     # physics.py: h_idx = np.arange(-(cfg.N_H - 1)//2, (cfg.N_H + 1)//2) * cfg.d_H
-    # NOTE: d_H is in wavelengths, so h_idx is also in wavelengths
+    # NOTE: In this repo cfg.d_H/cfg.d_V are in meters (see configs.py / dataset.py)
+    h_idx = np.arange(-(N_H - 1)//2, (N_H + 1)//2) * d_h
+    v_idx = np.arange(-(N_V - 1)//2, (N_V + 1)//2) * d_v
     h_idx = np.arange(-(N_H - 1)//2, (N_H + 1)//2) * d_h
     v_idx = np.arange(-(N_V - 1)//2, (N_V + 1)//2) * d_v
     
@@ -789,7 +791,7 @@ def music2d_from_cov_factor(cf_ang, K, cfg, *, shrink=None, grid_phi=181, grid_t
     # Extract geometry from config
     N_H = int(getattr(cfg, "N_H", int(np.sqrt(N))))
     N_V = int(getattr(cfg, "N_V", int(np.sqrt(N))))
-    d_h = float(getattr(cfg, "d_H", 0.5))  # in wavelengths
+    d_h = float(getattr(cfg, "d_H", 0.5 * float(getattr(cfg, "WAVEL", 0.3))))  # meters
     d_v = float(getattr(cfg, "d_V", 0.5))
     lam = float(getattr(cfg, "WAVEL", 0.0625))  # meters
     

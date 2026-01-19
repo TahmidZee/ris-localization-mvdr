@@ -108,7 +108,19 @@ This unit mismatch produced **near-flat MVDR/MUSIC spectra** (low PSSR) and made
 
 **Fix:** treat `cfg.d_H` / `cfg.d_V` as meters and build steering vectors using meter positions consistently (planar + near-field).
 
-### 6) Factor magnitude leash (prevents overflow before conditioning)
+### 6) CRITICAL: Fixed MVDR quadratic form (Capon denominator)
+
+**File:** `ris_pytorch_pipeline/music_gpu.py`
+
+The MVDR/Capon spectrum denominator must be \(a^H R^{-1} a\). A subtle conjugation/order bug in the batched implementation was computing \(a R^{-1} a^H\) instead, which produces **nearly flat spectra** and breaks peak detection/metrics (even on ground-truth covariances).
+
+**Fix:** compute the correct quadratic form consistently in:
+- full MVDR spectrum (`_compute_spectrum_mvdr`)
+- low-rank/Woodbury MVDR (`_compute_spectrum_mvdr_lowrank`)
+
+After this fix, MVDR on ground-truth covariances produces sharp peaks again (high PSSR) and peak metrics become meaningful.
+
+### 7) Factor magnitude leash (prevents overflow before conditioning)
 
 **Files:** `ris_pytorch_pipeline/loss.py`, `ris_pytorch_pipeline/train.py`
 
@@ -121,7 +133,7 @@ The normalization is controlled by config knobs:
 
 This is safe because downstream covariance is trace-normalized anyway; we're just preventing pathological intermediate values that can overflow in fp32/complex64.
 
-### 7) Fixed `_peak_contrast_loss()` tensor clamp bug
+### 8) Fixed `_peak_contrast_loss()` tensor clamp bug
 
 **File:** `ris_pytorch_pipeline/loss.py`
 
@@ -129,7 +141,7 @@ The peak contrast loss was using Python's `max(denom, 1e-12)` where `denom` is a
 
 Even though this loss is often disabled (weight=0), fixing it removes a class of "did this term actually do anything?" ambiguity.
 
-### 8) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
+### 9) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
 
 **File:** `ris_pytorch_pipeline/train.py` (+ defaults in `configs.py`)
 

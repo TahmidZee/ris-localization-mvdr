@@ -2803,8 +2803,8 @@ class Trainer:
                 print(f"⏹️ Early stopping at epoch {ep+1} (patience {early_stop_patience} reached)", flush=True)
                 break
             
-            # ICC FIX: Print pipeline config, geometry, and K-head diagnostics at epoch 0
-            if ep == 0:
+            # ICC FIX (debug only): Print pipeline config, geometry, and diagnostics at epoch 0
+            if ep == 0 and bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)):
                 print(f"  📋 Angle pipeline: MUSIC_COARSE={getattr(cfg,'MUSIC_COARSE',False)}, "
                       f"FBA={getattr(cfg,'MUSIC_USE_FBA',False)}, "
                       f"SHRINK={getattr(cfg,'MUSIC_USE_ADAPTIVE_SHRINK',False)}, "
@@ -2986,74 +2986,71 @@ class Trainer:
                                 import traceback
                                 traceback.print_exc()
                         
-                        # CLASSICAL MUSIC BASELINE: Check performance on ground-truth R_true with NEAR-FIELD steering
-                        try:
-                            # Get ground truth for first scene
-                            if isinstance(batch_val, dict):
-                                K_batch = batch_val["K"].to(self.device)
-                                ptr_batch = batch_val["ptr"].to(self.device)
-                                R_in_batch = batch_val["R_true"].to(self.device)
-                            else:
-                                # Unpack tuple (now has 8 elements: y, H, C, ptr, K, R, snr, H_full)
-                                _, _, _, ptr_batch, K_batch, R_in_batch, _, _ = batch_val
-                            
-                            k_true = int(K_batch[0].item())
-                            ptr_np = ptr_batch[0].detach().cpu().numpy()
-                            phi_gt = np.rad2deg(ptr_np[:k_true])
-                            theta_gt = np.rad2deg(ptr_np[cfg.K_MAX:cfg.K_MAX+k_true])
-                            
-                            # Get ground truth range (if available)
-                            r_gt = None
-                            if len(ptr_np) > 2*cfg.K_MAX:
-                                r_gt = ptr_np[2*cfg.K_MAX:2*cfg.K_MAX+k_true]  # Ground truth ranges
-                            
-                            print(f"  [DEBUG Classical] k_true={k_true}, phi_gt={phi_gt}, theta_gt={theta_gt}", flush=True)
-                            if r_gt is not None:
-                                print(f"  [DEBUG Classical] r_gt={r_gt}", flush=True)
-                            
-                            # EXPERT FIX: Use R_true directly from shard (NO LS, NO snapshot math!)
-                            R_true_ri = R_in_batch[0].detach().cpu().numpy()  # [N, N, 2]
-                            R_true = R_true_ri[:, :, 0] + 1j * R_true_ri[:, :, 1]  # [N, N] complex
-                            
-                            # Trace-normalize R_true
-                            N = R_true.shape[0]
-                            trace_R = np.real(np.trace(R_true))
-                            if trace_R > 1e-8:
-                                R_true = R_true * (N / trace_R)
-                            
-                            print(f"  [DEBUG Classical] R_true: tr={np.real(np.trace(R_true)):.1f}, ||R_true||_F={np.linalg.norm(R_true,'fro'):.1f}", flush=True)
-                            
-                            # EXPERT FIX: Run MUSIC with NEAR-FIELD steering using Ramezani reference
-                            from ris_pytorch_pipeline.ramezani_mod_music import nearfield_vec
-                            
-                            # MUSIC with near-field steering
-                            phi_music_true, theta_music_true = _classical_music_nearfield(
-                                R_true, k_true, phi_gt, theta_gt, r_gt, cfg
-                            )
-                            
-                            print(f"  [DEBUG Classical] MUSIC found: phi={phi_music_true}, theta={theta_music_true}", flush=True)
-                            
-                            # Compute errors (simple nearest-neighbor for quick check)
-                            if len(phi_music_true) > 0 and len(phi_gt) > 0:
-                                # Simple min distance for each GT
-                                errs_phi = []
-                                errs_theta = []
-                                for j in range(len(phi_gt)):
-                                    dphi = np.abs(phi_music_true - phi_gt[j])
-                                    dtheta = np.abs(theta_music_true - theta_gt[j])
-                                    idx = np.argmin(dphi + dtheta)
-                                    errs_phi.append(dphi[idx])
-                                    errs_theta.append(dtheta[idx])
-                                
-                                med_phi_true = np.median(errs_phi)
-                                med_theta_true = np.median(errs_theta)
-                                print(f"  🎯 CLASSICAL MUSIC CEILING (R_true + NF steering, scene 0): φ={med_phi_true:.2f}°, θ={med_theta_true:.2f}°", flush=True)
-                                if med_phi_true > 5.0:
-                                    print(f"     ⚠️  Classical MUSIC > 5° → check manifold/convention (should be ≪5° with R_true)!", flush=True)
+                        # CLASSICAL MUSIC BASELINE: Optional ceiling check (debug-only).
+                        if bool(getattr(cfg, "MUSIC_DEBUG", False)):
+                            try:
+                                # Get ground truth for first scene
+                                if isinstance(batch_val, dict):
+                                    K_batch = batch_val["K"].to(self.device)
+                                    ptr_batch = batch_val["ptr"].to(self.device)
+                                    R_in_batch = batch_val["R_true"].to(self.device)
                                 else:
-                                    print(f"     ✅ Classical MUSIC < 5° → manifold/convention correct!", flush=True)
-                        except Exception as e:
-                            print(f"  ⚠️  Classical MUSIC check failed: {e}", flush=True)
+                                    # Unpack tuple (now has 8 elements: y, H, C, ptr, K, R, snr, H_full)
+                                    _, _, _, ptr_batch, K_batch, R_in_batch, _, _ = batch_val
+                                
+                                k_true = int(K_batch[0].item())
+                                ptr_np = ptr_batch[0].detach().cpu().numpy()
+                                phi_gt = np.rad2deg(ptr_np[:k_true])
+                                theta_gt = np.rad2deg(ptr_np[cfg.K_MAX:cfg.K_MAX+k_true])
+                                
+                                # Get ground truth range (if available)
+                                r_gt = None
+                                if len(ptr_np) > 2*cfg.K_MAX:
+                                    r_gt = ptr_np[2*cfg.K_MAX:2*cfg.K_MAX+k_true]  # Ground truth ranges
+                                
+                                print(f"  [DEBUG Classical] k_true={k_true}, phi_gt={phi_gt}, theta_gt={theta_gt}", flush=True)
+                                if r_gt is not None:
+                                    print(f"  [DEBUG Classical] r_gt={r_gt}", flush=True)
+                                
+                                # EXPERT FIX: Use R_true directly from shard (NO LS, NO snapshot math!)
+                                R_true_ri = R_in_batch[0].detach().cpu().numpy()  # [N, N, 2]
+                                R_true = R_true_ri[:, :, 0] + 1j * R_true_ri[:, :, 1]  # [N, N] complex
+                                
+                                # Trace-normalize R_true
+                                N = R_true.shape[0]
+                                trace_R = np.real(np.trace(R_true))
+                                if trace_R > 1e-8:
+                                    R_true = R_true * (N / trace_R)
+                                
+                                print(f"  [DEBUG Classical] R_true: tr={np.real(np.trace(R_true)):.1f}, ||R_true||_F={np.linalg.norm(R_true,'fro'):.1f}", flush=True)
+                                
+                                # MUSIC with near-field steering
+                                phi_music_true, theta_music_true = _classical_music_nearfield(
+                                    R_true, k_true, phi_gt, theta_gt, r_gt, cfg
+                                )
+                                
+                                print(f"  [DEBUG Classical] MUSIC found: phi={phi_music_true}, theta={theta_music_true}", flush=True)
+                                
+                                # Compute errors (simple nearest-neighbor for quick check)
+                                if len(phi_music_true) > 0 and len(phi_gt) > 0:
+                                    errs_phi = []
+                                    errs_theta = []
+                                    for j in range(len(phi_gt)):
+                                        dphi = np.abs(phi_music_true - phi_gt[j])
+                                        dtheta = np.abs(theta_music_true - theta_gt[j])
+                                        idx = np.argmin(dphi + dtheta)
+                                        errs_phi.append(dphi[idx])
+                                        errs_theta.append(dtheta[idx])
+                                    
+                                    med_phi_true = np.median(errs_phi)
+                                    med_theta_true = np.median(errs_theta)
+                                    print(f"  🎯 CLASSICAL MUSIC CEILING (R_true + NF steering, scene 0): φ={med_phi_true:.2f}°, θ={med_theta_true:.2f}°", flush=True)
+                                    if med_phi_true > 5.0:
+                                        print(f"     ⚠️  Classical MUSIC > 5° → check manifold/convention (should be ≪5° with R_true)!", flush=True)
+                                    else:
+                                        print(f"     ✅ Classical MUSIC < 5° → manifold/convention correct!", flush=True)
+                            except Exception as e:
+                                print(f"  ⚠️  Classical MUSIC check failed: {e}", flush=True)
                         
                         self._eigenspectrum_logged = True
 
