@@ -237,46 +237,34 @@ def newton_refine_angles(phi_init, theta_init, R, K, cfg,
     
     def nearfield_steer(phi_r, theta_r, r_r):
         """
-        ICC FIX: Spherical near-field steering vector.
-        Accounts for per-element distance ρ_{m,n} = ||p_{m,n} - s(φ,θ,r)||
-        
-        This is the sub-degree unlock for near-field scenes.
+        Near-field steering vector (Fresnel / quadratic phase), aligned with this repo’s
+        canonical convention in `physics.nearfield_vec` and `music_gpu.py`.
+
+        IMPORTANT:
+        - `cfg.d_H` / `cfg.d_V` are **meters** in this repo (configs.py sets them as 0.5*WAVEL).
+        - Dataset generation uses the same Fresnel-style model, so this must match for
+          consistent Newton refinement / debug evaluations.
         """
-        # Element positions (centered UPA)
-        m_idx = np.arange(N_H) - (N_H - 1) / 2.0  # [-5.5, ..., 5.5] for 12x12
-        n_idx = np.arange(N_V) - (N_V - 1) / 2.0
-        
-        # Physical positions in meters
-        x_h = m_idx * d_h * lam  # Horizontal positions
-        y_v = n_idx * d_v * lam  # Vertical positions
-        
-        # Mesh grid: [N_H, N_V]
-        X, Y = np.meshgrid(x_h, y_v, indexing='ij')
-        X_flat = X.flatten()  # [N]
-        Y_flat = Y.flatten()  # [N]
-        Z_flat = np.zeros_like(X_flat)  # RIS at z=0
-        
-        # Source positions in Cartesian [K]
-        sin_phi = np.sin(phi_r)
-        cos_phi = np.cos(phi_r)
-        sin_theta = np.sin(theta_r)
-        cos_theta = np.cos(theta_r)
-        
-        # Source location: (r sin(θ) cos(φ), r sin(θ) sin(φ), r cos(θ))
-        sx = r_r * sin_theta * cos_phi  # [K]
-        sy = r_r * sin_theta * sin_phi  # [K]
-        sz = r_r * cos_theta              # [K]
-        
-        # Distance from each element to each source: [N, K]
-        # ρ_{n,k} = ||p_n - s_k||
-        rho = np.sqrt((X_flat[:, None] - sx[None, :])**2 + 
-                      (Y_flat[:, None] - sy[None, :])**2 + 
-                      (Z_flat[:, None] - sz[None, :])**2)
-        
-        # Phase: exp(-j k_0 ρ)
-        a = np.exp(-1j * k_wave * rho).astype(np.complex64)
-        
-        return a  # [N, K]
+        # Element positions (centered UPA), meters.
+        # Match dataset.py / physics.py indexing exactly (note Python precedence of unary minus with //).
+        h_idx = np.arange(-(N_H - 1)//2, (N_H + 1)//2, dtype=np.float32) * d_h
+        v_idx = np.arange(-(N_V - 1)//2, (N_V + 1)//2, dtype=np.float32) * d_v
+        h_mesh, v_mesh = np.meshgrid(h_idx, v_idx, indexing="xy")  # shapes [N_V, N_H]
+        vh = h_mesh.reshape(-1).astype(np.float32)  # [N]
+        vv = v_mesh.reshape(-1).astype(np.float32)  # [N]
+
+        # Trig
+        sin_phi = np.sin(phi_r).astype(np.float32)      # [K]
+        cos_theta = np.cos(theta_r).astype(np.float32)  # [K]
+        sin_theta = np.sin(theta_r).astype(np.float32)  # [K]
+        r_eff = np.maximum(r_r.astype(np.float32), 1e-6)  # [K]
+
+        # Fresnel phase: k0 * (planar - curvature)
+        planar = (vh[:, None] * sin_phi[None, :] * cos_theta[None, :]) + (vv[:, None] * sin_theta[None, :])  # [N,K]
+        curvature = (vh[:, None]**2 + vv[:, None]**2) / (2.0 * r_eff[None, :])  # [N,K]
+        phase = k_wave * (planar - curvature)  # [N,K]
+        a = np.exp(1j * phase).astype(np.complex64) / np.sqrt(N)
+        return a  # [N,K]
     
     # ICC FIX: Select steering model based on use_nearfield flag
     if use_nearfield and r_init is not None:

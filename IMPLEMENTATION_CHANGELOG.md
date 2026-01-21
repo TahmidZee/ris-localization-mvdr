@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 16, 2026 (Stability: factor column normalization + peak-contrast clamp fix)
+**Last Updated:** January 21, 2026 (Permutation-invariant aux training loss + `--from_hpo` training crash fix + benchmark/checkpoint robustness fixes)
 
 ---
 
@@ -44,6 +44,8 @@ This document details all code changes made to transition from a K-head classifi
   - added lightweight logging of offending parameter gradients on the first non-finite event
 - ✅ **HPO no longer aborts the entire study** when one trial encounters non-finite gradients:
   - non-finite-grad trials are pruned (`optuna.TrialPruned`) and the run continues
+- ✅ **Fixed full training crash when using `--from_hpo`**:
+  - `Trainer.__init__` had an inner `from pathlib import Path` which shadowed the module-level import, causing `UnboundLocalError: local variable 'Path' referenced before assignment`
 
 ---
 
@@ -51,13 +53,27 @@ This document details all code changes made to transition from a K-head classifi
 
 These changes were added after reviewing failure modes observed in logs (e.g. seemingly-worse surrogate aux RMSE and FP-heavy peak picking) and to prevent “train on one physics transform, infer on another”.
 
-### 1) Surrogate aux RMSE is now permutation-invariant (fixes inflated ~35–40° cases)
+### 1) Aux is now permutation-invariant end-to-end (validation **and** training)
 
 **File:** `ris_pytorch_pipeline/train.py`
 
 Previously, surrogate aux RMSE compared predicted sources to GT **by index**. In multi-source scenes, correct predictions in a different ordering can look “very wrong” (e.g. `aux_φ_rmse≈35°`) even when the set of sources is correct.
 
 **Now:** surrogate aux RMSE uses **assignment-based matching** (Hungarian if SciPy available, greedy fallback) so it is **invariant to source permutation**.
+
+**Additional critical fix (training):** the aux *training loss* was still computed **by index**, which is ill-posed because dataset generation does not impose any canonical ordering on sources.
+
+**Evidence (data generation is unordered):**
+- Sources are sampled in arbitrary order (no sorting) and then packed directly into `ptr` as chunked `[φ_pad..., θ_pad..., r_pad...]`.
+- In multi-source scenes, “slot 0” does not correspond to a consistent physical source across samples.
+
+**Fix (training):** `UltimateHybridLoss` now supports a **permutation-invariant aux loss** by matching predicted slots to GT slots (brute-force permutations; `K_MAX<=5` ⇒ ≤120 permutations) and then applying wrapped-Huber on angles + log-range Huber on the matched pairs.
+
+**Files:**
+- `ris_pytorch_pipeline/loss.py` (perm-invariant aux loss implementation)
+- `ris_pytorch_pipeline/configs.py` (new knob `AUX_LOSS_PERM_INVARIANT`, default `True`)
+
+**Why it matters:** this resolves the “aux dominates the loss but aux RMSE stays ~30°” failure mode and makes aux-related metrics and HPO behavior meaningful again.
 
 ### 2) Refiner guardrail + MVDR fallback (prevents “hallucination amplifier” failure mode)
 
@@ -122,9 +138,9 @@ After this fix, MVDR on ground-truth covariances produces sharp peaks again (hig
 
 ### 7) Factor magnitude leash (prevents overflow before conditioning)
 
-**Files:** `ris_pytorch_pipeline/loss.py`, `ris_pytorch_pipeline/train.py`
+**Files:** `ris_pytorch_pipeline/loss.py`, `ris_pytorch_pipeline/train.py`, `ris_pytorch_pipeline/infer.py`
 
-Added **column normalization** on complex covariance factors (`A_angle`, `A_range`) right after they are formed from the real/imag interleaved vectors. This prevents factor magnitudes from spiking before trace normalization / conditioning, which was a source of occasional non-finite gradients.
+Added a **magnitude leash** on complex covariance factors (`A_angle`, `A_range`) right after they are formed from the real/imag interleaved vectors (and in inference when reconstructing factors from network outputs). This prevents factor magnitudes from spiking before trace normalization / conditioning, which was a source of occasional non-finite gradients and potential inference-time overflow.
 
 The normalization is controlled by config knobs:
 - `FACTOR_COLNORM_ENABLE` (default: True)
@@ -141,7 +157,28 @@ The peak contrast loss was using Python's `max(denom, 1e-12)` where `denom` is a
 
 Even though this loss is often disabled (weight=0), fixing it removes a class of "did this term actually do anything?" ambiguity.
 
-### 9) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
+### 9) Fixed peak-contrast to be MVDR/Capon-aligned (and use GT range)
+
+**Files:** `ris_pytorch_pipeline/loss.py`, `ris_pytorch_pipeline/configs.py`
+
+The old “peak contrast” implementation was not aligned with MVDR inference:
+- it effectively used an **energy-style** denominator \(a^H R a\) instead of MVDR’s \(a^H R^{-1} a\)
+- it hard-coded a default range (e.g. `r=2.0m`) instead of using the **GT near-field range**
+- it relied on a steering convention that did not match `physics.py` / `music_gpu.py` exactly
+
+**Now:** peak-contrast is a **local MVDR/Capon contrast** loss:
+- computes \( \log P(\phi,\theta,r) = -\log(a^H R^{-1} a) \) on a small stencil around each GT source
+- uses **GT** \((\phi,\theta,r)\) (including range) for near-field steering
+- uses a single **Cholesky solve per scene** with multiple RHS steering vectors for efficiency
+
+**HPO policy:** this term stays **disabled in HPO** (via `HPO_DISABLE_UNSTABLE_LOSS_TERMS`), but is enabled for full training via phase weights.
+
+**New knobs (defaults):**
+- `PEAK_CONTRAST_STENCIL` (default: `3`)
+- `PEAK_CONTRAST_DELTA_RAD` (default: `0.10`)
+- `PEAK_CONTRAST_TAU` (default: `0.10`)
+
+### 10) Peak-level validation metrics (precision/recall/FP-per-scene + PSSR)
 
 **File:** `ris_pytorch_pipeline/train.py` (+ defaults in `configs.py`)
 
@@ -151,6 +188,19 @@ Surrogate validation can now optionally report **MVDR peak detection metrics** o
 - median peak-to-sidelobe proxy (PSSR, in dB)
 
 This is evaluation-only reporting (no backprop through MVDR) and helps catch “200% detection” issues during HPO/training rather than at the end.
+
+### 11) Benchmark harness + checkpoint loading robustness (post-audit)
+
+These are “plumbing” fixes that do not change training/HPO objectives, but prevent common breakages when running benchmarks/inference after multiple HPO/training iterations.
+
+**Files:** `ris_pytorch_pipeline/infer.py`, `ris_pytorch_pipeline/bench_suite.py`, `ris_pytorch_pipeline/benchmark.py`, `ris_pytorch_pipeline/baseline.py`
+
+- **Checkpoint/model arch drift fix (D_MODEL)**: `infer.load_model()` now infers `D_MODEL` directly from the checkpoint state_dict (e.g. 448 vs 512), so loading a checkpoint no longer depends on `best.json` matching perfectly.
+- **Optional device placement**: `infer.load_model(device=...)` can move the backbone (and refiner, if present) onto the requested device; benchmarking now auto-picks CUDA when available.
+- **Baseline covariance inputs fixed**: baselines now use `H_full` (physical BS→RIS channel) and robustly accept either complex arrays or RI `[...,2]` tensors (converts RI→complex internally).
+- **Blind-K helper fixed**: benchmark scripts now call `estimate_k_blind(R, T=...)` (correct MDL/AIC signature) instead of accidentally calling the lower-level `estimate_k_ic_from_cov` without `T`.
+- **Benchmark speed knob**: `bench_suite.B1_all_blind/B2_all_oracle(..., mvdr_refine=False)` can disable expensive local 3D MVDR refinement during benchmarking for faster throughput.
+- **Less log spam**: MVDR fallback logging is now gated (prints every `cfg.REFINER_REJECT_LOG_EVERY` fallbacks instead of every scene).
 
 ### Stage-2 SpectrumRefiner Training (Option B) — New Additions
 

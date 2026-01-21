@@ -172,7 +172,6 @@ class Trainer:
         # so that all modules load consistently, then we apply requires_grad masks.
         ckpt = str(getattr(cfg, "INIT_CKPT", "")).strip()
         if ckpt:
-            from pathlib import Path
             p = Path(ckpt)
             if p.exists():
                 sd = torch.load(str(p), map_location="cpu")
@@ -1861,10 +1860,11 @@ class Trainer:
                         gt_th  = ptr_gt[i, Kmax:2*Kmax][:k_i]
                         gt_r   = ptr_gt[i, 2*Kmax:3*Kmax][:k_i]
 
-                        # Pred (chunked)
-                        pr_phi = phi_theta_r_pred[i, :Kmax][:k_i]
-                        pr_th  = phi_theta_r_pred[i, Kmax:2*Kmax][:k_i]
-                        pr_r   = phi_theta_r_pred[i, 2*Kmax:3*Kmax][:k_i]
+                        # Pred (chunked). Use ALL Kmax slots as candidates and match to the
+                        # K_true GT sources (perm-invariant + allows arbitrary slot ordering).
+                        pr_phi = phi_theta_r_pred[i, :Kmax]
+                        pr_th  = phi_theta_r_pred[i, Kmax:2*Kmax]
+                        pr_r   = phi_theta_r_pred[i, 2*Kmax:3*Kmax]
 
                         # Convert to degrees/meters and compute MATCHED errors (perm-invariant).
                         gt_phi_deg = torch.rad2deg(gt_phi).numpy()

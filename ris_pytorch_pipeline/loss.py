@@ -4,6 +4,7 @@ from .configs import cfg, mdl_cfg
 from .physics import shrink
 from .covariance_utils import trace_norm_torch, shrink_torch, build_effective_cov_torch
 import math
+import itertools
 
 def _ri_to_c(x_ri):
     return torch.complex(x_ri[...,0], x_ri[...,1])
@@ -28,6 +29,73 @@ def _range_huber_loss(pred_r, gt_r, delta=0.2):
     gr = torch.log(gt_r_pos)
     e = torch.abs(pr - gr)
     return torch.where(e < delta, 0.5 * (e ** 2) / delta, e - 0.5 * delta)
+
+def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *, delta_ang=math.pi/720, delta_logr=0.2):
+    """
+    Permutation-invariant aux loss for unordered multi-source scenes.
+    Matches predicted slots (size K_MAX) to GT slots (size k<=K_MAX) via brute-force
+    (K_MAX<=5 => at most 120 perms), then computes wrapped Huber on angles and Huber on log-range.
+    Selection is done under no_grad for stability; gradients flow through the chosen pairing.
+    """
+    device = phi_p.device
+    B, Kmax = phi_p.shape
+    losses = []
+
+    # Precompute permutations of indices for each k in [1..Kmax]
+    perms_by_k = {}
+    base_idx = list(range(Kmax))
+    for k in range(1, Kmax + 1):
+        perms = list(itertools.permutations(base_idx, k))
+        perms_by_k[k] = torch.tensor(perms, device=device, dtype=torch.long)  # [P,k]
+
+    for b in range(B):
+        k = int(K_true[b].item())
+        if not (1 <= k <= Kmax):
+            continue
+        perms = perms_by_k[k]  # [P,k]
+
+        # Choose best assignment using detached costs (avoid noisy argmin gradients).
+        with torch.no_grad():
+            # [P,k]
+            pp = phi_p[b].detach()[perms]
+            tp = theta_p[b].detach()[perms]
+            rp = r_p[b].detach()[perms]
+            gt_phi = phi_t[b, :k].detach().view(1, k)
+            gt_th = theta_t[b, :k].detach().view(1, k)
+            gt_r = r_t[b, :k].detach().view(1, k)
+
+            dphi = _wrap_angle(pp - gt_phi).abs()
+            dth = _wrap_angle(tp - gt_th).abs()
+            # Wrapped huber in "distance" space (scalar cost for matching)
+            cphi = torch.where(dphi <= delta_ang, 0.5 * (dphi ** 2) / delta_ang, dphi - 0.5 * delta_ang)
+            cth = torch.where(dth <= delta_ang, 0.5 * (dth ** 2) / delta_ang, dth - 0.5 * delta_ang)
+
+            rp_pos = torch.clamp(rp, min=float(cfg.RANGE_R[0]) * 0.9)
+            gt_pos = torch.clamp(gt_r, min=float(cfg.RANGE_R[0]) * 0.9)
+            elog = (torch.log(rp_pos) - torch.log(gt_pos)).abs()
+            cr = torch.where(elog <= delta_logr, 0.5 * (elog ** 2) / delta_logr, elog - 0.5 * delta_logr)
+
+            cost = (cphi + cth + cr).sum(dim=1)  # [P]
+            best_i = int(torch.argmin(cost).item())
+            best_perm = perms[best_i]  # [k]
+
+        # Compute final per-sample loss with gradients through selected slots
+        pp = phi_p[b, best_perm]
+        tp = theta_p[b, best_perm]
+        rp = r_p[b, best_perm]
+        gt_phi = phi_t[b, :k]
+        gt_th = theta_t[b, :k]
+        gt_r = r_t[b, :k]
+
+        phi_huber = _wrapped_huber_loss(pp, gt_phi, delta=delta_ang).mean()
+        theta_huber = _wrapped_huber_loss(tp, gt_th, delta=delta_ang).mean()
+        theta_huber = theta_huber * float(getattr(mdl_cfg, "THETA_LOSS_SCALE", 1.0))
+        rng_huber = _range_huber_loss(rp, gt_r, delta=delta_logr).mean()
+        losses.append(phi_huber + theta_huber + rng_huber)
+
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
 
 def _vec2c(v):
     v = v.float()
@@ -59,8 +127,12 @@ def _steer_torch(phi, theta, r):
     cos_theta = torch.cos(theta).unsqueeze(-1)
     sin_theta = torch.sin(theta).unsqueeze(-1)
     r_eff = torch.clamp(r, min=1e-6).unsqueeze(-1)
-    dist = r.unsqueeze(-1) - vh*sin_phi*cos_theta - vv*sin_theta + (vh**2 + vv**2)/(2.0*r_eff)
-    phase = cfg.k0 * dist
+    # Match physics.py / dataset.py convention exactly:
+    # dist = r - planar + curvature
+    # phase = k0 * (r - dist) = k0 * (planar - curvature)
+    planar = vh * sin_phi * cos_theta + vv * sin_theta
+    curvature = (vh**2 + vv**2) / (2.0 * r_eff)
+    phase = cfg.k0 * (planar - curvature)
     a = torch.exp(1j * phase) / (cfg.N ** 0.5)
     return a.transpose(-1, -2).contiguous()
 
@@ -296,89 +368,87 @@ class UltimateHybridLoss(nn.Module):
 
         return (total_loss / valid_batches) if valid_batches > 0 else torch.tensor(0.0, device=device)
     
-    def _peak_contrast_loss(self, R_pred, phi_gt, theta_gt, K_true):
+    def _peak_contrast_loss(self, R_pred, phi_gt, theta_gt, r_gt, K_true):
         """
         NEW: Peak contrast loss for training-inference alignment.
-        Local ridge around GT angles using MUSIC pseudospectrum.
+        Local ridge around GT angles using MVDR/Capon pseudospectrum.
         
         Args:
-            R_pred: Predicted covariance [B, N, N] complex
-            phi_gt: Ground truth azimuth [B, K] 
-            theta_gt: Ground truth elevation [B, K]
+            R_pred: Predicted **effective** covariance [B, N, N] complex (should be diag-loaded + shrunk)
+            phi_gt: Ground truth azimuth [B, Kmax] radians
+            theta_gt: Ground truth elevation [B, Kmax] radians
+            r_gt: Ground truth range [B, Kmax] meters
             K_true: True number of sources [B] int
             
         Returns:
             Loss scalar
         """
+        # NOTE: We keep this loss cheap by using a small stencil (default 3x3) and doing
+        # one Cholesky solve per sample with (Kmax * stencil^2) RHS vectors.
         B, N = R_pred.shape[:2]
         device = R_pred.device
-        
-        total_loss = 0.0
-        valid_batches = 0
-        
-        for b in range(B):
-            K = int(K_true[b].item())
-            if K <= 0:
-                continue
-                
-            try:
-                # Build MUSIC spectrum around GT angles (5x5 stencil)
-                phi_center = phi_gt[b, :K]  # [K]
-                theta_center = theta_gt[b, :K]  # [K]
-                
-                # Create 5x5 stencil around each GT angle
-                stencil_size = 5
-                phi_offset = torch.linspace(-0.1, 0.1, stencil_size, device=device)  # ±0.1 rad ≈ ±6°
-                theta_offset = torch.linspace(-0.1, 0.1, stencil_size, device=device)
-                
-                contrast_loss = 0.0
-                for k in range(K):
-                    phi_k = phi_center[k]
-                    theta_k = theta_center[k]
-                    
-                    # Build stencil
-                    phi_grid = phi_k + phi_offset  # [5]
-                    theta_grid = theta_k + theta_offset  # [5]
-                    
-                    # Compute MUSIC spectrum on stencil
-                    spectrum = torch.zeros(stencil_size, stencil_size, device=device)
-                    
-                    for i, phi in enumerate(phi_grid):
-                        for j, theta in enumerate(theta_grid):
-                            # Build steering vector
-                            a = _steer_torch(phi.unsqueeze(0), theta.unsqueeze(0), 
-                                           torch.ones(1, device=device) * 2.0)  # Default range
-                            a = a[0, :, 0]  # [N]
-                            
-                            # MUSIC spectrum: 1 / (a^H G a) where G is noise projector
-                            # For simplicity, use R_pred directly (approximation)
-                            denom = torch.real(a.conj() @ R_pred[b] @ a)
-                            denom = torch.clamp(denom, min=1e-12)
-                            spectrum[i, j] = 1.0 / denom
-                    
-                    # Contrastive loss: GT (center) should be higher than neighbors
-                    gt_value = spectrum[stencil_size//2, stencil_size//2]  # Center
-                    neighbor_values = spectrum.flatten()
-                    neighbor_values = neighbor_values[neighbor_values != gt_value]  # Remove center
-                    
-                    # Softmax-NLL: GT should outrank neighbors
-                    if len(neighbor_values) > 0:
-                        values = torch.cat([gt_value.unsqueeze(0), neighbor_values])
-                        logits = values / 0.1  # Temperature scaling
-                        target = torch.zeros(1, dtype=torch.long, device=device)  # GT is index 0
-                        contrast_loss += F.cross_entropy(logits.unsqueeze(0), target)
-                
-                total_loss += contrast_loss / K  # Average over sources
-                valid_batches += 1
-                
-            except Exception:
-                # Skip problematic batches
-                continue
-        
-        if valid_batches > 0:
-            return total_loss / valid_batches
-        else:
+        Kmax = int(getattr(cfg, "K_MAX", 5))
+
+        # Hyperparams (configurable)
+        stencil = int(getattr(cfg, "PEAK_CONTRAST_STENCIL", 3))
+        stencil = max(3, int(stencil))
+        if stencil % 2 == 0:
+            stencil += 1
+        delta = float(getattr(cfg, "PEAK_CONTRAST_DELTA_RAD", 0.10))
+        tau = float(getattr(cfg, "PEAK_CONTRAST_TAU", 0.10))
+        tau = max(tau, 1e-3)
+
+        # Mask for valid sources
+        mask = (torch.arange(Kmax, device=device).unsqueeze(0) < K_true.unsqueeze(1)).float()  # [B,Kmax]
+        if mask.sum() <= 0:
             return torch.tensor(0.0, device=device)
+
+        # Offsets (radians)
+        phi_off = torch.linspace(-delta, delta, stencil, device=device, dtype=torch.float32)
+        th_off = torch.linspace(-delta, delta, stencil, device=device, dtype=torch.float32)
+
+        # Build per-source stencil points: [B,Kmax,st,st] -> flatten to G=st^2
+        phi_c = phi_gt[:, :Kmax].to(device=device, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
+        th_c = theta_gt[:, :Kmax].to(device=device, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
+        r_c = r_gt[:, :Kmax].to(device=device, dtype=torch.float32).clamp_min(1e-6).unsqueeze(-1).unsqueeze(-1)
+
+        phi_pts = (phi_c + phi_off.view(1, 1, stencil, 1)).expand(-1, -1, stencil, stencil)
+        th_pts = (th_c + th_off.view(1, 1, 1, stencil)).expand(-1, -1, stencil, stencil)
+        r_pts = r_c.expand(-1, -1, stencil, stencil)
+
+        G = stencil * stencil
+        phi_q = phi_pts.reshape(B, Kmax * G)
+        th_q = th_pts.reshape(B, Kmax * G)
+        r_q = r_pts.reshape(B, Kmax * G)
+
+        # Steering vectors: [B,N,Q]
+        A = _steer_torch(phi_q, th_q, r_q).to(torch.complex64)
+
+        # Robust solve: Cholesky if possible (faster/more stable than LU).
+        # Ensure Hermitian + add tiny eps for PSD.
+        eps_psd = float(getattr(mdl_cfg, "EPS_PSD", 1e-4))
+        I = torch.eye(N, device=device, dtype=R_pred.dtype).unsqueeze(0).expand(B, N, N)
+        R = 0.5 * (R_pred + R_pred.conj().transpose(-2, -1)) + eps_psd * I
+
+        L, info = torch.linalg.cholesky_ex(R)
+        if info is not None and torch.any(info != 0):
+            # Fallback to solve (rare); keep it safe.
+            X = torch.linalg.solve(R, A)
+        else:
+            X = torch.cholesky_solve(A, L)
+
+        denom = (A.conj() * X).sum(dim=1).real  # [B,Q]
+        denom = denom.clamp_min(1e-12)
+        logP = (-torch.log(denom)).reshape(B * Kmax, G)  # larger is better
+
+        # Target is center of the stencil grid
+        center_idx = (stencil // 2) * stencil + (stencil // 2)
+        target = torch.full((B * Kmax,), int(center_idx), device=device, dtype=torch.long)
+
+        # Contrast CE per source, masked
+        ce = F.cross_entropy(logP / tau, target, reduction="none")  # [B*Kmax]
+        m = mask.reshape(B * Kmax)
+        return (ce * m).sum() / (m.sum() + 1e-9)
 
     def _eigengap_hinge(self, R_hat_c: torch.Tensor, K_true: torch.Tensor) -> torch.Tensor:
         """
@@ -728,12 +798,15 @@ class UltimateHybridLoss(nn.Module):
         # NOTE: K-loss removed - using MVDR peak detection instead (K-free localization)
 
         # Aux: wrapped Huber on angles + Huber on log-range
-        phi_huber = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
-        theta_huber = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
-        theta_huber *= mdl_cfg.THETA_LOSS_SCALE  # Emphasize elevation for better θ accuracy
-        ang_err = phi_huber + theta_huber
-        rng_err_log = (_range_huber_loss(r_p, r_t) * mask).sum() / (mask.sum() + 1e-9)
-        aux_l2 = ang_err + rng_err_log
+        if bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
+            aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true)
+        else:
+            phi_huber = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
+            theta_huber = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
+            theta_huber *= mdl_cfg.THETA_LOSS_SCALE  # Emphasize elevation for better θ accuracy
+            ang_err = phi_huber + theta_huber
+            rng_err_log = (_range_huber_loss(r_p, r_t) * mask).sum() / (mask.sum() + 1e-9)
+            aux_l2 = ang_err + rng_err_log
 
         # Chamfer on (phi,theta)
         peak_l2 = self._angle_chamfer(phi_p, theta_p, phi_t, theta_t, mask)
@@ -767,7 +840,9 @@ class UltimateHybridLoss(nn.Module):
                 print(f"[LOSS DEBUG] Subspace align: DISABLED (weight={self.lam_subspace_align})")
                 self._subspace_align_logged = True
         if self.lam_peak_contrast > 0.0:
-            loss_peak_contrast = self._peak_contrast_loss(R_hat, phi_t, theta_t, K_true)
+            # Peak-contrast should use the *effective* covariance (diag-loaded + shrunk) and
+            # the near-field GT range to match inference physics.
+            loss_peak_contrast = self._peak_contrast_loss(R_eff_pred, phi_t, theta_t, r_t, K_true)
             # DEBUG: Print once to verify it's being computed
             if not hasattr(self, '_peak_contrast_logged'):
                 print(f"[LOSS DEBUG] Peak contrast: {loss_peak_contrast.item():.6f} @ weight={self.lam_peak_contrast}")
@@ -913,13 +988,23 @@ class UltimateHybridLoss(nn.Module):
                 aux=aux.to(device).float()
                 phi_p=aux[:,:cfg.K_MAX]; theta_p=aux[:,cfg.K_MAX:2*cfg.K_MAX]; r_p=aux[:,2*cfg.K_MAX:3*cfg.K_MAX]
 
-        phi_huber_sum=(_wrapped_huber_loss(phi_p,phi_t)*mask).sum()/(mask.sum()+1e-9)
-        theta_huber_sum=(_wrapped_huber_loss(theta_p,theta_t)*mask).sum()/(mask.sum()+1e-9)
-        theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE  # Emphasize elevation for better θ accuracy
-        ang_err=phi_huber_sum+theta_huber_sum
-        r_p_pos=torch.clamp(r_p,min=1e-6); r_t_pos=torch.clamp(r_t,min=1e-6)
-        rng_err_log=(((torch.log(r_p_pos)-torch.log(r_t_pos))**2)*mask).sum()/(mask.sum()+1e-9)
-        aux_l2=(ang_err+rng_err_log).item()
+        # Keep debug aux consistent with forward (perm-invariant when enabled).
+        if bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
+            aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true).item()
+            # Provide rough per-term scalars for logging only (by-index; not used for optimization)
+            phi_huber_sum = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
+            theta_huber_sum = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
+            theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE
+            r_p_pos = torch.clamp(r_p, min=1e-6); r_t_pos = torch.clamp(r_t, min=1e-6)
+            rng_err_log = (((torch.log(r_p_pos) - torch.log(r_t_pos)) ** 2) * mask).sum() / (mask.sum() + 1e-9)
+        else:
+            phi_huber_sum=(_wrapped_huber_loss(phi_p,phi_t)*mask).sum()/(mask.sum()+1e-9)
+            theta_huber_sum=(_wrapped_huber_loss(theta_p,theta_t)*mask).sum()/(mask.sum()+1e-9)
+            theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE  # Emphasize elevation for better θ accuracy
+            ang_err=phi_huber_sum+theta_huber_sum
+            r_p_pos=torch.clamp(r_p,min=1e-6); r_t_pos=torch.clamp(r_t,min=1e-6)
+            rng_err_log=(((torch.log(r_p_pos)-torch.log(r_t_pos))**2)*mask).sum()/(mask.sum()+1e-9)
+            aux_l2=(ang_err+rng_err_log).item()
         peak=self._angle_chamfer(phi_p,theta_p,phi_t,theta_t,mask).item()
         
         # Expert fix: Re-enabled margin and align for logging (now safe with SVD)
@@ -933,7 +1018,19 @@ class UltimateHybridLoss(nn.Module):
         if self.lam_subspace_align > 0.0:
             loss_subspace_align = self._subspace_alignment_loss(R_hat, R_true, K_true, ptr_gt)
         if self.lam_peak_contrast > 0.0:
-            loss_peak_contrast = self._peak_contrast_loss(R_hat, phi_t, theta_t, K_true)
+            # Use effective covariance (diag-loaded + optional shrink) to match the forward loss path.
+            from .covariance_utils import build_effective_cov_torch
+            R_pred_in = y_pred['R_blend'] if 'R_blend' in y_pred else R_hat
+            R_eff = build_effective_cov_torch(
+                R_pred_in,
+                snr_db=y_true.get("snr_db", None),
+                R_samp=None,
+                beta=None,
+                diag_load=True,
+                apply_shrink=("snr_db" in y_true),
+                target_trace=float(cfg.N),
+            )
+            loss_peak_contrast = self._peak_contrast_loss(R_eff, phi_t, theta_t, r_t, K_true)
         
         r_span=(cfg.RANGE_R[1]-cfg.RANGE_R[0]+1e-9)
         rng=((((r_p-r_t)/r_span)**2)*mask).sum()/(mask.sum()+1e-9)

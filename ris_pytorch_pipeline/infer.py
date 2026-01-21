@@ -8,6 +8,8 @@ import json
 import torch.nn.functional as F
 
 
+_REFINER_FALLBACK_COUNT = 0
+
 def _load_hpo_best_dict(p=None):
     if p is None:
         p = getattr(cfg, 'HPO_BEST_JSON', str(Path(getattr(cfg, "HPO_DIR", cfg.RESULTS_DIR)) / "best.json"))
@@ -46,8 +48,27 @@ def _load_model_arch_from_hpo(hpo_json=None):
         # Add other architecture parameters as needed
     )
 
+def _infer_arch_from_state_dict(sd: dict) -> dict:
+    """
+    Infer minimal architecture (currently just D_MODEL) from a checkpoint state_dict.
+    This prevents load-time shape mismatches when cfg/`best.json` drift from the actual
+    trained checkpoint (common after multiple HPO/training runs).
+    """
+    arch = {}
+    try:
+        if isinstance(sd, dict):
+            if "fusion.bias" in sd:
+                arch["d_model"] = int(sd["fusion.bias"].numel())
+            elif "transformer.layers.0.self_attn.in_proj_weight" in sd:
+                arch["d_model"] = int(sd["transformer.layers.0.self_attn.in_proj_weight"].shape[1])
+            elif "y_conv2.weight" in sd:
+                arch["d_model"] = int(sd["y_conv2.weight"].shape[0])
+    except Exception:
+        pass
+    return arch
+
 @torch.no_grad()
-def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_swa=True, *, require_refiner: bool = True):
+def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_swa=True, *, device=None, require_refiner: bool = True):
     if ckpt_dir is None:
         ckpt_dir = cfg.CKPT_DIR  # Use cfg.CKPT_DIR as default
     
@@ -64,10 +85,26 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
     
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
     
+    # Resolve checkpoint format early so we can infer architecture if needed.
+    refiner_sd = None
+    if isinstance(ckpt, dict) and ("backbone" in ckpt or "refiner" in ckpt):
+        sd = ckpt.get("backbone", ckpt.get("model", {}))
+        refiner_sd = ckpt.get("refiner")
+    elif isinstance(ckpt, dict) and "model" in ckpt:
+        sd = ckpt["model"]
+    elif isinstance(ckpt, dict):
+        # Heuristic: treat as raw state_dict
+        sd = ckpt
+    else:
+        raise ValueError(f"Unsupported checkpoint type: {type(ckpt)}")
+
     # Try to get architecture from checkpoint first (if ckpt is a dict wrapper)
     arch = ckpt.get("arch") if isinstance(ckpt, dict) else None
     if arch is None:
-        # Fallback to HPO configuration
+        # Prefer inferring from the state_dict (always consistent with weights).
+        arch = _infer_arch_from_state_dict(sd) or None
+    if arch is None:
+        # Fallback to HPO configuration (best.json)
         try:
             arch = _load_model_arch_from_hpo()
             print(f"Using HPO architecture: D_MODEL={arch['d_model']}")
@@ -87,22 +124,6 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
         mdl_cfg.DROPOUT = arch.get("dropout", mdl_cfg.DROPOUT)
         
         model = HybridModel()
-
-        # Support multiple checkpoint formats:
-        # - raw state_dict
-        # - {"model": state_dict}
-        # - {"backbone": state_dict, "refiner": state_dict} (refiner-assisted inference)
-        refiner_sd = None
-        if isinstance(ckpt, dict) and ("backbone" in ckpt or "refiner" in ckpt):
-            sd = ckpt.get("backbone", ckpt.get("model", {}))
-            refiner_sd = ckpt.get("refiner")
-        elif isinstance(ckpt, dict) and "model" in ckpt:
-            sd = ckpt["model"]
-        elif isinstance(ckpt, dict):
-            # Heuristic: treat as raw state_dict
-            sd = ckpt
-        else:
-            raise ValueError(f"Unsupported checkpoint type: {type(ckpt)}")
 
         missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
         
@@ -142,6 +163,18 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
             )
         elif require_refiner:
             print("⚠️ SpectrumRefiner weights not found in checkpoint; proceeding with MVDR-only fallback (ALLOW_INFER_WITHOUT_REFINER=True).", flush=True)
+
+        # Optionally move to a target device (useful for benchmarking/inference on GPU).
+        if device is not None:
+            try:
+                dev = device if isinstance(device, torch.device) else torch.device(str(device))
+            except Exception:
+                dev = torch.device("cpu")
+            if dev.type == "cuda" and (not torch.cuda.is_available()):
+                dev = torch.device("cpu")
+            model = model.to(dev)
+            if hasattr(model, "_spectrum_refiner") and (getattr(model, "_spectrum_refiner", None) is not None):
+                model._spectrum_refiner = model._spectrum_refiner.to(dev)
 
         model.eval()
         return model
@@ -266,7 +299,19 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     def _vec2c_flat(v_flat: np.ndarray) -> np.ndarray:
         v_flat = v_flat.astype(np.float32)
         xr, xi = v_flat[::2], v_flat[1::2]
-        return (xr + 1j * xi).reshape(cfg.N, cfg.K_MAX).astype(np.complex64)
+        A = (xr + 1j * xi).reshape(cfg.N, cfg.K_MAX).astype(np.complex64)  # [N,K]
+
+        # Magnitude leash (same spirit as loss.py): prevent rare huge factor spikes from
+        # overflowing before downstream trace-normalization/conditioning.
+        if bool(getattr(cfg, "FACTOR_COLNORM_ENABLE", True)):
+            eps = float(getattr(cfg, "FACTOR_COLNORM_EPS", 1e-6))
+            max_norm = float(getattr(cfg, "FACTOR_COLNORM_MAX", 1e3))
+            col = np.linalg.norm(A, axis=0, keepdims=True).astype(np.float32)
+            col = np.maximum(col, eps)
+            if max_norm > 0:
+                col = np.minimum(col, max_norm)
+            A = (A / col).astype(np.complex64)
+        return A
 
     A_ang = _vec2c_flat(_to_numpy(pred["cov_fact_angle"][0]))
     A_rng = _vec2c_flat(_to_numpy(pred["cov_fact_range"][0]))
@@ -335,7 +380,10 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     # If refiner is disabled/missing, fall back if allowed.
     if (not use_refiner_cfg) or (not has_refiner):
         if allow_fallback:
-            if int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0:
+            global _REFINER_FALLBACK_COUNT
+            _REFINER_FALLBACK_COUNT += 1
+            nlog = int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1))
+            if nlog != 0 and ((_REFINER_FALLBACK_COUNT - 1) % max(1, nlog) == 0):
                 print("[INFER] Refiner unavailable/disabled -> MVDR fallback", flush=True)
             return _mvdr_fallback()
         raise ValueError(

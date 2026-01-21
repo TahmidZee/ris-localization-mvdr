@@ -70,7 +70,21 @@ def decoupled_mod_music(R_incident, K, grid_size_ang=41, grid_size_r=61, N_H=Non
     return phi[:K], theta[:K], rng, _
 
 def incident_cov_from_snaps(y_lm, H_mn, codes_ln):
-    L, M = y_lm.shape; N = H_mn.shape[1]
+    # Accept either complex arrays or RI stacks (...,2).
+    def _to_c(x):
+        x = np.asarray(x)
+        if np.iscomplexobj(x):
+            return x.astype(np.complex64)
+        if x.shape[-1] == 2:
+            return (x[..., 0] + 1j * x[..., 1]).astype(np.complex64)
+        return x.astype(np.complex64)
+
+    y_lm = _to_c(y_lm)
+    H_mn = _to_c(H_mn)
+    codes_ln = _to_c(codes_ln)
+
+    L, M = y_lm.shape
+    N = H_mn.shape[1]
     GT = np.empty((L*M, N), np.complex64); yT = y_lm.reshape(L*M).astype(np.complex64)
     for l in range(L): GT[l*M:(l+1)*M,:] = H_mn @ np.diag(codes_ln[l])
     A = GT.conj().T @ GT; b = GT.conj().T @ yT

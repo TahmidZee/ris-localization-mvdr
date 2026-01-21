@@ -76,6 +76,12 @@ class SysConfig:
         # Final phase (last 10-20% of epochs): bump structure slightly
         self.LAM_SUBSPACE_ALIGN_FINAL = 0.07
         self.LAM_PEAK_CONTRAST_FINAL = 0.12
+
+        # Peak-contrast (MVDR-local) loss knobs
+        # Used only when lam_peak_contrast > 0 (disabled by default in HPO via HPO_DISABLE_UNSTABLE_LOSS_TERMS).
+        self.PEAK_CONTRAST_STENCIL = 3        # odd size; 3 => 3x3 stencil (cheap), 5 => 5x5 (stronger, slower)
+        self.PEAK_CONTRAST_DELTA_RAD = 0.10   # ±delta around GT (radians) ~ ±5.7°
+        self.PEAK_CONTRAST_TAU = 0.10         # softmax temperature for contrast CE
         
         self.LAM_COV_PRED = 0.05       # Auxiliary NMSE on R_pred (5% of lam_cov=1.0, prevents hiding)
         
@@ -306,6 +312,12 @@ class SysConfig:
             "w_aux_ang": 0.01,    # Penalty for aux angle RMSE (deg)
             "w_aux_r": 0.01,      # Penalty for aux range RMSE (m)
         }
+
+        # --- Permutation-invariant aux training loss ---
+        # Dataset sources are unordered; training aux (phi/theta/r) "by index" is ill-posed and
+        # leads to persistently high aux RMSE even with large lam_aux. When enabled, we match
+        # predicted slots to GT slots (K<=K_MAX<=5 => tiny brute-force).
+        self.AUX_LOSS_PERM_INVARIANT = True
 
         # --- Phase-aware training knobs (3-phase plan) ---
         # TRAIN_PHASE options:

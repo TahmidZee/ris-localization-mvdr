@@ -105,13 +105,9 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
         # === Learning rate: log-uniform around baseline, ±2× range ===
         lr         = trial.suggest_float("lr", 1.0e-4, 4e-4, log=True)  # Expanded slightly from [1.5e-4, 3e-4]
         
-        # Range grid: Keep moderate for HPO cost control (reserve 241 for final training)
-        range_grid = trial.suggest_categorical("range_grid", [121, 161])  # HPO: [121, 161]; full training: 241
-        
-        # SOTA FIX: Newton refinement now runs AFTER MUSIC (not on aux head)
-        # ICC FIX: Expanded ranges to support near-field Newton (sub-degree unlock)
-        newton_it  = trial.suggest_int("newton_iter", 5, 15)            # MUSIC→Newton: 5-15 iters for NF support
-        newton_lr  = trial.suggest_float("newton_lr", 0.3, 1.0)         # Step: 0.3-1.0 (conservative lower bound for NF)
+        # NOTE: Legacy inference knobs (range_grid/newton_iter/newton_lr) are intentionally
+        # NOT optimized here anymore because production inference is MVDR-first (K-free),
+        # and these parameters are no longer on the critical path.
         
         # === Loss weights (K-head removed - using MVDR peak detection) ===
         lam_cov    = trial.suggest_float("lam_cov", 0.10, 0.25)     # Covariance learning weight (primary)
@@ -130,7 +126,7 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
 
         return dict(
             D_MODEL=D_MODEL, NUM_HEADS=NUM_HEADS, dropout=dropout,
-            lr=lr, range_grid=range_grid, newton_iter=newton_it, newton_lr=newton_lr,
+            lr=lr,
             lam_cov=lam_cov, lam_ang=lam_ang, lam_rng=lam_rng,
             # NOTE: lam_K removed - using MVDR peak detection
             shrink_alpha=shrink_alpha, softmax_tau=softmax_tau, batch_size=batch_size,
@@ -144,7 +140,6 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
 
         # snapshot current mdl_cfg knobs we're about to modify
         keys = ["D_MODEL","NUM_HEADS","DROPOUT","LR_INIT","BATCH_SIZE",
-                "INFERENCE_GRID_SIZE_RANGE","NEWTON_ITER","NEWTON_LR",
                 "SHRINK_BASE_ALPHA","SOFTMAX_TAU","USE_EMA","USE_SWA","USE_3_PHASE_CURRICULUM"]
         snap = {k: getattr(mdl_cfg, k, None) for k in keys}
 
@@ -175,10 +170,7 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
             mdl_cfg.LR_INIT   = s["lr"]
             mdl_cfg.BATCH_SIZE = s["batch_size"]
             
-            # apply suggestions - inference  
-            mdl_cfg.INFERENCE_GRID_SIZE_RANGE = s["range_grid"]
-            mdl_cfg.NEWTON_ITER = s["newton_iter"]
-            mdl_cfg.NEWTON_LR   = s["newton_lr"]
+            # apply suggestions - conditioning / calibration knobs
             mdl_cfg.SHRINK_BASE_ALPHA = s["shrink_alpha"]
             mdl_cfg.SOFTMAX_TAU = s["softmax_tau"]
 

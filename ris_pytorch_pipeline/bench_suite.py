@@ -2,11 +2,12 @@
 import time, json
 import numpy as np
 import pandas as pd
+import torch
 from pathlib import Path
 
 from .configs import cfg
 from .dataset import ShardNPZDataset
-from .infer import load_model, hybrid_estimate_final, estimate_k_ic_from_cov
+from .infer import load_model, hybrid_estimate_final, estimate_k_blind
 from .baseline import (
     ramezani_mod_music_wrapper,
     decoupled_mod_music,
@@ -147,11 +148,15 @@ def _estimate_hybrid(model, sample, blind_k=True):
 
 
 def _estimate_with_baseline(kind, sample, blind_k=True):
+    # Baselines expect the physical BS→RIS channel H_full [M,N] and complex snapshots/codes.
     y_ri = sample["y"].numpy()
-    H_ri = sample["H"].numpy()
     C_ri = sample["codes"].numpy()
-    R_inc = incident_cov_from_snaps(y_ri, H_ri, C_ri)
-    K_hat = estimate_k_ic_from_cov(R_inc) if blind_k else int(sample["K"])
+    H_full_ri = sample.get("H_full", None)
+    if H_full_ri is None:
+        raise RuntimeError("Baseline evaluation requires H_full in shards (field 'H_full' missing).")
+    H_full_ri = H_full_ri.numpy()
+    R_inc = incident_cov_from_snaps(y_ri, H_full_ri, C_ri)
+    K_hat = estimate_k_blind(R_inc, T=int(y_ri.shape[0]), kmax=int(getattr(cfg, "K_MAX", 5))) if blind_k else int(sample["K"])
     t0 = time.time()
     if kind == "ramezani":
         phi, tht, rr = ramezani_mod_music_wrapper(R_inc, K_hat)
@@ -169,40 +174,49 @@ def _estimate_with_baseline(kind, sample, blind_k=True):
 
 # --------------- Core runner ---------------
 
-def _run_on_dataset(tag, dset, baselines=("ramezani","dcd","nfssn"), blind_k=True, limit=None):
-    model = load_model()
-    N = len(dset) if limit is None else min(limit, len(dset))
-    recs = []
-    t0 = time.time()
-    for idx in range(N):
-        item = dset[idx]
-        gt = _gt_from_item(item)
-        # Hybrid
-        (ph_h, tht_h, rr_h), t_h = _estimate_hybrid(model, item, blind_k=blind_k)
-        err_h = _match_err(gt, (ph_h, tht_h, rr_h), return_rmspe=True)
-        recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who="Hybrid",
-                         phi=err_h[0], theta=err_h[1], rng=err_h[2], rmspe=err_h[3],
-                         t_hybrid_ms=t_h, t_mod_ms=np.nan, t_dcd_ms=np.nan, t_nfssn_ms=np.nan,
-                         mode=("Blind-K" if blind_k else "Oracle-K")))
-        # Baselines
-        for base in baselines:
-            (ph_b, tht_b, rr_b), t_b = _estimate_with_baseline(base, item, blind_k=blind_k)
-            err_b = _match_err(gt, (ph_b, tht_b, rr_b), return_rmspe=True)
-            who = ("Ramezani-MOD-MUSIC" if base=="ramezani" else
-                   "DCD-MUSIC" if base=="dcd" else
-                   "NF-SubspaceNet" if base=="nfssn" else
-                   "Decoupled-MOD-MUSIC")
-            recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who=who,
-                             phi=err_b[0], theta=err_b[1], rng=err_b[2], rmspe=err_b[3],
-                             t_hybrid_ms=np.nan,
-                             t_mod_ms=t_b if base in ("ramezani","decoupled_mod") else np.nan,
-                             t_dcd_ms=t_b if base=="dcd" else np.nan,
-                             t_nfssn_ms=t_b if base=="nfssn" else np.nan,
+def _run_on_dataset(tag, dset, baselines=("ramezani","dcd","nfssn"), blind_k=True, limit=None, *, mvdr_refine=None):
+    # Optional MVDR refinement override for benchmarking speed/ablation.
+    old_ref = getattr(cfg, "MVDR_DO_REFINEMENT", True)
+    if mvdr_refine is not None:
+        cfg.MVDR_DO_REFINEMENT = bool(mvdr_refine)
+    # Auto-pick GPU when available (your `screen`), otherwise fall back to CPU.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        model = load_model(map_location="cpu", device=device)
+        N = len(dset) if limit is None else min(limit, len(dset))
+        recs = []
+        t0 = time.time()
+        for idx in range(N):
+            item = dset[idx]
+            gt = _gt_from_item(item)
+            # Hybrid
+            (ph_h, tht_h, rr_h), t_h = _estimate_hybrid(model, item, blind_k=blind_k)
+            err_h = _match_err(gt, (ph_h, tht_h, rr_h), return_rmspe=True)
+            recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who="Hybrid",
+                             phi=err_h[0], theta=err_h[1], rng=err_h[2], rmspe=err_h[3],
+                             t_hybrid_ms=t_h, t_mod_ms=np.nan, t_dcd_ms=np.nan, t_nfssn_ms=np.nan,
                              mode=("Blind-K" if blind_k else "Oracle-K")))
-    out = BENCH_DIR / f"{tag}.csv"
-    pd.DataFrame(recs).to_csv(out, index=False)
-    print(f"[{tag}] Saved {out} in {(time.time()-t0):.1f}s")
-    return out
+            # Baselines
+            for base in baselines:
+                (ph_b, tht_b, rr_b), t_b = _estimate_with_baseline(base, item, blind_k=blind_k)
+                err_b = _match_err(gt, (ph_b, tht_b, rr_b), return_rmspe=True)
+                who = ("Ramezani-MOD-MUSIC" if base=="ramezani" else
+                       "DCD-MUSIC" if base=="dcd" else
+                       "NF-SubspaceNet" if base=="nfssn" else
+                       "Decoupled-MOD-MUSIC")
+                recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who=who,
+                                 phi=err_b[0], theta=err_b[1], rng=err_b[2], rmspe=err_b[3],
+                                 t_hybrid_ms=np.nan,
+                                 t_mod_ms=t_b if base in ("ramezani","decoupled_mod") else np.nan,
+                                 t_dcd_ms=t_b if base=="dcd" else np.nan,
+                                 t_nfssn_ms=t_b if base=="nfssn" else np.nan,
+                                 mode=("Blind-K" if blind_k else "Oracle-K")))
+        out = BENCH_DIR / f"{tag}.csv"
+        pd.DataFrame(recs).to_csv(out, index=False)
+        print(f"[{tag}] Saved {out} in {(time.time()-t0):.1f}s")
+        return out
+    finally:
+        cfg.MVDR_DO_REFINEMENT = old_ref
 
 
 # --------------- Indexed subset ---------------
@@ -215,11 +229,11 @@ class _IndexedSubset:
 
 # --------------- Suite B1–B7 ---------------
 
-def B1_all_blind(baselines=("ramezani","dcd","nfssn"), limit=None):
-    dset = ShardNPZDataset(TEST_DIR); return _run_on_dataset("B1_all_blind", dset, baselines, True, limit)
+def B1_all_blind(baselines=("ramezani","dcd","nfssn"), limit=None, *, mvdr_refine=None):
+    dset = ShardNPZDataset(TEST_DIR); return _run_on_dataset("B1_all_blind", dset, baselines, True, limit, mvdr_refine=mvdr_refine)
 
-def B2_all_oracle(baselines=("ramezani","dcd","nfssn"), limit=None):
-    dset = ShardNPZDataset(TEST_DIR); return _run_on_dataset("B2_all_oracle", dset, baselines, False, limit)
+def B2_all_oracle(baselines=("ramezani","dcd","nfssn"), limit=None, *, mvdr_refine=None):
+    dset = ShardNPZDataset(TEST_DIR); return _run_on_dataset("B2_all_oracle", dset, baselines, False, limit, mvdr_refine=mvdr_refine)
 
 def B3_by_K_blind(baselines=("ramezani","dcd","nfssn"), limit_per_K=None):
     outs=[]; full=ShardNPZDataset(TEST_DIR)

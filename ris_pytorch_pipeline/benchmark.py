@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 import time
 import numpy as np
+import torch
 from pathlib import Path
 from .dataset import ShardNPZDataset
-from .infer import load_model, hybrid_estimate_final, estimate_k_ic_from_cov
+from .infer import load_model, hybrid_estimate_final, estimate_k_blind
 from .baseline import (
     ramezani_mod_music_wrapper,
     decoupled_mod_music,
@@ -94,6 +95,7 @@ def _estimate_hybrid(model, sample, blind_k=True):
     s = {
         "y": sample["y"],         # [L,M,2] torch
         "H": sample["H"],         # [M,N,2] torch
+        "H_full": sample.get("H_full", None),  # [M,N,2] torch (optional; enables R_samp blending)
         "codes": sample["codes"], # [L,N,2] torch
         "K": int(sample["K"]),
         "snr_db": float(sample["snr"]),
@@ -107,10 +109,13 @@ def _estimate_hybrid(model, sample, blind_k=True):
 
 def _estimate_with_baseline(kind, sample, blind_k=True):
     y_ri = sample["y"].numpy()
-    H_ri = sample["H"].numpy()
     C_ri = sample["codes"].numpy()
-    R_inc = incident_cov_from_snaps(y_ri, H_ri, C_ri)
-    K_hat = estimate_k_ic_from_cov(R_inc) if blind_k else int(sample["K"])
+    H_full_ri = sample.get("H_full", None)
+    if H_full_ri is None:
+        raise RuntimeError("Baseline evaluation requires H_full in shards (field 'H_full' missing).")
+    H_full_ri = H_full_ri.numpy()
+    R_inc = incident_cov_from_snaps(y_ri, H_full_ri, C_ri)
+    K_hat = estimate_k_blind(R_inc, T=int(y_ri.shape[0]), kmax=int(getattr(cfg, "K_MAX", 5))) if blind_k else int(sample["K"])
 
     t0 = time.time()
     if kind == "ramezani":
@@ -140,7 +145,7 @@ def run_bench_csv(model, n=300, oracle=False, outf="bench_blind.csv"):
     N = min(n, len(dset))
     for i in range(N):
         it = dset[i]
-        s = {"y": it["y"], "H": it["H"], "codes": it["codes"], "K": int(it["K"]), "snr_db": float(it["snr"])}
+        s = {"y": it["y"], "H": it["H"], "H_full": it.get("H_full", None), "codes": it["codes"], "K": int(it["K"]), "snr_db": float(it["snr"])}
         pr = hybrid_estimate_final(model, s, force_K=(int(it["K"]) if oracle else None), k_policy="mdl", do_newton=True)
         gt_phi = _gt_from_item(it)[0]
         gt_phi0 = float(gt_phi[0]) if len(gt_phi) > 0 else 0.0
@@ -149,3 +154,9 @@ def run_bench_csv(model, n=300, oracle=False, outf="bench_blind.csv"):
     with open(outf, "w", newline="") as f:
         csv.writer(f).writerows(rows)
     return outf
+
+
+def load_model_for_bench():
+    """Convenience loader that uses CUDA when available."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return load_model(map_location="cpu", device=device)
