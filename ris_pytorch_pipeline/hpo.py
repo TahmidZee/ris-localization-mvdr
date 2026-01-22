@@ -242,28 +242,32 @@ def run_hpo(
 
     # Setup logging to file
     log_file = Path(cfg.HPO_DIR) / f"hpo_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    
+
     # Tee output to both console and file
     class TeeLogger:
         def __init__(self, *files):
             self.files = files
+
         def write(self, obj):
             for f in self.files:
                 f.write(obj)
                 f.flush()
+
         def flush(self):
             for f in self.files:
                 f.flush()
-    
+
     orig_stdout, orig_stderr = sys.stdout, sys.stderr
     log_f = open(log_file, "w")
+    sys.stdout = TeeLogger(orig_stdout, log_f)
+    sys.stderr = TeeLogger(orig_stderr, log_f)
+
     try:
-        sys.stdout = TeeLogger(orig_stdout, log_f)
-        sys.stderr = TeeLogger(orig_stderr, log_f)
         print(f"[HPO] Logging to: {log_file}", flush=True)
 
         # prefer cfg.HPO_DB if you defined it, else fall back to cfg.HPO_DB_PATH
         hpo_db = getattr(cfg, "HPO_DB", str(Path(cfg.HPO_DIR) / "hpo.db"))
+
         # Use distinct study names so results don't mix between objectives.
         mode = str(objective_mode).lower().strip()
         suffix = "surrogate" if mode == "surrogate" else "mvdr_final"
@@ -281,229 +285,246 @@ def run_hpo(
 
         print(f"[HPO] storage={hpo_db}  study={study.study_name}  space={space}", flush=True)
 
-    def suggest(trial: optuna.Trial):
-        # === TIGHTENED SEARCH SPACE ===
-        if space == "wide":
-            D_MODEL   = trial.suggest_categorical("D_MODEL",   [448, 512])  # Restored full model size
-            NUM_HEADS = trial.suggest_categorical("NUM_HEADS", [6, 8])     # Restored full head count
-            dropout   = trial.suggest_float("dropout", 0.20, 0.32)          # Tightened from [0.25, 0.45]
-        else:
-            D_MODEL   = trial.suggest_categorical("D_MODEL",   [448, 512])  # Restored full model size
-            NUM_HEADS = trial.suggest_categorical("NUM_HEADS", [6, 8])     # Restored full head count
-            dropout   = trial.suggest_float("dropout", 0.20, 0.32)
-
-        # === Learning rate: log-uniform around baseline, ±2× range ===
-        lr         = trial.suggest_float("lr", 1.0e-4, 4e-4, log=True)  # Expanded slightly from [1.5e-4, 3e-4]
-        
-        # NOTE: Legacy inference knobs (range_grid/newton_iter/newton_lr) are intentionally
-        # NOT optimized here anymore because production inference is MVDR-first (K-free),
-        # and these parameters are no longer on the critical path.
-        
-        # === Loss weights (K-head removed - using MVDR peak detection) ===
-        lam_cov    = trial.suggest_float("lam_cov", 0.10, 0.25)     # Covariance learning weight (primary)
-        lam_ang    = trial.suggest_float("lam_ang", 0.50, 1.00)     # Angle aux weight
-        lam_rng    = trial.suggest_float("lam_rng", 0.30, 0.60)     # Range aux weight
-        # NOTE: lam_K removed - K estimation now done via MDL/MVDR at inference
-        shrink_alpha = trial.suggest_float("shrink_alpha", 0.10, 0.20)  # Tightened from [0.10, 0.25]
-        softmax_tau = trial.suggest_float("softmax_tau", 0.15, 0.25)    # Keep same
-        
-        # ICC CRITICAL FIX: Prefer larger batches (avoid BS=32 which degrades quickly)
-        batch_size = trial.suggest_categorical("batch_size", [64, 80])  # Removed 32/48: BS=32 tanks val quickly
-        
-        # NF-MLE polish parameters: Limit to {0, 2} for HPO speed, reserve 3 iters for final training
-        nf_mle_snr_threshold = trial.suggest_float("nf_mle_snr_threshold", 4.0, 10.0)  # dB: gate MLE on SNR
-        nf_mle_iters = trial.suggest_categorical("nf_mle_iters", [0, 2])  # HPO: {0, 2}; full training: 2-3
-
-        return dict(
-            D_MODEL=D_MODEL, NUM_HEADS=NUM_HEADS, dropout=dropout,
-            lr=lr,
-            lam_cov=lam_cov, lam_ang=lam_ang, lam_rng=lam_rng,
-            # NOTE: lam_K removed - using MVDR peak detection
-            shrink_alpha=shrink_alpha, softmax_tau=softmax_tau, batch_size=batch_size,
-            nf_mle_snr_threshold=nf_mle_snr_threshold, nf_mle_iters=nf_mle_iters
-        )
-
-    def objective(trial: optuna.Trial):
-        print(f"\n[HPO Trial {trial.number}] Starting trial...", flush=True)
-        s = suggest(trial)
-        print(f"[HPO Trial {trial.number}] Hyperparameters suggested: D_MODEL={s['D_MODEL']}, BS={s['batch_size']}, LR={s['lr']:.6f}", flush=True)
-
-        # snapshot current mdl_cfg knobs we're about to modify
-        keys = ["D_MODEL","NUM_HEADS","DROPOUT","LR_INIT","BATCH_SIZE",
-                "SHRINK_BASE_ALPHA","SOFTMAX_TAU","USE_EMA","USE_SWA","USE_3_PHASE_CURRICULUM"]
-        snap = {k: getattr(mdl_cfg, k, None) for k in keys}
-
-        try:
-            # Mark HPO mode for Trainer (fail-fast on NaN grads, disable unstable loss terms by default)
-            cfg.HPO_MODE = True
-
-            # Disable EMA, SWA, and curriculum for HPO trials
-            # CRITICAL FIX: Curriculum causes validation loss to spike when K-weight increases,
-            # triggering early stopping before model can learn K properly
-            mdl_cfg.USE_EMA = False
-            mdl_cfg.USE_SWA = False
-            mdl_cfg.USE_3_PHASE_CURRICULUM = False  # DISABLED: Curriculum sabotages HPO with early stopping
-            
-            # ICC CRITICAL FIX: Enable near-field Newton during HPO for proper edge-pegging fix
-            # NF Newton is needed to handle the range-angle coupling correctly
-            # This prevents edge pegging and improves low-SNR robustness
-            cfg.NEWTON_NEARFIELD = True  # HPO: Enable NF Newton for proper 3D localization
-            
-            # Apply NF-MLE polish parameters (HPO-tunable for low-SNR robustness)
-            cfg.NF_MLE_SNR_THRESHOLD = s["nf_mle_snr_threshold"]
-            cfg.NF_MLE_ITERS = s["nf_mle_iters"]
-            
-            # apply suggestions - architecture
-            mdl_cfg.D_MODEL   = s["D_MODEL"]
-            mdl_cfg.NUM_HEADS = s["NUM_HEADS"]
-            mdl_cfg.DROPOUT   = s["dropout"]
-            mdl_cfg.LR_INIT   = s["lr"]
-            mdl_cfg.BATCH_SIZE = s["batch_size"]
-            
-            # apply suggestions - conditioning / calibration knobs
-            mdl_cfg.SHRINK_BASE_ALPHA = s["shrink_alpha"]
-            mdl_cfg.SOFTMAX_TAU = s["softmax_tau"]
-
-            # Now create Trainer (after setting USE_SWA=False)
-            # CRITICAL: Use SURROGATE mode for HPO (no MUSIC in validation loop)
-            # This makes HPO fast, stable, and well-behaved
-            cfg.VAL_PRIMARY = "surrogate"
-            cfg.USE_MUSIC_METRICS_IN_VAL = False  # No MUSIC during HPO!
-            print(f"[HPO Trial {trial.number}] Creating Trainer (VAL_PRIMARY={cfg.VAL_PRIMARY}, MUSIC={cfg.USE_MUSIC_METRICS_IN_VAL})...", flush=True)
-            t = Trainer(from_hpo=False)
-            print(f"[HPO Trial {trial.number}] Trainer created successfully", flush=True)
-            
-            # Populate _hpo_loss_weights so curriculum can access them
-            # NOTE: lam_K removed - using MVDR peak detection
-            t._hpo_loss_weights = {
-                "lam_cov": s["lam_cov"],
-                "lam_ang": s["lam_ang"],
-                "lam_rng": s["lam_rng"],
-            }
-            
-            # Apply loss weight suggestions (K-head removed)
-            t.loss_fn.lam_cov = s["lam_cov"]         # Primary covariance weight
-            t.loss_fn.lam_diag = 0.2  # 20% for diagonal (relative within NMSE)
-            t.loss_fn.lam_off = 0.8   # 80% for off-diagonal (relative within NMSE)
-            t.loss_fn.lam_aux = s["lam_ang"] + s["lam_rng"]  # Combined aux weight
-            
-            # Set reasonable defaults for missing loss parameters (not optimized by HPO).
-            # IMPORTANT: keep HPO stable (avoid SVD/QR-heavy regularizers in early search).
-            t.loss_fn.lam_ortho = 1e-3  # Orthogonality penalty
-            t.loss_fn.lam_peak = 0.05   # Chamfer/peak angle loss (ok)
-            if bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
-                t.loss_fn.lam_gap = 0.0
-                t.loss_fn.lam_margin = 0.0
-                t.loss_fn.lam_subspace_align = 0.0
-                t.loss_fn.lam_peak_contrast = 0.0
-                # Also disable the legacy mdl_cfg align knob used by some schedules
-                mdl_cfg.LAM_ALIGN = 0.0
+        def suggest(trial: optuna.Trial):
+            # === TIGHTENED SEARCH SPACE ===
+            if space == "wide":
+                D_MODEL = trial.suggest_categorical("D_MODEL", [448, 512])  # Restored full model size
+                NUM_HEADS = trial.suggest_categorical("NUM_HEADS", [6, 8])  # Restored full head count
+                dropout = trial.suggest_float("dropout", 0.20, 0.32)  # Tightened from [0.25, 0.45]
             else:
-                # Eigengap/margin disabled globally (kept for backward-compat only).
-                t.loss_fn.lam_gap = 0.0
-                t.loss_fn.lam_margin = 0.0
-            t.loss_fn.lam_range_factor = 0.3  # Range factor in covariance
-            if not bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
-                mdl_cfg.LAM_ALIGN = 0.002  # Subspace alignment penalty
+                D_MODEL = trial.suggest_categorical("D_MODEL", [448, 512])  # Restored full model size
+                NUM_HEADS = trial.suggest_categorical("NUM_HEADS", [6, 8])  # Restored full head count
+                dropout = trial.suggest_float("dropout", 0.20, 0.32)
 
-            # HPO subset: Use reasonable subset for effective HPO
-            # Updated 2025-11-26: New dataset is 100K train / 10K val / 10K test
-            total_train_samples = 100000  # Current L=16 dataset (100K train samples)
-            total_val_samples = 10000     # Current L=16 dataset (10K val samples)
-            hpo_n_train = int(0.1 * total_train_samples)  # 10K samples (10%) - effective HPO subset
-            hpo_n_val = int(0.1 * total_val_samples)      # 1K samples (10%) - effective HPO subset
-            
-            print(f"[HPO Trial {trial.number}] Starting training with {hpo_n_train} train, {hpo_n_val} val samples...", flush=True)
+            # === Learning rate: log-uniform around baseline, ±2× range ===
+            lr = trial.suggest_float("lr", 1.0e-4, 4e-4, log=True)  # Expanded slightly from [1.5e-4, 3e-4]
+
+            # === Loss weights (K-head removed - using MVDR peak detection) ===
+            lam_cov = trial.suggest_float("lam_cov", 0.10, 0.25)  # Covariance learning weight (primary)
+            lam_ang = trial.suggest_float("lam_ang", 0.50, 1.00)  # Angle aux weight
+            lam_rng = trial.suggest_float("lam_rng", 0.30, 0.60)  # Range aux weight
+            shrink_alpha = trial.suggest_float("shrink_alpha", 0.10, 0.20)  # Tightened from [0.10, 0.25]
+            softmax_tau = trial.suggest_float("softmax_tau", 0.15, 0.25)
+
+            # Prefer larger batches (avoid BS=32 which degrades quickly)
+            batch_size = trial.suggest_categorical("batch_size", [64, 80])
+
+            # NF-MLE polish parameters
+            nf_mle_snr_threshold = trial.suggest_float("nf_mle_snr_threshold", 4.0, 10.0)
+            nf_mle_iters = trial.suggest_categorical("nf_mle_iters", [0, 2])
+
+            return dict(
+                D_MODEL=D_MODEL,
+                NUM_HEADS=NUM_HEADS,
+                dropout=dropout,
+                lr=lr,
+                lam_cov=lam_cov,
+                lam_ang=lam_ang,
+                lam_rng=lam_rng,
+                shrink_alpha=shrink_alpha,
+                softmax_tau=softmax_tau,
+                batch_size=batch_size,
+                nf_mle_snr_threshold=nf_mle_snr_threshold,
+                nf_mle_iters=nf_mle_iters,
+            )
+
+        def objective(trial: optuna.Trial):
+            print(f"\n[HPO Trial {trial.number}] Starting trial...", flush=True)
+            s = suggest(trial)
+            print(
+                f"[HPO Trial {trial.number}] Hyperparameters suggested: D_MODEL={s['D_MODEL']}, BS={s['batch_size']}, LR={s['lr']:.6f}",
+                flush=True,
+            )
+
+            # snapshot current mdl_cfg knobs we're about to modify
+            keys = [
+                "D_MODEL",
+                "NUM_HEADS",
+                "DROPOUT",
+                "LR_INIT",
+                "BATCH_SIZE",
+                "SHRINK_BASE_ALPHA",
+                "SOFTMAX_TAU",
+                "USE_EMA",
+                "USE_SWA",
+                "USE_3_PHASE_CURRICULUM",
+            ]
+            snap = {k: getattr(mdl_cfg, k, None) for k in keys}
+
             try:
-                best_val = t.fit(
-                    epochs=epochs_per_trial,
-                    use_shards=True,
-                    n_train=hpo_n_train,    # 10K samples (10% of 100K) for effective HPO
-                    n_val=hpo_n_val,        # 1K samples (10% of 10K) for effective HPO
-                    gpu_cache=True,         # Critical for HPO speed
-                    grad_accumulation=1,    # REDUCED from 2 (was 256 effective batch, too smooth)
-                    early_stop_patience=early_stop_patience,  # Stop if no improvement for N epochs
-                    val_every=1,            # Validate every epoch (surrogate is fast!)
-                    skip_music_val=True,    # NO MUSIC during HPO - use surrogate metrics only
-                )
-            except RuntimeError as e:
-                msg = str(e)
-                # Do not crash the entire HPO run on one unstable trial.
-                if "Non-finite gradients detected" in msg:
-                    raise optuna.TrialPruned(msg)
-                raise
+                # Mark HPO mode for Trainer (fail-fast on NaN grads, disable unstable loss terms by default)
+                cfg.HPO_MODE = True
 
-            # If requested, score this trial via the *actual* MVDR-first inference path.
-            # Note: training still uses surrogate validation for speed/stability; we only change
-            # the objective returned to Optuna.
-            mode = str(objective_mode).lower().strip()
-            final_obj = float(best_val) if best_val is not None else float("inf")
-            if mode != "surrogate":
+                # Disable EMA, SWA, and curriculum for HPO trials
+                mdl_cfg.USE_EMA = False
+                mdl_cfg.USE_SWA = False
+                mdl_cfg.USE_3_PHASE_CURRICULUM = False
+
+                # Enable near-field Newton during HPO for proper 3D localization
+                cfg.NEWTON_NEARFIELD = True
+
+                # Apply NF-MLE polish parameters (HPO-tunable for low-SNR robustness)
+                cfg.NF_MLE_SNR_THRESHOLD = s["nf_mle_snr_threshold"]
+                cfg.NF_MLE_ITERS = s["nf_mle_iters"]
+
+                # apply suggestions - architecture
+                mdl_cfg.D_MODEL = s["D_MODEL"]
+                mdl_cfg.NUM_HEADS = s["NUM_HEADS"]
+                mdl_cfg.DROPOUT = s["dropout"]
+                mdl_cfg.LR_INIT = s["lr"]
+                mdl_cfg.BATCH_SIZE = s["batch_size"]
+
+                # apply suggestions - conditioning / calibration knobs
+                mdl_cfg.SHRINK_BASE_ALPHA = s["shrink_alpha"]
+                mdl_cfg.SOFTMAX_TAU = s["softmax_tau"]
+
+                # Now create Trainer (after setting USE_SWA=False)
+                cfg.VAL_PRIMARY = "surrogate"
+                cfg.USE_MUSIC_METRICS_IN_VAL = False  # No MUSIC during HPO!
+                print(
+                    f"[HPO Trial {trial.number}] Creating Trainer (VAL_PRIMARY={cfg.VAL_PRIMARY}, MUSIC={cfg.USE_MUSIC_METRICS_IN_VAL})...",
+                    flush=True,
+                )
+                t = Trainer(from_hpo=False)
+                print(f"[HPO Trial {trial.number}] Trainer created successfully", flush=True)
+
+                # Populate _hpo_loss_weights so curriculum can access them
+                t._hpo_loss_weights = {
+                    "lam_cov": s["lam_cov"],
+                    "lam_ang": s["lam_ang"],
+                    "lam_rng": s["lam_rng"],
+                }
+
+                # Apply loss weight suggestions
+                t.loss_fn.lam_cov = s["lam_cov"]
+                t.loss_fn.lam_diag = 0.2
+                t.loss_fn.lam_off = 0.8
+                t.loss_fn.lam_aux = s["lam_ang"] + s["lam_rng"]
+
+                # Stable defaults for non-optimized loss params
+                t.loss_fn.lam_ortho = 1e-3
+                t.loss_fn.lam_peak = 0.05
+                if bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
+                    t.loss_fn.lam_gap = 0.0
+                    t.loss_fn.lam_margin = 0.0
+                    t.loss_fn.lam_subspace_align = 0.0
+                    t.loss_fn.lam_peak_contrast = 0.0
+                    mdl_cfg.LAM_ALIGN = 0.0
+                else:
+                    t.loss_fn.lam_gap = 0.0
+                    t.loss_fn.lam_margin = 0.0
+                t.loss_fn.lam_range_factor = 0.3
+                if not bool(getattr(cfg, "HPO_DISABLE_UNSTABLE_LOSS_TERMS", True)):
+                    mdl_cfg.LAM_ALIGN = 0.002
+
+                # HPO subset: 10K train / 1K val (10% each)
+                total_train_samples = 100000
+                total_val_samples = 10000
+                hpo_n_train = int(0.1 * total_train_samples)
+                hpo_n_val = int(0.1 * total_val_samples)
+
+                print(
+                    f"[HPO Trial {trial.number}] Starting training with {hpo_n_train} train, {hpo_n_val} val samples...",
+                    flush=True,
+                )
                 try:
-                    # Load best checkpoint weights into the in-memory model.
-                    best_path = Path(cfg.CKPT_DIR) / "best.pt"
-                    if best_path.exists():
-                        sd = torch.load(str(best_path), map_location="cpu", weights_only=False)
-                        t.model.load_state_dict(sd, strict=False)
-                    n_eval = int(e2e_val_scenes) if (e2e_val_scenes is not None) else int(getattr(cfg, "HPO_E2E_VAL_SCENES", 500))
-                    e2e = _eval_mvdr_final_on_val_subset(
-                        t.model,
-                        n_scenes=n_eval,
-                        seed=int(e2e_seed),
-                        blind_k=bool(e2e_blind_k),
+                    best_val = t.fit(
+                        epochs=epochs_per_trial,
+                        use_shards=True,
+                        n_train=hpo_n_train,
+                        n_val=hpo_n_val,
+                        gpu_cache=True,
+                        grad_accumulation=1,
+                        early_stop_patience=early_stop_patience,
+                        val_every=1,
+                        skip_music_val=True,
                     )
-                    final_obj = float(e2e["objective"])
-                    # Store for analysis in Optuna DB/CSV.
-                    for k, v in e2e.items():
-                        try:
-                            trial.set_user_attr(f"e2e_{k}", v)
-                        except Exception:
-                            pass
+                except RuntimeError as e:
+                    msg = str(e)
+                    if "Non-finite gradients detected" in msg:
+                        raise optuna.TrialPruned(msg)
+                    raise
+
+                # Optional MVDR-first end-to-end scoring
+                mode_local = str(objective_mode).lower().strip()
+                final_obj = float(best_val) if best_val is not None else float("inf")
+                if mode_local != "surrogate":
+                    try:
+                        best_path = Path(cfg.CKPT_DIR) / "best.pt"
+                        if best_path.exists():
+                            sd = torch.load(str(best_path), map_location="cpu", weights_only=False)
+                            t.model.load_state_dict(sd, strict=False)
+
+                        n_eval = (
+                            int(e2e_val_scenes)
+                            if (e2e_val_scenes is not None)
+                            else int(getattr(cfg, "HPO_E2E_VAL_SCENES", 500))
+                        )
+                        e2e = _eval_mvdr_final_on_val_subset(
+                            t.model,
+                            n_scenes=n_eval,
+                            seed=int(e2e_seed),
+                            blind_k=bool(e2e_blind_k),
+                        )
+                        final_obj = float(e2e["objective"])
+                        for k, v in e2e.items():
+                            try:
+                                trial.set_user_attr(f"e2e_{k}", v)
+                            except Exception:
+                                pass
+                        print(
+                            f"[HPO Trial {trial.number}] E2E(MVDR-final) objective={final_obj:.6f} "
+                            f"(rmseφ={e2e['rmse_phi_mean']:.2f}°, rmseθ={e2e['rmse_theta_mean']:.2f}°, rmse_r={e2e['rmse_r_mean']:.2f}m, "
+                            f"succ={e2e['success_rate']:.3f}, fp/scene={e2e['fp_per_scene']:.2f})",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(
+                            f"[HPO Trial {trial.number}] E2E eval failed: {e} -> returning large penalty (1e6)",
+                            flush=True,
+                        )
+                        final_obj = 1e6
+
+                if final_obj is None or not np.isfinite(final_obj):
                     print(
-                        f"[HPO Trial {trial.number}] E2E(MVDR-final) objective={final_obj:.6f} "
-                        f"(rmseφ={e2e['rmse_phi_mean']:.2f}°, rmseθ={e2e['rmse_theta_mean']:.2f}°, rmse_r={e2e['rmse_r_mean']:.2f}m, "
-                        f"succ={e2e['success_rate']:.3f}, fp/scene={e2e['fp_per_scene']:.2f})",
+                        f"[HPO Trial {trial.number}] Training completed! Best objective: {final_obj} (non-finite)",
                         flush=True,
                     )
-                except Exception as e:
-                    print(f"[HPO Trial {trial.number}] E2E eval failed: {e} -> returning large penalty (1e6)", flush=True)
-                    final_obj = 1e6
-
-            # CRITICAL FIX: Handle None/inf values in print
-            if final_obj is None or not np.isfinite(final_obj):
-                print(f"[HPO Trial {trial.number}] Training completed! Best objective: {final_obj} (non-finite)", flush=True)
-            else:
-                print(f"[HPO Trial {trial.number}] Training completed! Best objective: {final_obj:.6f}", flush=True)
-            
-            # CRITICAL FIX: Clear memory between HPO trials to prevent memory leaks
-            del t
-            import gc; gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # CRITICAL FIX: Guard against inf/nan values in HPO objective
-            if not np.isfinite(final_obj):
-                print(f"[HPO Trial {trial.number}] Non-finite objective (val={final_obj}), returning large penalty (1e6)", flush=True)
-                return 1e6
-            
-            return float(final_obj)
-        finally:
-            cfg.HPO_MODE = False
-            # restore mdl_cfg
-            for k, v in snap.items():
-                if v is None:
-                    try:
-                        delattr(mdl_cfg, k)
-                    except Exception:
-                        pass
                 else:
-                    setattr(mdl_cfg, k, v)
+                    print(f"[HPO Trial {trial.number}] Training completed! Best objective: {final_obj:.6f}", flush=True)
 
-        # resume-friendly: only run the remaining trials that aren't finished yet
+                # Clear memory between HPO trials
+                del t
+                import gc
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                if not np.isfinite(final_obj):
+                    print(
+                        f"[HPO Trial {trial.number}] Non-finite objective (val={final_obj}), returning large penalty (1e6)",
+                        flush=True,
+                    )
+                    return 1e6
+
+                return float(final_obj)
+            finally:
+                cfg.HPO_MODE = False
+                for k, v in snap.items():
+                    if v is None:
+                        try:
+                            delattr(mdl_cfg, k)
+                        except Exception:
+                            pass
+                    else:
+                        setattr(mdl_cfg, k, v)
+
+        # resume-friendly: only run remaining trials
         done = len(_finished_trials(study))
-        remaining = max(0, n_trials - done)
+        remaining = max(0, int(n_trials) - done)
         print(f"[HPO] Completed trials: {done}, Remaining trials: {remaining}", flush=True)
-        
+
         if remaining > 0:
             print(f"[HPO] Starting optimization with {remaining} trials...", flush=True)
             study.optimize(
@@ -512,17 +533,15 @@ def run_hpo(
                 catch=(RuntimeError,),
                 gc_after_trial=True,
                 show_progress_bar=False,
-                n_jobs=1  # CRITICAL: Force sequential trials to avoid memory issues
+                n_jobs=1,
             )
-            print(f"[HPO] Optimization completed!", flush=True)
+            print("[HPO] Optimization completed!", flush=True)
 
         # persist the winner
         try:
             if study.best_trial is not None:
                 _save_hpo_winner(study.best_trial)
-                mode = str(objective_mode).lower().strip()
                 if mode == "surrogate":
-                    # Note: best_value is -score (since Optuna minimizes and surrogate score is higher-is-better)
                     actual_score = -study.best_value
                     print(f"[HPO] Best surrogate score={actual_score:.4f} (trial={study.best_trial.number})")
                 else:
@@ -539,7 +558,6 @@ def run_hpo(
             except Exception as e:
                 print(f"[HPO] CSV export skipped: {e}")
     finally:
-        # Restore stdout/stderr so multi-stage orchestration doesn't nest TeeLogger chains.
         try:
             sys.stdout = orig_stdout
             sys.stderr = orig_stderr
