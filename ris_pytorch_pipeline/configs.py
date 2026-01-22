@@ -122,6 +122,14 @@ class SysConfig:
         self.HPO_DB  = f"{self.HPO_DIR}/hpo.db"
         self.HPO_BEST_JSON = f"{self.HPO_DIR}/best.json"
 
+        # HPO objective policy
+        # - "surrogate": fast, uses Trainer's surrogate validation score (loss + aux)
+        # - "mvdr_final": slower, runs MVDR-first inference (`hybrid_estimate_final`) on a fixed val subset
+        self.HPO_OBJECTIVE_MODE = "surrogate"
+        self.HPO_E2E_VAL_SCENES = 500
+        self.HPO_E2E_SEED = 0
+        self.HPO_E2E_BLIND_K = True
+
         # Inference policy (use HPO knobs for Newton+range grid)
         # K-free policy: do NOT use MDL/AIC in the production inference path.
         # Keep MDL as a debug/ablation knob only (see infer.py).

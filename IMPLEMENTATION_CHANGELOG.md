@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 21, 2026 (Permutation-invariant aux training loss + `--from_hpo` training crash fix + benchmark/checkpoint robustness fixes)
+**Last Updated:** January 22, 2026 (MVDR-final HPO objective + two-stage HPO runner)
 
 ---
 
@@ -845,5 +845,41 @@ loss = loss_fn(pred, y_true)  # Automatically includes heatmap loss
 ```
 
 ---
+
+## 12) HPO objective aligned to production (MVDR-final) + two-stage HPO runner
+
+**Goal:** Optimize for SOTA near-field localization *as actually executed in production*, i.e. MVDR-first inference via `infer.hybrid_estimate_final`, rather than a proxy dominated by training loss / aux metrics.
+
+**Files:**
+- `ris_pytorch_pipeline/hpo.py`
+- `ris_pytorch_pipeline/ris_pipeline.py`
+- `ris_pytorch_pipeline/configs.py`
+
+### MVDR-final HPO objective mode
+
+- Added `objective=mvdr_final`:
+  - Each trial still trains using the **fast surrogate validation loop** for stability.
+  - The returned Optuna objective is computed by running **`hybrid_estimate_final`** on a **fixed validation subset** and scoring Hungarian-matched:
+    - RMSE φ (deg), RMSE θ (deg), RMSE r (m)
+    - success rate (all GT sources within tolerance)
+    - light FP/FN per scene penalties
+  - End-to-end metrics are stored in Optuna trial `user_attrs` (prefixed `e2e_...`) for analysis.
+
+### Two-stage HPO runner
+
+- Added `hpo2` CLI:
+  - **Stage 1**: many trials using `objective=surrogate`
+  - **Stage 2**: take top-K configs from Stage 1 and rerun them with `objective=mvdr_final` (rerank by end-to-end localization)
+  - Stage 2 uses Optuna `enqueue_trial()` so we evaluate the exact candidate configs from Stage 1.
+
+### CLI usage
+
+```bash
+# One-stage end-to-end HPO (slower per trial, production-aligned)
+python -m ris_pytorch_pipeline.ris_pipeline hpo --objective mvdr_final --trials 100 --hpo-epochs 20 --e2e-val-scenes 1000
+
+# Two-stage HPO (recommended when budget allows)
+python -m ris_pytorch_pipeline.ris_pipeline hpo2 --stage1-trials 300 --stage1-epochs 15 --stage2-topk 40 --stage2-epochs 20 --e2e-val-scenes 2000
+```
 
 *End of Changelog*

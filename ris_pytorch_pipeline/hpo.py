@@ -12,6 +12,159 @@ import logging
 
 from .configs import cfg, mdl_cfg, set_seed
 from .train import Trainer
+from .dataset import ShardNPZDataset
+from .infer import hybrid_estimate_final
+from .eval_angles import eval_scene_angles_ranges
+
+
+def _resolve_val_dir() -> Path:
+    """
+    Resolve the validation shards directory.
+    Prefers cfg.DATA_SHARDS_VAL; falls back to cfg.DATA_SHARDS_DIR/val.
+    """
+    v = Path(str(getattr(cfg, "DATA_SHARDS_VAL", "")).strip() or "")
+    if str(v) and v.exists():
+        return v
+    root = Path(str(getattr(cfg, "DATA_SHARDS_DIR", "data_shards_M64_L16")).strip() or "data_shards_M64_L16")
+    return root / "val"
+
+
+def _ptr_to_gt_deg(item: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Extract GT (phi, theta, r) from a ShardNPZDataset item.
+    Returns degrees/meters arrays of length K.
+    """
+    K = int(item.get("K", 0))
+    KMAX = int(getattr(cfg, "K_MAX", 5))
+    if "ptr" in item:
+        a = item["ptr"]
+        if torch.is_tensor(a):
+            a = a.detach().cpu().float().reshape(-1)
+            phi = torch.rad2deg(a[0:KMAX][:K]).numpy()
+            tht = torch.rad2deg(a[KMAX:2 * KMAX][:K]).numpy()
+            rr = a[2 * KMAX:3 * KMAX][:K].numpy()
+            return phi, tht, rr
+        a = np.asarray(a, dtype=np.float32).reshape(-1)
+        phi = np.rad2deg(a[0:KMAX][:K])
+        tht = np.rad2deg(a[KMAX:2 * KMAX][:K])
+        rr = a[2 * KMAX:3 * KMAX][:K]
+        return phi, tht, rr
+
+    # Fallback: explicit fields (radians)
+    phi = np.rad2deg(np.asarray(item.get("phi", []), dtype=np.float32))
+    tht = np.rad2deg(np.asarray(item.get("theta", []), dtype=np.float32))
+    rr = np.asarray(item.get("r", []), dtype=np.float32)
+    return phi, tht, rr
+
+
+@torch.no_grad()
+def _eval_mvdr_final_on_val_subset(
+    model,
+    *,
+    n_scenes: int,
+    seed: int = 0,
+    blind_k: bool = True,
+) -> dict:
+    """
+    End-to-end eval: run MVDR-first inference (hybrid_estimate_final) and compute
+    Hungarian-matched RMSEs + success rate on a fixed validation subset.
+    """
+    val_dir = _resolve_val_dir()
+    ds = ShardNPZDataset(val_dir)
+    N = min(int(n_scenes), len(ds))
+    rng = np.random.default_rng(int(seed))
+    idx = rng.choice(len(ds), size=N, replace=False) if N < len(ds) else np.arange(len(ds))
+
+    # Normalizers (same defaults as Trainer's MUSIC-based composite)
+    phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
+    theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))
+    r_norm = float(getattr(cfg, "VAL_NORM_R_M", 1.0))
+
+    # Success tolerances (reuse surrogate peak tolerances by default)
+    tol_phi = float(getattr(cfg, "SURROGATE_DET_TOL_PHI_DEG", 5.0))
+    tol_theta = float(getattr(cfg, "SURROGATE_DET_TOL_THETA_DEG", 5.0))
+    tol_r = float(getattr(cfg, "SURROGATE_DET_TOL_R_M", 1.0))
+
+    rmse_phi_list: list[float] = []
+    rmse_theta_list: list[float] = []
+    rmse_r_list: list[float] = []
+    succ = 0
+    fp = 0
+    fn = 0
+
+    model.eval()
+    for i in idx:
+        it = ds[int(i)]
+        gt_phi_deg, gt_th_deg, gt_r_m = _ptr_to_gt_deg(it)
+
+        s = {
+            "y": it["y"],
+            "H": it["H"],
+            "H_full": it.get("H_full", None),
+            "codes": it["codes"],
+            "K": int(it["K"]),
+            "snr_db": float(it["snr"]),
+        }
+        force_K = None if bool(blind_k) else int(it["K"])
+
+        try:
+            ph, tht, rr = hybrid_estimate_final(
+                model,
+                s,
+                force_K=force_K,
+                k_policy="mdl",
+                do_newton=bool(getattr(cfg, "NEWTON_NEARFIELD", True)),
+                use_hpo_knobs=False,  # inference knobs no longer HPO-controlled
+            )
+        except Exception:
+            ph, tht, rr = ([], [], [])
+
+        ph = np.rad2deg(np.asarray(ph, dtype=np.float32))
+        tht = np.rad2deg(np.asarray(tht, dtype=np.float32))
+        rr = np.asarray(rr, dtype=np.float32)
+
+        err = eval_scene_angles_ranges(
+            ph,
+            tht,
+            rr,
+            gt_phi_deg,
+            gt_th_deg,
+            gt_r_m,
+            success_tol_phi=tol_phi,
+            success_tol_theta=tol_theta,
+            success_tol_r=tol_r,
+        )
+
+        # Penalize empty/invalid preds by using norm-scale errors
+        rmse_phi_list.append(float(err["rmse_phi"]) if err["rmse_phi"] is not None else phi_norm)
+        rmse_theta_list.append(float(err["rmse_theta"]) if err["rmse_theta"] is not None else theta_norm)
+        rmse_r_list.append(float(err["rmse_r"]) if err["rmse_r"] is not None else r_norm)
+
+        succ += int(bool(err.get("success_flag", False)))
+        fp += max(0, int(err.get("num_pred", 0)) - int(err.get("num_gt", 0)))
+        fn += max(0, int(err.get("num_gt", 0)) - int(err.get("num_pred", 0)))
+
+    rmse_phi_mean = float(np.mean(rmse_phi_list)) if rmse_phi_list else float("inf")
+    rmse_theta_mean = float(np.mean(rmse_theta_list)) if rmse_theta_list else float("inf")
+    rmse_r_mean = float(np.mean(rmse_r_list)) if rmse_r_list else float("inf")
+    success_rate = float(succ) / max(1.0, float(N))
+    fp_per_scene = float(fp) / max(1.0, float(N))
+    fn_per_scene = float(fn) / max(1.0, float(N))
+
+    # Composite objective: lower is better.
+    objective = (rmse_phi_mean / phi_norm) + (rmse_theta_mean / theta_norm) + (rmse_r_mean / r_norm) - success_rate
+    objective += 0.25 * fp_per_scene + 0.25 * fn_per_scene
+
+    return dict(
+        rmse_phi_mean=rmse_phi_mean,
+        rmse_theta_mean=rmse_theta_mean,
+        rmse_r_mean=rmse_r_mean,
+        success_rate=success_rate,
+        fp_per_scene=fp_per_scene,
+        fn_per_scene=fn_per_scene,
+        objective=float(objective),
+        n_scenes=int(N),
+    )
 
 def _save_hpo_winner(trial: optuna.trial.FrozenTrial):
     Path(cfg.HPO_DIR).mkdir(parents=True, exist_ok=True)
@@ -59,7 +212,31 @@ def _study(storage_path: str, name: str, seed: int = 42):
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=6, n_min_trials=8),
     )
 
-def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_csv: bool = False, early_stop_patience: int = 15):
+
+def _completed_trials_sorted(study: optuna.Study):
+    """Return COMPLETE trials sorted by objective value (ascending)."""
+    ts = []
+    for t in study.get_trials(deepcopy=False):
+        if t.state == optuna.trial.TrialState.COMPLETE and (t.value is not None) and np.isfinite(float(t.value)):
+            ts.append(t)
+    ts.sort(key=lambda x: float(x.value))
+    return ts
+
+
+def run_hpo(
+    n_trials: int,
+    epochs_per_trial: int,
+    space: str = "wide",
+    export_csv: bool = False,
+    early_stop_patience: int = 15,
+    *,
+    objective_mode: str = "surrogate",
+    e2e_val_scenes: int | None = None,
+    e2e_seed: int = 0,
+    e2e_blind_k: bool = True,
+    enqueue_params: list[dict] | None = None,
+    study_name_override: str | None = None,
+):
     set_seed(42)
     Path(cfg.HPO_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -78,18 +255,31 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
             for f in self.files:
                 f.flush()
     
-    log_f = open(log_file, 'w')
-    sys.stdout = TeeLogger(sys.stdout, log_f)
-    sys.stderr = TeeLogger(sys.stderr, log_f)
-    
-    print(f"[HPO] Logging to: {log_file}", flush=True)
+    orig_stdout, orig_stderr = sys.stdout, sys.stderr
+    log_f = open(log_file, "w")
+    try:
+        sys.stdout = TeeLogger(orig_stdout, log_f)
+        sys.stderr = TeeLogger(orig_stderr, log_f)
+        print(f"[HPO] Logging to: {log_file}", flush=True)
 
-    # prefer cfg.HPO_DB if you defined it, else fall back to cfg.HPO_DB_PATH
-    hpo_db = getattr(cfg, "HPO_DB", str(Path(cfg.HPO_DIR) / "hpo.db"))
-    study_name = getattr(cfg, "HPO_STUDY_NAME", f"L16_M64_{space}_v2_optimfix")
-    study = _study(hpo_db, name=study_name, seed=42)
+        # prefer cfg.HPO_DB if you defined it, else fall back to cfg.HPO_DB_PATH
+        hpo_db = getattr(cfg, "HPO_DB", str(Path(cfg.HPO_DIR) / "hpo.db"))
+        # Use distinct study names so results don't mix between objectives.
+        mode = str(objective_mode).lower().strip()
+        suffix = "surrogate" if mode == "surrogate" else "mvdr_final"
+        study_name = study_name_override or getattr(cfg, "HPO_STUDY_NAME", f"L16_M64_{space}_v2_{suffix}")
+        study = _study(hpo_db, name=study_name, seed=42)
 
-    print(f"[HPO] storage={hpo_db}  study={study.study_name}  space={space}", flush=True)
+        # Optional: enqueue a fixed list of parameter dicts (used by two-stage rerank).
+        if enqueue_params:
+            for p in enqueue_params:
+                if isinstance(p, dict) and p:
+                    try:
+                        study.enqueue_trial(p)
+                    except Exception:
+                        pass
+
+        print(f"[HPO] storage={hpo_db}  study={study.study_name}  space={space}", flush=True)
 
     def suggest(trial: optuna.Trial):
         # === TIGHTENED SEARCH SPACE ===
@@ -242,11 +432,48 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
                 if "Non-finite gradients detected" in msg:
                     raise optuna.TrialPruned(msg)
                 raise
+
+            # If requested, score this trial via the *actual* MVDR-first inference path.
+            # Note: training still uses surrogate validation for speed/stability; we only change
+            # the objective returned to Optuna.
+            mode = str(objective_mode).lower().strip()
+            final_obj = float(best_val) if best_val is not None else float("inf")
+            if mode != "surrogate":
+                try:
+                    # Load best checkpoint weights into the in-memory model.
+                    best_path = Path(cfg.CKPT_DIR) / "best.pt"
+                    if best_path.exists():
+                        sd = torch.load(str(best_path), map_location="cpu", weights_only=False)
+                        t.model.load_state_dict(sd, strict=False)
+                    n_eval = int(e2e_val_scenes) if (e2e_val_scenes is not None) else int(getattr(cfg, "HPO_E2E_VAL_SCENES", 500))
+                    e2e = _eval_mvdr_final_on_val_subset(
+                        t.model,
+                        n_scenes=n_eval,
+                        seed=int(e2e_seed),
+                        blind_k=bool(e2e_blind_k),
+                    )
+                    final_obj = float(e2e["objective"])
+                    # Store for analysis in Optuna DB/CSV.
+                    for k, v in e2e.items():
+                        try:
+                            trial.set_user_attr(f"e2e_{k}", v)
+                        except Exception:
+                            pass
+                    print(
+                        f"[HPO Trial {trial.number}] E2E(MVDR-final) objective={final_obj:.6f} "
+                        f"(rmseφ={e2e['rmse_phi_mean']:.2f}°, rmseθ={e2e['rmse_theta_mean']:.2f}°, rmse_r={e2e['rmse_r_mean']:.2f}m, "
+                        f"succ={e2e['success_rate']:.3f}, fp/scene={e2e['fp_per_scene']:.2f})",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[HPO Trial {trial.number}] E2E eval failed: {e} -> returning large penalty (1e6)", flush=True)
+                    final_obj = 1e6
+
             # CRITICAL FIX: Handle None/inf values in print
-            if best_val is None or not np.isfinite(best_val):
-                print(f"[HPO Trial {trial.number}] Training completed! Best objective: {best_val} (non-finite)", flush=True)
+            if final_obj is None or not np.isfinite(final_obj):
+                print(f"[HPO Trial {trial.number}] Training completed! Best objective: {final_obj} (non-finite)", flush=True)
             else:
-                print(f"[HPO Trial {trial.number}] Training completed! Best objective: {best_val:.6f}", flush=True)
+                print(f"[HPO Trial {trial.number}] Training completed! Best objective: {final_obj:.6f}", flush=True)
             
             # CRITICAL FIX: Clear memory between HPO trials to prevent memory leaks
             del t
@@ -255,11 +482,11 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
                 torch.cuda.empty_cache()
             
             # CRITICAL FIX: Guard against inf/nan values in HPO objective
-            if not np.isfinite(best_val):
-                print(f"[HPO Trial {trial.number}] Non-finite objective (val={best_val}), returning large penalty (1e6)", flush=True)
+            if not np.isfinite(final_obj):
+                print(f"[HPO Trial {trial.number}] Non-finite objective (val={final_obj}), returning large penalty (1e6)", flush=True)
                 return 1e6
             
-            return float(best_val)
+            return float(final_obj)
         finally:
             cfg.HPO_MODE = False
             # restore mdl_cfg
@@ -272,41 +499,114 @@ def run_hpo(n_trials: int, epochs_per_trial: int, space: str = "wide", export_cs
                 else:
                     setattr(mdl_cfg, k, v)
 
-    # resume-friendly: only run the remaining trials that aren't finished yet
-    done = len(_finished_trials(study))
-    remaining = max(0, n_trials - done)
-    print(f"[HPO] Completed trials: {done}, Remaining trials: {remaining}", flush=True)
-    
-    if remaining > 0:
-        print(f"[HPO] Starting optimization with {remaining} trials...", flush=True)
-        study.optimize(
-            objective,
-            n_trials=remaining,
-            catch=(RuntimeError,),
-            gc_after_trial=True,
-            show_progress_bar=False,
-            n_jobs=1  # CRITICAL: Force sequential trials to avoid memory issues
-        )
-        print(f"[HPO] Optimization completed!", flush=True)
+        # resume-friendly: only run the remaining trials that aren't finished yet
+        done = len(_finished_trials(study))
+        remaining = max(0, n_trials - done)
+        print(f"[HPO] Completed trials: {done}, Remaining trials: {remaining}", flush=True)
+        
+        if remaining > 0:
+            print(f"[HPO] Starting optimization with {remaining} trials...", flush=True)
+            study.optimize(
+                objective,
+                n_trials=remaining,
+                catch=(RuntimeError,),
+                gc_after_trial=True,
+                show_progress_bar=False,
+                n_jobs=1  # CRITICAL: Force sequential trials to avoid memory issues
+            )
+            print(f"[HPO] Optimization completed!", flush=True)
 
-    # persist the winner
-    try:
-        if study.best_trial is not None:
-            _save_hpo_winner(study.best_trial)
-            # Note: best_value is -score (since Optuna minimizes and surrogate score is higher-is-better)
-            actual_score = -study.best_value
-            print(f"[HPO] Best surrogate score={actual_score:.4f} (trial={study.best_trial.number})")
-    except Exception as e:
-        print(f"[HPO] No completed trials yet: {e}")
-
-    if export_csv:
+        # persist the winner
         try:
-            df = study.trials_dataframe()
-            out = Path(cfg.HPO_DIR) / f"{study.study_name}_trials.csv"
-            df.to_csv(out, index=False)
-            print(f"[HPO] Exported trials CSV → {out}")
+            if study.best_trial is not None:
+                _save_hpo_winner(study.best_trial)
+                mode = str(objective_mode).lower().strip()
+                if mode == "surrogate":
+                    # Note: best_value is -score (since Optuna minimizes and surrogate score is higher-is-better)
+                    actual_score = -study.best_value
+                    print(f"[HPO] Best surrogate score={actual_score:.4f} (trial={study.best_trial.number})")
+                else:
+                    print(f"[HPO] Best MVDR-final objective={study.best_value:.6f} (trial={study.best_trial.number})")
         except Exception as e:
-            print(f"[HPO] CSV export skipped: {e}")
+            print(f"[HPO] No completed trials yet: {e}")
+
+        if export_csv:
+            try:
+                df = study.trials_dataframe()
+                out = Path(cfg.HPO_DIR) / f"{study.study_name}_trials.csv"
+                df.to_csv(out, index=False)
+                print(f"[HPO] Exported trials CSV → {out}")
+            except Exception as e:
+                print(f"[HPO] CSV export skipped: {e}")
+    finally:
+        # Restore stdout/stderr so multi-stage orchestration doesn't nest TeeLogger chains.
+        try:
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
+        except Exception:
+            pass
+        try:
+            log_f.close()
+        except Exception:
+            pass
+
+
+def run_hpo_two_stage(
+    *,
+    stage1_trials: int,
+    stage1_epochs: int,
+    stage2_topk: int,
+    stage2_epochs: int,
+    space: str = "wide",
+    early_stop_patience: int = 15,
+    e2e_val_scenes: int = 1000,
+    e2e_seed: int = 0,
+    e2e_blind_k: bool = True,
+):
+    """
+    Two-stage HPO:
+      - Stage 1: many trials, fast surrogate objective
+      - Stage 2: rerank top-K parameter sets using MVDR-first end-to-end objective
+        (re-trains each candidate, then evaluates via hybrid_estimate_final on a fixed val subset).
+    """
+    hpo_db = getattr(cfg, "HPO_DB", str(Path(cfg.HPO_DIR) / "hpo.db"))
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+
+    # Stage 1
+    s1_name = f"L16_M64_{space}_2stage_{stamp}_stage1_surrogate"
+    run_hpo(
+        n_trials=int(stage1_trials),
+        epochs_per_trial=int(stage1_epochs),
+        space=space,
+        export_csv=True,
+        early_stop_patience=early_stop_patience,
+        objective_mode="surrogate",
+        study_name_override=s1_name,
+    )
+
+    # Reload study1 and pick top-K
+    study1 = _study(hpo_db, name=s1_name, seed=42)
+    top = _completed_trials_sorted(study1)[: max(1, int(stage2_topk))]
+    enqueue = [dict(t.params) for t in top if isinstance(t.params, dict)]
+
+    print(f"[HPO2] Stage1 best value={float(study1.best_value):.6f} (trial={study1.best_trial.number})", flush=True)
+    print(f"[HPO2] Reranking top-K={len(enqueue)} via MVDR-final objective...", flush=True)
+
+    # Stage 2
+    s2_name = f"L16_M64_{space}_2stage_{stamp}_stage2_mvdr_final"
+    run_hpo(
+        n_trials=len(enqueue),
+        epochs_per_trial=int(stage2_epochs),
+        space=space,
+        export_csv=True,
+        early_stop_patience=early_stop_patience,
+        objective_mode="mvdr_final",
+        e2e_val_scenes=int(e2e_val_scenes),
+        e2e_seed=int(e2e_seed),
+        e2e_blind_k=bool(e2e_blind_k),
+        enqueue_params=enqueue,
+        study_name_override=s2_name,
+    )
 
 
 

@@ -89,6 +89,27 @@ def main():
     g.add_argument("--hpo-epochs", type=int, default=40)  # ICC FIX: 40 epochs for proper exploration
     g.add_argument("--space", choices=["small","wide","xl"], default="wide")
     g.add_argument("--early-stop-patience", type=int, default=15, help="Early stopping patience (epochs)")  # ICC FIX: patience=15
+    g.add_argument(
+        "--objective",
+        choices=["surrogate", "mvdr_final"],
+        default="surrogate",
+        help="HPO objective: fast surrogate (default) or end-to-end MVDR-first inference scoring (slower, aligned to production).",
+    )
+    g.add_argument("--e2e-val-scenes", type=int, default=500, help="Scenes for MVDR-final eval per trial (objective=mvdr_final)")
+    g.add_argument("--e2e-seed", type=int, default=0, help="RNG seed for selecting the fixed MVDR-final eval subset")
+    g.add_argument("--e2e-oracle-k", action="store_true", help="Use oracle K during MVDR-final eval (default is blind-K via MDL)")
+
+    # --- HPO2 (two-stage): surrogate search -> MVDR-final rerank of top-K ---
+    g2h = sub.add_parser("hpo2", help="Two-stage HPO: fast surrogate search, then MVDR-final rerank of top-K")
+    g2h.add_argument("--space", choices=["small","wide","xl"], default="wide")
+    g2h.add_argument("--stage1-trials", type=int, default=200)
+    g2h.add_argument("--stage1-epochs", type=int, default=20)
+    g2h.add_argument("--stage2-topk", type=int, default=25)
+    g2h.add_argument("--stage2-epochs", type=int, default=20)
+    g2h.add_argument("--early-stop-patience", type=int, default=15)
+    g2h.add_argument("--e2e-val-scenes", type=int, default=1000)
+    g2h.add_argument("--e2e-seed", type=int, default=0)
+    g2h.add_argument("--e2e-oracle-k", action="store_true")
 
     # --- quick bench (legacy scatter sanity, writes gt_phi0 vs pred_phi0) ---
     g_bench = sub.add_parser("bench", help="Quick bench: writes pairs [gt_phi0, pred_phi0] CSV")
@@ -177,7 +198,30 @@ def main():
 
     elif args.cmd == "hpo":
         from .hpo import run_hpo
-        run_hpo(n_trials=args.trials, epochs_per_trial=args.hpo_epochs, space=args.space, export_csv=True, early_stop_patience=args.early_stop_patience)
+        run_hpo(
+            n_trials=args.trials,
+            epochs_per_trial=args.hpo_epochs,
+            space=args.space,
+            export_csv=True,
+            early_stop_patience=args.early_stop_patience,
+            objective_mode=str(getattr(args, "objective", "surrogate")),
+            e2e_val_scenes=int(getattr(args, "e2e_val_scenes", 500)),
+            e2e_seed=int(getattr(args, "e2e_seed", 0)),
+            e2e_blind_k=not bool(getattr(args, "e2e_oracle_k", False)),
+        )
+    elif args.cmd == "hpo2":
+        from .hpo import run_hpo_two_stage
+        run_hpo_two_stage(
+            stage1_trials=int(getattr(args, "stage1_trials", 200)),
+            stage1_epochs=int(getattr(args, "stage1_epochs", 20)),
+            stage2_topk=int(getattr(args, "stage2_topk", 25)),
+            stage2_epochs=int(getattr(args, "stage2_epochs", 20)),
+            space=str(getattr(args, "space", "wide")),
+            early_stop_patience=int(getattr(args, "early_stop_patience", 15)),
+            e2e_val_scenes=int(getattr(args, "e2e_val_scenes", 1000)),
+            e2e_seed=int(getattr(args, "e2e_seed", 0)),
+            e2e_blind_k=not bool(getattr(args, "e2e_oracle_k", False)),
+        )
 
     elif args.cmd == "bench":
         # Quick sanity bench (scatter CSV)
