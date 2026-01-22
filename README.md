@@ -54,14 +54,18 @@ python -m ris_pytorch_pipeline.ris_pipeline pregen-split \
     --out_dir data_shards_M64_L16
 ```
 
-### 3. Run HPO (Stage 1)
+### 3. Run HPO (Recommended: Two-stage)
 
 ```bash
-python -m ris_pytorch_pipeline.ris_pipeline hpo \
-    --trials 50 \
-    --hpo-epochs 20 \
+# Stage 1: fast surrogate search
+# Stage 2: MVDR-first end-to-end rerank of top-K (production-aligned)
+python -m ris_pytorch_pipeline.ris_pipeline hpo2 \
     --space wide \
-    --early-stop-patience 6
+    --stage1-trials 300 \
+    --stage1-epochs 15 \
+    --stage2-topk 40 \
+    --stage2-epochs 20 \
+    --e2e-val-scenes 2000
 ```
 
 ### 4. Train Backbone (Stage 2)
