@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 22, 2026 (MVDR-final HPO objective + two-stage HPO runner)
+**Last Updated:** January 23, 2026 (MVDR-final HPO objective corrected + continuity fix)
 
 ---
 
@@ -881,5 +881,35 @@ python -m ris_pytorch_pipeline.ris_pipeline hpo --objective mvdr_final --trials 
 # Two-stage HPO (recommended when budget allows)
 python -m ris_pytorch_pipeline.ris_pipeline hpo2 --stage1-trials 300 --stage1-epochs 15 --stage2-topk 40 --stage2-epochs 20 --e2e-val-scenes 2000
 ```
+
+---
+
+## 13) MVDR-final HPO objective corrected (TP/FN/FP) + continuous localization term
+
+**Why:** The end-to-end HPO objective directly drives production quality. We updated it to be both **correct** (TP/FP/FN computed from tolerance-gated Hungarian matches) and **smooth** (localization term computed over all matched pairs, not just TPs).
+
+**Files:**
+- `ris_pytorch_pipeline/hpo.py`
+- `ris_pytorch_pipeline/eval_angles.py` (Hungarian pairing helper)
+- `ris_pytorch_pipeline/configs.py` (objective knobs)
+
+**Objective (minimize):**
+```
+objective = (rmse_xyz_all / xyz_norm) + f1_weight * (1 - F1)
+```
+
+**Definitions:**
+- `rmse_xyz_all`: 3D position RMSE (meters) over **all** Hungarian pairs (ungated) → smooth signal even for near-miss predictions
+- `F1`: 2·P·R/(P+R) with P=TP/(TP+FP), R=TP/(TP+FN)
+- `TP`: Hungarian-matched pairs **within** (φ, θ, r) tolerances
+- `FP`: predictions without a good match (`num_pred - TP`)
+- `FN`: GTs without a good match (`num_gt - TP`)
+
+**Edge-case behavior:**
+- If no matched pairs: `rmse_xyz_all = xyz_norm` (max penalty) and `F1=0`
+- Perfect detection: `F1=1`, objective reduces to localization error only
+
+**Backward compatibility:**
+- Legacy objective still computed and logged as `objective_legacy` with legacy FP/FN semantics for comparison.
 
 *End of Changelog*

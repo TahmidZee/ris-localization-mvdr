@@ -69,17 +69,18 @@ def _eval_mvdr_final_on_val_subset(
     End-to-end evaluation for HPO: run MVDR-first inference and compute production-aligned metrics.
 
     OBJECTIVE FUNCTION (minimize):
-        objective = (rmse_xyz / xyz_norm) + f1_weight * (1 - F1)
+        objective = (rmse_xyz_all / xyz_norm) + f1_weight * (1 - F1)
 
     where:
-        - rmse_xyz: RMSE of 3D Euclidean position error (meters) over TRUE POSITIVE matches only
+        - rmse_xyz_all: RMSE of 3D Euclidean position error (meters) over ALL Hungarian pairs (ungated)
+          → provides a smooth/continuous localization signal even for near-miss predictions
         - F1: 2*P*R/(P+R) with P=TP/(TP+FP), R=TP/(TP+FN)
         - TP: Hungarian-matched pairs within (phi, theta, r) tolerances
         - FP: predictions without a good match (= num_pred - TP)
         - FN: GTs without a good match (= num_gt - TP)
 
     Edge cases:
-        - If TP=0 (model predicts nothing useful): rmse_xyz=xyz_norm (max penalty), F1=0 → high objective
+        - If no matched pairs: rmse_xyz_all=xyz_norm (max penalty), F1=0 → high objective
         - Perfect detection (all GTs matched, no extras): F1=1 → only localization term matters
 
     This directly optimizes what we care about for SOTA near-field localization:
@@ -128,7 +129,9 @@ def _eval_mvdr_final_on_val_subset(
     legacy_fp = 0
     legacy_fn = 0
     total_num_gt = 0
-    xyz_sqerr_sum = 0.0
+    xyz_all_sqerr_sum = 0.0
+    xyz_all_count = 0
+    xyz_tp_sqerr_sum = 0.0
     xyz_tp_count = 0
 
     model.eval()
@@ -199,12 +202,17 @@ def _eval_mvdr_final_on_val_subset(
             dth = float(abs(tht[pi] - gt_th_deg[gi]))
             dr = float(abs(rr[pi] - gt_r_m[gi]))
             ok = (dphi <= tol_phi) and (dth <= tol_theta) and (dr <= tol_r)
+
+            # Always accumulate ungated xyz error (continuity for objective).
+            p_xyz = _sph_to_xyz(ph[pi], tht[pi], rr[pi])
+            g_xyz = _sph_to_xyz(gt_phi_deg[gi], gt_th_deg[gi], gt_r_m[gi])
+            de = float(np.linalg.norm(p_xyz - g_xyz))
+            xyz_all_sqerr_sum += de * de
+            xyz_all_count += 1
+
             if ok:
-                # Accumulate xyz squared error for TPs only
-                p_xyz = _sph_to_xyz(ph[pi], tht[pi], rr[pi])
-                g_xyz = _sph_to_xyz(gt_phi_deg[gi], gt_th_deg[gi], gt_r_m[gi])
-                de = float(np.linalg.norm(p_xyz - g_xyz))
-                xyz_sqerr_sum += de * de
+                # Also track TP-only xyz error for diagnostics.
+                xyz_tp_sqerr_sum += de * de
                 xyz_tp_count += 1
                 tp_scene += 1
 
@@ -232,13 +240,19 @@ def _eval_mvdr_final_on_val_subset(
     recall = float(total_tp) / max(1.0, float(total_tp + total_fn))
     f1 = (2.0 * precision * recall) / max(1e-12, (precision + recall))
 
-    # xyz RMSE: only over TPs. If no TPs, penalize heavily (use norm as fallback).
+    # xyz RMSE over ALL matched pairs (ungated): smooth, continuous objective signal.
     xyz_norm = float(getattr(cfg, "HPO_E2E_XYZ_NORM_M", 0.5))
-    if xyz_tp_count > 0:
-        rmse_xyz_mean = float(np.sqrt(xyz_sqerr_sum / float(xyz_tp_count)))
+    if xyz_all_count > 0:
+        rmse_xyz_mean = float(np.sqrt(xyz_all_sqerr_sum / float(xyz_all_count)))
     else:
-        # No TPs at all → max penalty (= norm, so normalized term = 1.0)
+        # No matched pairs at all → max penalty (= norm, so normalized term = 1.0)
         rmse_xyz_mean = xyz_norm
+
+    # TP-only xyz RMSE (diagnostic, reflects localization quality when detection is correct)
+    if xyz_tp_count > 0:
+        rmse_xyz_tp = float(np.sqrt(xyz_tp_sqerr_sum / float(xyz_tp_count)))
+    else:
+        rmse_xyz_tp = float("inf")
 
     f1_w = float(getattr(cfg, "HPO_E2E_F1_WEIGHT", 2.0))
     objective_xyz_f1 = (rmse_xyz_mean / max(1e-12, xyz_norm)) + f1_w * (1.0 - f1)
@@ -257,6 +271,7 @@ def _eval_mvdr_final_on_val_subset(
         fn_per_scene_legacy=fn_per_scene_legacy,
         # Detection metrics (corrected)
         rmse_xyz_mean=rmse_xyz_mean,
+        rmse_xyz_tp=rmse_xyz_tp,
         precision=precision,
         recall=recall,
         f1=f1,
