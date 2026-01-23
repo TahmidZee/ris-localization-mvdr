@@ -14,7 +14,7 @@ from .configs import cfg, mdl_cfg, set_seed
 from .train import Trainer
 from .dataset import ShardNPZDataset
 from .infer import hybrid_estimate_final
-from .eval_angles import eval_scene_angles_ranges
+from .eval_angles import eval_scene_angles_ranges, hungarian_pairs_angles_ranges
 
 
 def _resolve_val_dir() -> Path:
@@ -85,12 +85,27 @@ def _eval_mvdr_final_on_val_subset(
     tol_theta = float(getattr(cfg, "SURROGATE_DET_TOL_THETA_DEG", 5.0))
     tol_r = float(getattr(cfg, "SURROGATE_DET_TOL_R_M", 1.0))
 
+    def _sph_to_xyz(phi_deg: np.ndarray, theta_deg: np.ndarray, r_m: np.ndarray) -> np.ndarray:
+        """Convert (phi, theta, r) in degrees/meters to xyz in meters (consistent for pred+gt)."""
+        phi = np.deg2rad(np.asarray(phi_deg, dtype=np.float64))
+        th = np.deg2rad(np.asarray(theta_deg, dtype=np.float64))
+        r = np.asarray(r_m, dtype=np.float64)
+        x = r * np.cos(th) * np.cos(phi)
+        y = r * np.cos(th) * np.sin(phi)
+        z = r * np.sin(th)
+        return np.stack([x, y, z], axis=-1)
+
     rmse_phi_list: list[float] = []
     rmse_theta_list: list[float] = []
     rmse_r_list: list[float] = []
     succ = 0
     fp = 0
     fn = 0
+
+    # New: detection+meter-domain tracking
+    tp = 0
+    xyz_sqerr_sum = 0.0
+    xyz_tp_count = 0
 
     model.eval()
     for i in idx:
@@ -144,6 +159,23 @@ def _eval_mvdr_final_on_val_subset(
         fp += max(0, int(err.get("num_pred", 0)) - int(err.get("num_gt", 0)))
         fn += max(0, int(err.get("num_gt", 0)) - int(err.get("num_pred", 0)))
 
+        # --- New objective ingredients: TP/FP/FN via tolerance-gated Hungarian matches + xyz RMSE ---
+        pairs = hungarian_pairs_angles_ranges(ph, tht, rr, gt_phi_deg, gt_th_deg, gt_r_m)
+        tp_scene = 0
+        for pi, gi in pairs:
+            dphi = float(abs(ph[pi] - gt_phi_deg[gi]))
+            dth = float(abs(tht[pi] - gt_th_deg[gi]))
+            dr = float(abs(rr[pi] - gt_r_m[gi]))
+            ok = (dphi <= tol_phi) and (dth <= tol_theta) and (dr <= tol_r)
+            if ok:
+                p_xyz = _sph_to_xyz(ph[pi], tht[pi], rr[pi])
+                g_xyz = _sph_to_xyz(gt_phi_deg[gi], gt_th_deg[gi], gt_r_m[gi])
+                de = float(np.linalg.norm(p_xyz - g_xyz))
+                xyz_sqerr_sum += de * de
+                xyz_tp_count += 1
+                tp_scene += 1
+        tp += tp_scene
+
     rmse_phi_mean = float(np.mean(rmse_phi_list)) if rmse_phi_list else float("inf")
     rmse_theta_mean = float(np.mean(rmse_theta_list)) if rmse_theta_list else float("inf")
     rmse_r_mean = float(np.mean(rmse_r_list)) if rmse_r_list else float("inf")
@@ -151,9 +183,23 @@ def _eval_mvdr_final_on_val_subset(
     fp_per_scene = float(fp) / max(1.0, float(N))
     fn_per_scene = float(fn) / max(1.0, float(N))
 
-    # Composite objective: lower is better.
-    objective = (rmse_phi_mean / phi_norm) + (rmse_theta_mean / theta_norm) + (rmse_r_mean / r_norm) - success_rate
-    objective += 0.25 * fp_per_scene + 0.25 * fn_per_scene
+    # Legacy composite (kept for reporting/comparison)
+    objective_legacy = (rmse_phi_mean / phi_norm) + (rmse_theta_mean / theta_norm) + (rmse_r_mean / r_norm) - success_rate
+    objective_legacy += 0.25 * fp_per_scene + 0.25 * fn_per_scene
+
+    # New production-aligned objective (default): optimize set detection quality + meter-domain localization error.
+    # TP are Hungarian matches within (phi/theta/r) tolerances; F1 penalizes both FP and FN.
+    precision = float(tp) / max(1.0, float(tp + fp))
+    recall = float(tp) / max(1.0, float(tp + fn))
+    f1 = (2.0 * precision * recall) / max(1e-12, (precision + recall))
+    rmse_xyz_mean = float(np.sqrt(xyz_sqerr_sum / max(1.0, float(xyz_tp_count))))
+
+    xyz_norm = float(getattr(cfg, "HPO_E2E_XYZ_NORM_M", 0.5))
+    f1_w = float(getattr(cfg, "HPO_E2E_F1_WEIGHT", 2.0))
+    objective_xyz_f1 = (rmse_xyz_mean / max(1e-12, xyz_norm)) + f1_w * (1.0 - f1)
+
+    mode = str(getattr(cfg, "HPO_E2E_OBJECTIVE", "xyz_f1")).lower().strip()
+    objective = objective_xyz_f1 if mode != "legacy" else float(objective_legacy)
 
     return dict(
         rmse_phi_mean=rmse_phi_mean,
@@ -162,6 +208,13 @@ def _eval_mvdr_final_on_val_subset(
         success_rate=success_rate,
         fp_per_scene=fp_per_scene,
         fn_per_scene=fn_per_scene,
+        # New metrics
+        rmse_xyz_mean=rmse_xyz_mean,
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        tp=int(tp),
+        objective_legacy=float(objective_legacy),
         objective=float(objective),
         n_scenes=int(N),
     )
@@ -474,8 +527,10 @@ def run_hpo(
                                 pass
                         print(
                             f"[HPO Trial {trial.number}] E2E(MVDR-final) objective={final_obj:.6f} "
-                            f"(rmseφ={e2e['rmse_phi_mean']:.2f}°, rmseθ={e2e['rmse_theta_mean']:.2f}°, rmse_r={e2e['rmse_r_mean']:.2f}m, "
-                            f"succ={e2e['success_rate']:.3f}, fp/scene={e2e['fp_per_scene']:.2f})",
+                        f"(rmse_xyz={e2e.get('rmse_xyz_mean', float('nan')):.3f}m, "
+                        f"F1={e2e.get('f1', float('nan')):.3f}, "
+                        f"rmseφ={e2e['rmse_phi_mean']:.2f}°, rmseθ={e2e['rmse_theta_mean']:.2f}°, rmse_r={e2e['rmse_r_mean']:.2f}m, "
+                        f"succ={e2e['success_rate']:.3f}, fp/scene={e2e['fp_per_scene']:.2f})",
                             flush=True,
                         )
                     except Exception as e:

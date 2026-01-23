@@ -205,6 +205,36 @@ def eval_scene_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_g
     }
 
 
+def hungarian_pairs_angles_ranges(phi_pred, theta_pred, r_pred, phi_gt, theta_gt, r_gt):
+    """
+    Return Hungarian-matched (pred_idx, gt_idx) pairs for (phi, theta, r).
+
+    This is useful when downstream code needs the actual index mapping (e.g. to compute
+    Cartesian errors in meters), not just aggregated RMSEs.
+    """
+    phi_pred = np.asarray(phi_pred, dtype=np.float64).reshape(-1)
+    theta_pred = np.asarray(theta_pred, dtype=np.float64).reshape(-1)
+    r_pred = np.asarray(r_pred, dtype=np.float64).reshape(-1)
+    phi_gt = np.asarray(phi_gt, dtype=np.float64).reshape(-1)
+    theta_gt = np.asarray(theta_gt, dtype=np.float64).reshape(-1)
+    r_gt = np.asarray(r_gt, dtype=np.float64).reshape(-1)
+
+    Kp, Kg = len(phi_pred), len(phi_gt)
+    if Kp == 0 or Kg == 0:
+        return []
+
+    C = _angle_cost_matrix(phi_pred, theta_pred, phi_gt, theta_gt, r_pred, r_gt).astype(np.float64)
+    r_idx, c_idx = _hungarian_assign(C.copy())
+    m = min(Kp, Kg)
+    pairs: list[tuple[int, int]] = []
+    for i in range(m):
+        pi = int(r_idx[i])
+        gi = int(c_idx[i])
+        if 0 <= pi < Kp and 0 <= gi < Kg:
+            pairs.append((pi, gi))
+    return pairs
+
+
 def eval_batch_angles_ranges(pred_batch, gt_batch):
     """
     Evaluate a batch of predictions

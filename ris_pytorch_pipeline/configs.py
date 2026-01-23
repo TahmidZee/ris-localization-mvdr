@@ -130,6 +130,14 @@ class SysConfig:
         self.HPO_E2E_SEED = 0
         self.HPO_E2E_BLIND_K = True
 
+        # HPO end-to-end (MVDR-first) objective design.
+        # Goal: optimize *set localization* quality in meters (near-field), not just per-axis RMSE.
+        # - "xyz_f1": Hungarian match, compute 3D Cartesian RMSE over true-positives, plus an (1-F1) term.
+        # - "legacy": previous composite based on per-axis RMSEs and success_rate.
+        self.HPO_E2E_OBJECTIVE = "xyz_f1"
+        self.HPO_E2E_XYZ_NORM_M = 0.5     # meters; normalization for RMSE_xyz in objective
+        self.HPO_E2E_F1_WEIGHT = 2.0      # weight for (1 - F1) in objective (dimensionless)
+
         # Inference policy (use HPO knobs for Newton+range grid)
         # K-free policy: do NOT use MDL/AIC in the production inference path.
         # Keep MDL as a debug/ablation knob only (see infer.py).
