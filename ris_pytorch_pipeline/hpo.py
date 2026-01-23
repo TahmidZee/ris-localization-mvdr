@@ -125,6 +125,8 @@ def _eval_mvdr_final_on_val_subset(
     total_tp = 0
     total_fp = 0
     total_fn = 0
+    legacy_fp = 0
+    legacy_fn = 0
     total_num_gt = 0
     xyz_sqerr_sum = 0.0
     xyz_tp_count = 0
@@ -182,6 +184,10 @@ def _eval_mvdr_final_on_val_subset(
 
         succ += int(bool(err.get("success_flag", False)))
 
+        # Legacy FP/FN based on count difference (kept for backward-comparable metric only).
+        legacy_fp += max(0, num_pred - num_gt)
+        legacy_fn += max(0, num_gt - num_pred)
+
         # --- CORRECTED TP/FP/FN: tolerance-gated Hungarian matching ---
         # TP = matched pairs within tolerance
         # FP = num_pred - TP (predictions without good match)
@@ -213,10 +219,12 @@ def _eval_mvdr_final_on_val_subset(
     success_rate = float(succ) / max(1.0, float(N))
     fp_per_scene = float(total_fp) / max(1.0, float(N))
     fn_per_scene = float(total_fn) / max(1.0, float(N))
+    fp_per_scene_legacy = float(legacy_fp) / max(1.0, float(N))
+    fn_per_scene_legacy = float(legacy_fn) / max(1.0, float(N))
 
     # Legacy composite (kept for reporting/comparison)
     objective_legacy = (rmse_phi_mean / phi_norm) + (rmse_theta_mean / theta_norm) + (rmse_r_mean / r_norm) - success_rate
-    objective_legacy += 0.25 * fp_per_scene + 0.25 * fn_per_scene
+    objective_legacy += 0.25 * fp_per_scene_legacy + 0.25 * fn_per_scene_legacy
 
     # --- Production-aligned objective (default): detection quality + meter-domain localization ---
     # Precision = TP / (TP + FP), Recall = TP / (TP + FN), F1 = 2PR/(P+R)
@@ -245,6 +253,8 @@ def _eval_mvdr_final_on_val_subset(
         success_rate=success_rate,
         fp_per_scene=fp_per_scene,
         fn_per_scene=fn_per_scene,
+        fp_per_scene_legacy=fp_per_scene_legacy,
+        fn_per_scene_legacy=fn_per_scene_legacy,
         # Detection metrics (corrected)
         rmse_xyz_mean=rmse_xyz_mean,
         precision=precision,
