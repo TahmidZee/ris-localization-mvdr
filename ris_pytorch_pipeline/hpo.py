@@ -66,8 +66,26 @@ def _eval_mvdr_final_on_val_subset(
     blind_k: bool = True,
 ) -> dict:
     """
-    End-to-end eval: run MVDR-first inference (hybrid_estimate_final) and compute
-    Hungarian-matched RMSEs + success rate on a fixed validation subset.
+    End-to-end evaluation for HPO: run MVDR-first inference and compute production-aligned metrics.
+
+    OBJECTIVE FUNCTION (minimize):
+        objective = (rmse_xyz / xyz_norm) + f1_weight * (1 - F1)
+
+    where:
+        - rmse_xyz: RMSE of 3D Euclidean position error (meters) over TRUE POSITIVE matches only
+        - F1: 2*P*R/(P+R) with P=TP/(TP+FP), R=TP/(TP+FN)
+        - TP: Hungarian-matched pairs within (phi, theta, r) tolerances
+        - FP: predictions without a good match (= num_pred - TP)
+        - FN: GTs without a good match (= num_gt - TP)
+
+    Edge cases:
+        - If TP=0 (model predicts nothing useful): rmse_xyz=xyz_norm (max penalty), F1=0 → high objective
+        - Perfect detection (all GTs matched, no extras): F1=1 → only localization term matters
+
+    This directly optimizes what we care about for SOTA near-field localization:
+        1. Find all sources (recall)
+        2. Don't hallucinate extra sources (precision)
+        3. Localize found sources accurately in 3D space (rmse_xyz)
     """
     val_dir = _resolve_val_dir()
     ds = ShardNPZDataset(val_dir)
@@ -99,11 +117,15 @@ def _eval_mvdr_final_on_val_subset(
     rmse_theta_list: list[float] = []
     rmse_r_list: list[float] = []
     succ = 0
-    fp = 0
-    fn = 0
 
-    # New: detection+meter-domain tracking
-    tp = 0
+    # --- Detection+localization tracking (corrected) ---
+    # TP: matched pairs within tolerance
+    # FP: predictions that don't match any GT within tolerance
+    # FN: GTs that weren't matched within tolerance
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_num_gt = 0
     xyz_sqerr_sum = 0.0
     xyz_tp_count = 0
 
@@ -111,6 +133,8 @@ def _eval_mvdr_final_on_val_subset(
     for i in idx:
         it = ds[int(i)]
         gt_phi_deg, gt_th_deg, gt_r_m = _ptr_to_gt_deg(it)
+        num_gt = len(gt_phi_deg)
+        total_num_gt += num_gt
 
         s = {
             "y": it["y"],
@@ -137,6 +161,7 @@ def _eval_mvdr_final_on_val_subset(
         ph = np.rad2deg(np.asarray(ph, dtype=np.float32))
         tht = np.rad2deg(np.asarray(tht, dtype=np.float32))
         rr = np.asarray(rr, dtype=np.float32)
+        num_pred = len(ph)
 
         err = eval_scene_angles_ranges(
             ph,
@@ -150,16 +175,17 @@ def _eval_mvdr_final_on_val_subset(
             success_tol_r=tol_r,
         )
 
-        # Penalize empty/invalid preds by using norm-scale errors
+        # Penalize empty/invalid preds by using norm-scale errors (for legacy metrics)
         rmse_phi_list.append(float(err["rmse_phi"]) if err["rmse_phi"] is not None else phi_norm)
         rmse_theta_list.append(float(err["rmse_theta"]) if err["rmse_theta"] is not None else theta_norm)
         rmse_r_list.append(float(err["rmse_r"]) if err["rmse_r"] is not None else r_norm)
 
         succ += int(bool(err.get("success_flag", False)))
-        fp += max(0, int(err.get("num_pred", 0)) - int(err.get("num_gt", 0)))
-        fn += max(0, int(err.get("num_gt", 0)) - int(err.get("num_pred", 0)))
 
-        # --- New objective ingredients: TP/FP/FN via tolerance-gated Hungarian matches + xyz RMSE ---
+        # --- CORRECTED TP/FP/FN: tolerance-gated Hungarian matching ---
+        # TP = matched pairs within tolerance
+        # FP = num_pred - TP (predictions without good match)
+        # FN = num_gt - TP (GTs without good match)
         pairs = hungarian_pairs_angles_ranges(ph, tht, rr, gt_phi_deg, gt_th_deg, gt_r_m)
         tp_scene = 0
         for pi, gi in pairs:
@@ -168,33 +194,44 @@ def _eval_mvdr_final_on_val_subset(
             dr = float(abs(rr[pi] - gt_r_m[gi]))
             ok = (dphi <= tol_phi) and (dth <= tol_theta) and (dr <= tol_r)
             if ok:
+                # Accumulate xyz squared error for TPs only
                 p_xyz = _sph_to_xyz(ph[pi], tht[pi], rr[pi])
                 g_xyz = _sph_to_xyz(gt_phi_deg[gi], gt_th_deg[gi], gt_r_m[gi])
                 de = float(np.linalg.norm(p_xyz - g_xyz))
                 xyz_sqerr_sum += de * de
                 xyz_tp_count += 1
                 tp_scene += 1
-        tp += tp_scene
+
+        # Correct FP/FN based on TP, not count difference
+        total_tp += tp_scene
+        total_fp += max(0, num_pred - tp_scene)  # Extra predictions
+        total_fn += max(0, num_gt - tp_scene)    # Missed GTs
 
     rmse_phi_mean = float(np.mean(rmse_phi_list)) if rmse_phi_list else float("inf")
     rmse_theta_mean = float(np.mean(rmse_theta_list)) if rmse_theta_list else float("inf")
     rmse_r_mean = float(np.mean(rmse_r_list)) if rmse_r_list else float("inf")
     success_rate = float(succ) / max(1.0, float(N))
-    fp_per_scene = float(fp) / max(1.0, float(N))
-    fn_per_scene = float(fn) / max(1.0, float(N))
+    fp_per_scene = float(total_fp) / max(1.0, float(N))
+    fn_per_scene = float(total_fn) / max(1.0, float(N))
 
     # Legacy composite (kept for reporting/comparison)
     objective_legacy = (rmse_phi_mean / phi_norm) + (rmse_theta_mean / theta_norm) + (rmse_r_mean / r_norm) - success_rate
     objective_legacy += 0.25 * fp_per_scene + 0.25 * fn_per_scene
 
-    # New production-aligned objective (default): optimize set detection quality + meter-domain localization error.
-    # TP are Hungarian matches within (phi/theta/r) tolerances; F1 penalizes both FP and FN.
-    precision = float(tp) / max(1.0, float(tp + fp))
-    recall = float(tp) / max(1.0, float(tp + fn))
+    # --- Production-aligned objective (default): detection quality + meter-domain localization ---
+    # Precision = TP / (TP + FP), Recall = TP / (TP + FN), F1 = 2PR/(P+R)
+    precision = float(total_tp) / max(1.0, float(total_tp + total_fp))
+    recall = float(total_tp) / max(1.0, float(total_tp + total_fn))
     f1 = (2.0 * precision * recall) / max(1e-12, (precision + recall))
-    rmse_xyz_mean = float(np.sqrt(xyz_sqerr_sum / max(1.0, float(xyz_tp_count))))
 
+    # xyz RMSE: only over TPs. If no TPs, penalize heavily (use norm as fallback).
     xyz_norm = float(getattr(cfg, "HPO_E2E_XYZ_NORM_M", 0.5))
+    if xyz_tp_count > 0:
+        rmse_xyz_mean = float(np.sqrt(xyz_sqerr_sum / float(xyz_tp_count)))
+    else:
+        # No TPs at all → max penalty (= norm, so normalized term = 1.0)
+        rmse_xyz_mean = xyz_norm
+
     f1_w = float(getattr(cfg, "HPO_E2E_F1_WEIGHT", 2.0))
     objective_xyz_f1 = (rmse_xyz_mean / max(1e-12, xyz_norm)) + f1_w * (1.0 - f1)
 
@@ -208,12 +245,15 @@ def _eval_mvdr_final_on_val_subset(
         success_rate=success_rate,
         fp_per_scene=fp_per_scene,
         fn_per_scene=fn_per_scene,
-        # New metrics
+        # Detection metrics (corrected)
         rmse_xyz_mean=rmse_xyz_mean,
         precision=precision,
         recall=recall,
         f1=f1,
-        tp=int(tp),
+        tp=int(total_tp),
+        fp=int(total_fp),
+        fn=int(total_fn),
+        total_gt=int(total_num_gt),
         objective_legacy=float(objective_legacy),
         objective=float(objective),
         n_scenes=int(N),
@@ -526,11 +566,11 @@ def run_hpo(
                             except Exception:
                                 pass
                         print(
-                            f"[HPO Trial {trial.number}] E2E(MVDR-final) objective={final_obj:.6f} "
-                        f"(rmse_xyz={e2e.get('rmse_xyz_mean', float('nan')):.3f}m, "
-                        f"F1={e2e.get('f1', float('nan')):.3f}, "
-                        f"rmseφ={e2e['rmse_phi_mean']:.2f}°, rmseθ={e2e['rmse_theta_mean']:.2f}°, rmse_r={e2e['rmse_r_mean']:.2f}m, "
-                        f"succ={e2e['success_rate']:.3f}, fp/scene={e2e['fp_per_scene']:.2f})",
+                            f"[HPO Trial {trial.number}] E2E(MVDR-final) obj={final_obj:.4f} "
+                            f"rmse_xyz={e2e.get('rmse_xyz_mean', float('nan')):.3f}m "
+                            f"F1={e2e.get('f1', 0):.3f} (P={e2e.get('precision', 0):.3f} R={e2e.get('recall', 0):.3f}) "
+                            f"TP={e2e.get('tp', 0)}/{e2e.get('total_gt', 0)} "
+                            f"FP={e2e.get('fp', 0)} FN={e2e.get('fn', 0)}",
                             flush=True,
                         )
                     except Exception as e:
