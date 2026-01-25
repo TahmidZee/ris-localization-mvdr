@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 23, 2026 (MVDR-final HPO objective corrected + continuity fix)
+**Last Updated:** January 25, 2026 (R_samp fixed end-to-end: generation + construction + call-sites + regression test)
 
 ---
 
@@ -52,6 +52,21 @@ This document details all code changes made to transition from a K-head classifi
 ## Guardrails & Regression Tests (NEW, post initial rollout)
 
 These changes were added after reviewing failure modes observed in logs (e.g. seemingly-worse surrogate aux RMSE and FP-heavy peak picking) and to prevent “train on one physics transform, infer on another”.
+
+---
+
+## 12) R_samp end-to-end fix (data generation + covariance construction + call-sites)
+
+**Why:** Diagnostics showed **MVDR works on `R` (GT covariance) but fails on `R_samp` (sample covariance)**. This poisoned hybrid blending (`R_eff=(1-β)R_pred+βR_samp`) and could derail Stage-2 HPO / MVDR-final evaluation.
+
+**Fixes:**
+- **`dataset.py`**: Make source symbols vary over snapshots (`s` is `[L,K]`), update `y_clean` generation to use `s[l]`, and compute `R_true` from average per-source power across snapshots.
+- **`angle_pipeline.py`**: Rewrite `build_sample_covariance_from_snapshots()` to compute a true sample covariance \(R_{samp}=\\frac{1}{L}\\sum x_{hat}x_{hat}^H\) without mean-centering; accept `H` as `[M,N]` or `[L,M,N]`; add configurable solver (`RSAMP_SOLVER`).
+- **`baseline.py`**: Replace the old rank-1 `incident_cov_from_snaps()` behavior with a wrapper that delegates to `build_sample_covariance_from_snapshots()`.
+- **`infer.py`**: Fix `hybrid_estimate_raw()` to only build `R_samp` from `H_full` (or use precomputed `R_samp`); stop repeating `H_full` unnecessarily in `hybrid_estimate_final()`.
+- **`regression_tests.py`**: Add `r_samp` sanity test (mmap-based, lightweight) to prevent silent regressions.
+
+**Report:** `R_SAMP_FIX_REPORT_20260125.md`
 
 ### 1) Aux is now permutation-invariant end-to-end (validation **and** training)
 

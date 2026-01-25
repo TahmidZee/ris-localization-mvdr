@@ -1971,16 +1971,23 @@ class Trainer:
         theta_rmse = float(np.sqrt(np.mean(np.square(aux_theta_err)))) if aux_theta_err else 0.0
         r_rmse = float(np.sqrt(np.mean(np.square(aux_r_err)))) if aux_r_err else 0.0
         
-        # Composite score (higher is better)
+        # Composite score (higher is better).
+        #
+        # NOTE: During HPO we want a surrogate that correlates with MVDR-first inference quality.
+        # If SURROGATE_PEAK_METRICS is enabled, incorporate peak-level detection F1 and FP/scene.
         w = getattr(cfg, "SURROGATE_METRIC_WEIGHTS", None) or {
             "w_loss": 1.0,
             "w_aux_ang": 0.01,
             "w_aux_r": 0.01,
+            # Optional MVDR-peak proxy (only used when SURROGATE_PEAK_METRICS=True)
+            "w_peak_f1": 2.0,
+            "w_peak_fp": 0.1,
+            "w_peak_pssr": 0.0,
         }
         score = (
-            - w["w_loss"] * avg_loss
-            - w["w_aux_ang"] * (phi_rmse + theta_rmse) / 2.0
-            - w["w_aux_r"] * r_rmse
+            - float(w.get("w_loss", 1.0)) * avg_loss
+            - float(w.get("w_aux_ang", 0.01)) * (phi_rmse + theta_rmse) / 2.0
+            - float(w.get("w_aux_r", 0.01)) * r_rmse
         )
         
         metrics = {
@@ -1995,16 +2002,22 @@ class Trainer:
         if do_peak_metrics and peak_evald > 0:
             prec = float(peak_tp) / max(1.0, float(peak_tp + peak_fp))
             rec = float(peak_tp) / max(1.0, float(peak_tp + peak_fn))
+            f1 = (2.0 * prec * rec) / max(1e-12, (prec + rec))
             fp_per_scene = float(peak_fp) / max(1.0, float(peak_evald))
             metrics.update(
                 {
                     "peak_precision": prec,
                     "peak_recall": rec,
+                    "peak_f1": f1,
                     "peak_fp_per_scene": fp_per_scene,
                     "peak_pssr_db_med": float(np.median(pssr_db_vals)) if pssr_db_vals else 0.0,
                     "peak_eval_scenes": int(peak_evald),
                 }
             )
+            # Boost surrogate score with a MVDR-first proxy if enabled.
+            score += float(w.get("w_peak_f1", 0.0)) * f1
+            score -= float(w.get("w_peak_fp", 0.0)) * fp_per_scene
+            score += float(w.get("w_peak_pssr", 0.0)) * (metrics["peak_pssr_db_med"] / 10.0)
             print(
                 f"[VAL PEAK] scenes={peak_evald} precision={prec:.3f} recall={rec:.3f} "
                 f"fp/scene={fp_per_scene:.2f} pssr_med={metrics['peak_pssr_db_med']:.2f}dB",

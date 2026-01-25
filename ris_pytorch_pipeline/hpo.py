@@ -417,15 +417,25 @@ def run_hpo(
             # === Learning rate: log-uniform around baseline, ±2× range ===
             lr = trial.suggest_float("lr", 1.0e-4, 4e-4, log=True)  # Expanded slightly from [1.5e-4, 3e-4]
 
-            # === Loss weights (K-head removed - using MVDR peak detection) ===
-            lam_cov = trial.suggest_float("lam_cov", 0.10, 0.25)  # Covariance learning weight (primary)
-            lam_ang = trial.suggest_float("lam_ang", 0.50, 1.00)  # Angle aux weight
-            lam_rng = trial.suggest_float("lam_rng", 0.30, 0.60)  # Range aux weight
+            # === Loss weights ===
+            # IMPORTANT: MVDR-first inference depends primarily on learning a good covariance.
+            # The previous ranges under-weighted covariance relative to aux heads and led to
+            # uniformly-bad MVDR-final objectives (F1≈0, rmse_xyz≈4m).
+            #
+            # New policy (production-aligned):
+            # - lam_cov is dominant
+            # - aux heads are mild regularizers (still useful for stability), but not the driver
+            lam_cov = trial.suggest_float("lam_cov", 0.5, 2.0)   # covariance NMSE weight (primary)
+            lam_ang = trial.suggest_float("lam_ang", 0.0, 0.30)  # aux angle weight (regularizer)
+            lam_rng = trial.suggest_float("lam_rng", 0.0, 0.30)  # aux range weight (regularizer)
             shrink_alpha = trial.suggest_float("shrink_alpha", 0.10, 0.20)  # Tightened from [0.10, 0.25]
             softmax_tau = trial.suggest_float("softmax_tau", 0.15, 0.25)
 
             # Prefer larger batches (avoid BS=32 which degrades quickly)
             batch_size = trial.suggest_categorical("batch_size", [64, 80])
+
+            # NOTE: hybrid_cov_beta removed from HPO — R_samp is broken (F1=0 on validation).
+            # Once R_samp is fixed, re-enable: hybrid_beta = trial.suggest_float("hybrid_cov_beta", 0.15, 0.55)
 
             # NF-MLE polish parameters
             nf_mle_snr_threshold = trial.suggest_float("nf_mle_snr_threshold", 4.0, 10.0)
@@ -485,6 +495,10 @@ def run_hpo(
                 cfg.NF_MLE_SNR_THRESHOLD = s["nf_mle_snr_threshold"]
                 cfg.NF_MLE_ITERS = s["nf_mle_iters"]
 
+                # Hybrid covariance blend: DISABLED because R_samp is broken (F1=0).
+                # Once R_samp is fixed, re-enable HPO tuning of this parameter.
+                cfg.HYBRID_COV_BETA = 0.0
+
                 # apply suggestions - architecture
                 mdl_cfg.D_MODEL = s["D_MODEL"]
                 mdl_cfg.NUM_HEADS = s["NUM_HEADS"]
@@ -540,6 +554,24 @@ def run_hpo(
                 total_val_samples = 10000
                 hpo_n_train = int(0.1 * total_train_samples)
                 hpo_n_val = int(0.1 * total_val_samples)
+
+                # Stage-1 surrogate: enable a cheap MVDR-peak proxy to make the surrogate correlate with MVDR-final.
+                # This does NOT run the full E2E objective; it just computes peak-level P/R/F1 on a small cap.
+                # (Stage-2 still uses the true MVDR-final objective at the end of each trial.)
+                if str(getattr(cfg, "VAL_PRIMARY", "surrogate")).lower().strip() == "surrogate":
+                    cfg.SURROGATE_PEAK_METRICS = True
+                    cfg.SURROGATE_PEAK_MAX_SCENES = int(getattr(cfg, "HPO_SURROGATE_PEAK_MAX_SCENES", 64))
+                    cfg.SURROGATE_PEAK_GRID_PHI = int(getattr(cfg, "HPO_SURROGATE_PEAK_GRID_PHI", 121))
+                    cfg.SURROGATE_PEAK_GRID_THETA = int(getattr(cfg, "HPO_SURROGATE_PEAK_GRID_THETA", 61))
+                    # Default weights: prioritize peak F1, lightly penalize FP/scene, and keep loss as a stabilizer.
+                    cfg.SURROGATE_METRIC_WEIGHTS = getattr(cfg, "SURROGATE_METRIC_WEIGHTS", None) or {
+                        "w_loss": 0.5,
+                        "w_aux_ang": 0.002,
+                        "w_aux_r": 0.002,
+                        "w_peak_f1": 6.0,
+                        "w_peak_fp": 0.25,
+                        "w_peak_pssr": 0.0,
+                    }
 
                 print(
                     f"[HPO Trial {trial.number}] Starting training with {hpo_n_train} train, {hpo_n_val} val samples...",
@@ -732,6 +764,66 @@ def run_hpo_two_stage(
 
     # Stage 2
     s2_name = f"L16_M64_{space}_2stage_{stamp}_stage2_mvdr_final"
+    run_hpo(
+        n_trials=len(enqueue),
+        epochs_per_trial=int(stage2_epochs),
+        space=space,
+        export_csv=True,
+        early_stop_patience=early_stop_patience,
+        objective_mode="mvdr_final",
+        e2e_val_scenes=int(e2e_val_scenes),
+        e2e_seed=int(e2e_seed),
+        e2e_blind_k=bool(e2e_blind_k),
+        enqueue_params=enqueue,
+        study_name_override=s2_name,
+    )
+
+
+def run_hpo_stage2_rerank_from_stage1(
+    *,
+    stage1_study_name: str,
+    stage2_topk: int,
+    stage2_epochs: int,
+    stage2_study_name: str | None = None,
+    space: str = "wide",
+    early_stop_patience: int = 15,
+    e2e_val_scenes: int = 1000,
+    e2e_seed: int = 0,
+    e2e_blind_k: bool = True,
+):
+    """
+    Stage-2-only rerank utility.
+
+    Use this when Stage-1 was already completed (possibly on another machine) and you want
+    to rerank Stage-1 top-K trials via the MVDR-final end-to-end objective.
+
+    This reads Stage-1 trials from the same Optuna storage (cfg.HPO_DB -> *.journal) and
+    enqueues the top-K parameter dicts into a new Stage-2 study.
+    """
+    if not stage1_study_name or (not str(stage1_study_name).strip()):
+        raise ValueError("stage1_study_name is required")
+
+    hpo_db = getattr(cfg, "HPO_DB", str(Path(cfg.HPO_DIR) / "hpo.db"))
+    stage1_study_name = str(stage1_study_name).strip()
+
+    # Load stage-1 study and pick top-K completed trials
+    study1 = _study(hpo_db, name=stage1_study_name, seed=42)
+    top = _completed_trials_sorted(study1)[: max(1, int(stage2_topk))]
+    enqueue = [dict(t.params) for t in top if isinstance(t.params, dict)]
+
+    if not enqueue:
+        raise RuntimeError(
+            f"No completed trials found in stage1 study '{stage1_study_name}'. "
+            f"Check the storage path ({hpo_db}) and study name."
+        )
+
+    # Default stage-2 name: derived from stage-1 name (stable across machines)
+    s2_name = str(stage2_study_name).strip() if stage2_study_name else f"{stage1_study_name}_stage2_mvdr_final"
+
+    print(f"[HPO2] Stage2-only rerank from stage1 study='{stage1_study_name}'", flush=True)
+    print(f"[HPO2] Stage1 best value={float(study1.best_value):.6f} (trial={study1.best_trial.number})", flush=True)
+    print(f"[HPO2] Reranking top-K={len(enqueue)} into stage2 study='{s2_name}'", flush=True)
+
     run_hpo(
         n_trials=len(enqueue),
         epochs_per_trial=int(stage2_epochs),

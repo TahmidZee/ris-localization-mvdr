@@ -327,8 +327,8 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
         try:
             from .angle_pipeline import build_sample_covariance_from_snapshots
             H_full_c = _ri_to_c_np(sample.get("H_full"))  # [M,N]
-            H_stack = np.repeat(H_full_c[None, :, :], y_c.shape[0], axis=0)  # [L,M,N]
-            R_samp = build_sample_covariance_from_snapshots(y_c, H_stack, C_c, cfg, tikhonov_alpha=1e-3)
+            # build_sample_covariance_from_snapshots accepts [M,N] directly (no need to repeat)
+            R_samp = build_sample_covariance_from_snapshots(y_c, H_full_c, C_c, cfg, tikhonov_alpha=1e-3)
         except Exception:
             R_samp = None
 
@@ -382,7 +382,12 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
         if allow_fallback:
             global _REFINER_FALLBACK_COUNT
             _REFINER_FALLBACK_COUNT += 1
-            nlog = int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1))
+            # Avoid per-scene spam during HPO end-to-end evaluation.
+            # Default: keep existing behavior; in HPO mode default to silence unless overridden.
+            if bool(getattr(cfg, "HPO_MODE", False)):
+                nlog = int(getattr(cfg, "HPO_REFINER_REJECT_LOG_EVERY", 0))
+            else:
+                nlog = int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1))
             if nlog != 0 and ((_REFINER_FALLBACK_COUNT - 1) % max(1, nlog) == 0):
                 print("[INFER] Refiner unavailable/disabled -> MVDR fallback", flush=True)
             return _mvdr_fallback()
@@ -448,7 +453,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
                     raise RuntimeError(f"prob map too saturated (sat_frac={sat:.3f})")
             except Exception as e:
                 if allow_fallback:
-                    if int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0:
+                    if (not bool(getattr(cfg, "HPO_MODE", False))) and (int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0):
                         print(f"[INFER] Refiner rejected ({e}) -> MVDR fallback", flush=True)
                     return _mvdr_fallback()
                 raise
@@ -468,7 +473,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             max_raw = int(getattr(cfg, "REFINER_GUARD_MAX_RAW_PEAKS", 2000))
             if idx.numel() > 0 and idx.shape[0] > max_raw:
                 if allow_fallback:
-                    if int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0:
+                    if (not bool(getattr(cfg, "HPO_MODE", False))) and (int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0):
                         print(f"[INFER] Refiner rejected (too many peaks: {idx.shape[0]}) -> MVDR fallback", flush=True)
                     return _mvdr_fallback()
                 # else: keep going and rely on top-K truncation
@@ -542,15 +547,34 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
     codes = torch.from_numpy(codes_data[:, :, 0] + 1j * codes_data[:, :, 1]).to(torch.complex64).unsqueeze(0).to(device)
 
     # Optional R_samp for hybrid-aware K-head
+    R_samp_t = None
     try:
-        from .angle_pipeline import build_sample_covariance_from_snapshots
-        L_snap = y.shape[1]
-        y_np = (y[0].real.cpu().numpy() + 1j * y[0].imag.cpu().numpy())  # [L,M]
-        H_np = (H[0].real.cpu().numpy() + 1j * H[0].imag.cpu().numpy())  # [M,N]
-        codes_np = (codes[0].real.cpu().numpy() + 1j * codes[0].imag.cpu().numpy())  # [L,N]
-        H_stack = np.repeat(H_np[None, :, :], L_snap, axis=0)
-        R_samp_np = build_sample_covariance_from_snapshots(y_np, H_stack, codes_np, cfg)
-        R_samp_t = torch.from_numpy(R_samp_np).to(torch.complex64).unsqueeze(0).to(device)
+        # Prefer precomputed R_samp if available
+        if sample.get("R_samp") is not None:
+            R_samp_raw = sample["R_samp"]
+            if torch.is_tensor(R_samp_raw):
+                R_samp_raw = R_samp_raw.numpy()
+            R_samp_raw = np.asarray(R_samp_raw)
+            if R_samp_raw.shape[-1] == 2:
+                R_samp_np = (R_samp_raw[..., 0] + 1j * R_samp_raw[..., 1]).astype(np.complex64)
+            else:
+                R_samp_np = R_samp_raw.astype(np.complex64)
+            R_samp_t = torch.from_numpy(R_samp_np).to(torch.complex64).unsqueeze(0).to(device)
+        # Otherwise try building from H_full (not H, which is per-snapshot effective channel)
+        elif sample.get("H_full") is not None:
+            from .angle_pipeline import build_sample_covariance_from_snapshots
+            H_full_raw = sample["H_full"]
+            if torch.is_tensor(H_full_raw):
+                H_full_raw = H_full_raw.numpy()
+            H_full_raw = np.asarray(H_full_raw)
+            if H_full_raw.shape[-1] == 2:
+                H_full_np = (H_full_raw[..., 0] + 1j * H_full_raw[..., 1]).astype(np.complex64)  # [M,N]
+            else:
+                H_full_np = H_full_raw.astype(np.complex64)
+            y_np = (y[0].cpu().numpy().real + 1j * y[0].cpu().numpy().imag).astype(np.complex64)  # [L,M]
+            codes_np = (codes[0].cpu().numpy().real + 1j * codes[0].cpu().numpy().imag).astype(np.complex64)  # [L,N]
+            R_samp_np = build_sample_covariance_from_snapshots(y_np, H_full_np, codes_np, cfg)
+            R_samp_t = torch.from_numpy(R_samp_np).to(torch.complex64).unsqueeze(0).to(device)
     except Exception:
         R_samp_t = None
     with torch.no_grad():

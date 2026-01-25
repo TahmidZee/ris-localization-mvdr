@@ -63,13 +63,18 @@ def build_sample_covariance_from_snapshots(y, H, codes, cfg, tikhonov_alpha=1e-3
     Returns:
         R_samp: Sample covariance [N, N] complex, trace-normalized and full-rank
     
-    Algorithm:
-        Forward model: y[l, m] = Σ_n H[m, n] * codes[l, n] * a[n] + noise
-        
-        For each snapshot ℓ, form sensing matrix Φ[l] = diag(codes[l]) @ H^T  → [N, M_BS]
-        Then solve: a[l] = (Φ[l]^H Φ[l] + αI)^{-1} Φ[l]^H y[l]
-        
-        Build full-rank covariance from L diverse solutions via mean-centering and scatter matrix.
+    Algorithm (RIS-domain covariance estimate):
+        Forward model: y[l] = (H @ diag(codes[l])) @ x[l] + noise
+        where x[l] is the RIS-element domain signal at snapshot l.
+
+        We estimate x_hat[l] from each snapshot, then form:
+            R_samp = (1/L) Σ_l x_hat[l] x_hat[l]^H
+
+        IMPORTANT:
+          - Do NOT mean-center x_hat across snapshots. Mean-centering removes the signal
+            component when x[l] has nonzero mean (common), leaving mostly noise covariance.
+          - To make R_samp meaningful for multi-source covariance, the simulator should
+            use time-varying source symbols across snapshots (see dataset.py).
     """
     debug = bool(getattr(cfg, "DEBUG_BUILD_R_SAMP", False))
     if debug:
@@ -77,83 +82,46 @@ def build_sample_covariance_from_snapshots(y, H, codes, cfg, tikhonov_alpha=1e-3
         print(f"     [DEBUG build_R_samp] y.shape={y.shape}, H.shape={H.shape}, codes.shape={codes.shape}", flush=True)
         print(f"     [DEBUG build_R_samp] y norm={np.linalg.norm(y):.2e}, H norm={np.linalg.norm(H):.2e}, codes norm={np.linalg.norm(codes):.2e}", flush=True)
     
-    L = y.shape[0]
-    M = y.shape[1]
-    N = getattr(cfg, 'N_H', 12) * getattr(cfg, 'N_V', 12)
-    
-    # Build sensing matrix Φ [L*M, N]
-    # Each row is: Φ_{ℓm,n} = H_{ℓm} * codes_{ℓn}
-    # But H is [L, M] and we need to broadcast
-    Phi = np.zeros((L * M, N), dtype=np.complex64)
-    Y_vec = np.zeros(L * M, dtype=np.complex64)
-    
+    L = int(y.shape[0])
+    M = int(y.shape[1])
+    N = int(getattr(cfg, "N_H", 12) * getattr(cfg, "N_V", 12))
+
+    # Accept either H=[M,N] or H=[L,M,N] (some call-sites repeat H across L).
+    H = np.asarray(H)
+    if H.ndim == 2:
+        H_stack = np.repeat(H[None, :, :], L, axis=0)
+    elif H.ndim == 3 and H.shape[0] == L:
+        H_stack = H
+    else:
+        raise ValueError(f"H must be [M,N] or [L,M,N], got {H.shape}")
+
+    # Solver choice: matched-filter (fast) or ridge_ls (slower, stronger).
+    solver = str(getattr(cfg, "RSAMP_SOLVER", "matched_filter")).lower().strip()
+
+    x_hat = np.zeros((L, N), dtype=np.complex128)
     for ell in range(L):
-        for m in range(M):
-            row_idx = ell * M + m
-            # Phi row: H[ℓ,m] * codes[ℓ,:]
-            Phi[row_idx, :] = H[ell, m] * codes[ell, :]
-            Y_vec[row_idx] = y[ell, m]
-    
-    # Tikhonov-regularized least squares
-    Phi_H_Phi = Phi.conj().T @ Phi  # [N, N]
-    Phi_H_Phi_reg = Phi_H_Phi + tikhonov_alpha * np.trace(Phi_H_Phi).real / N * np.eye(N, dtype=np.complex64)
-    Phi_H_Y = Phi.conj().T @ Y_vec  # [N]
-    
-    try:
-        a_hat = np.linalg.solve(Phi_H_Phi_reg, Phi_H_Y)
-    except np.linalg.LinAlgError:
-        a_hat = np.linalg.lstsq(Phi_H_Phi_reg, Phi_H_Y, rcond=None)[0]
-    
-    # Build full-rank sample covariance by leveraging per-snapshot residuals
-    # Compute per-snapshot contributions with diversity from L snapshots
-    a_snapshots = np.zeros((L, N), dtype=np.complex128)  # Use float64 for numerics
-    
-    for ell in range(L):
-        # Per-snapshot least squares (adds diversity)
-        # Forward: y[l, m] = Σ_n H[m, n] * codes[l, n] * a[n]
-        # Sensing matrix: Φ[m, n] = H[m, n] * codes[l, n]  [M_BS, N]
-        H_ell = H[ell]  # [M_BS, N] - full channel matrix (same for all ell, but indexed for convenience)
-        # CRITICAL: Use H_ell @ diag(codes[ell]) for full-rank Phi, NOT outer product!
-        Phi_ell = (H_ell @ np.diag(codes[ell])).astype(np.complex128)  # [M_BS, N] - physically correct!
-        y_ell = y[ell].astype(np.complex128)  # [M_BS]
-        
-        # Mini least squares for this snapshot
-        Phi_ell_H_Phi = Phi_ell.conj().T @ Phi_ell  # [N, N]
-        Phi_ell_H_y = Phi_ell.conj().T @ y_ell  # [N]
-        
-        # Add ridge regularization for stability (RELATIVE to Phi magnitude)
-        # Use adaptive regularization: α * trace(Phi^H Phi) / N
-        trace_Phi_H_Phi = np.trace(Phi_ell_H_Phi).real
-        alpha_scaled = tikhonov_alpha * trace_Phi_H_Phi / N
-        reg_ell = Phi_ell_H_Phi + alpha_scaled * np.eye(N, dtype=np.complex128)
-        
-        if debug and ell == 0:  # Debug first snapshot only
-            print(f"     [DEBUG LS] ell={ell}: Phi_ell.shape={Phi_ell.shape}, ||Phi_ell||_F={np.linalg.norm(Phi_ell,'fro'):.2e}", flush=True)
-            print(f"     [DEBUG LS] ell={ell}: y_ell.shape={y_ell.shape}, ||y_ell||={np.linalg.norm(y_ell):.2e}", flush=True)
-            print(f"     [DEBUG LS] ell={ell}: trace(Phi^H Phi)={trace_Phi_H_Phi:.2e}, α_scaled={alpha_scaled:.2e}", flush=True)
-        
-        try:
-            a_snapshots[ell] = np.linalg.solve(reg_ell, Phi_ell_H_y)
-        except np.linalg.LinAlgError:
-            a_snapshots[ell] = np.linalg.lstsq(reg_ell, Phi_ell_H_y, rcond=None)[0]
-        
-        if debug and ell == 0:  # Debug first snapshot solve
-            print(f"     [DEBUG LS] ell={ell}: ||a_snapshots[ell]||={np.linalg.norm(a_snapshots[ell]):.2e}", flush=True)
-    
-    # Mean-center the snapshots to remove DC mode (CRITICAL!)
-    a_mean = np.mean(a_snapshots, axis=0, keepdims=True)
-    a_centered = a_snapshots - a_mean
-    
-    if debug:
-        print(f"     [DEBUG LS] ||a_mean||={np.linalg.norm(a_mean):.2e}, ||a_centered||_F={np.linalg.norm(a_centered,'fro'):.2e}", flush=True)
-    
-    # Form scatter matrix: R_samp = (1/(L-1)) Σ_ℓ a_c[ℓ] a_c[ℓ]^H
-    R_samp = np.zeros((N, N), dtype=np.complex128)
-    for ell in range(L):
-        R_samp += np.outer(a_centered[ell], a_centered[ell].conj())
-    
-    R_samp = R_samp / max(1, L - 1)  # Unbiased covariance estimator
-    
+        H_ell = H_stack[ell].astype(np.complex128)     # [M,N]
+        c_ell = codes[ell].astype(np.complex128)       # [N]
+        y_ell = y[ell].astype(np.complex128)           # [M]
+        # Effective sensing matrix: G = H @ diag(codes[ell]) == H * codes[ell][None,:]
+        G = H_ell * c_ell[None, :]                     # [M,N]
+        if solver == "ridge_ls":
+            GH_G = G.conj().T @ G                      # [N,N]
+            GH_y = G.conj().T @ y_ell                  # [N]
+            tr = float(np.trace(GH_G).real)
+            alpha_scaled = float(tikhonov_alpha) * tr / max(1, N)
+            reg = GH_G + alpha_scaled * np.eye(N, dtype=np.complex128)
+            try:
+                x_hat[ell] = np.linalg.solve(reg, GH_y)
+            except np.linalg.LinAlgError:
+                x_hat[ell] = np.linalg.lstsq(reg, GH_y, rcond=None)[0]
+        else:
+            # Matched filter: cheap and stable (works well as a covariance proxy).
+            x_hat[ell] = (G.conj().T @ y_ell) / max(1.0, float(M))
+
+    # Sample covariance over snapshots (NO mean-centering).
+    R_samp = (x_hat.conj().T @ x_hat) / max(1.0, float(L))  # [N,N]
+
     # Cast back to complex64 for consistency
     R_samp = R_samp.astype(np.complex64)
     

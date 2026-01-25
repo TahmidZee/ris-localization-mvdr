@@ -70,6 +70,22 @@ def decoupled_mod_music(R_incident, K, grid_size_ang=41, grid_size_r=61, N_H=Non
     return phi[:K], theta[:K], rng, _
 
 def incident_cov_from_snaps(y_lm, H_mn, codes_ln):
+    """
+    Compute RIS-domain sample covariance from snapshots.
+    
+    This is a thin wrapper around build_sample_covariance_from_snapshots() for
+    backward compatibility with benchmarks.
+    
+    Args:
+        y_lm: Received signals [L, M] complex or RI-stack [L, M, 2]
+        H_mn: BS-RIS channel [M, N] complex or RI-stack [M, N, 2]
+        codes_ln: RIS phase codes [L, N] complex or RI-stack [L, N, 2]
+    
+    Returns:
+        R: Sample covariance [N, N] complex64, trace-normalized
+    """
+    from .angle_pipeline import build_sample_covariance_from_snapshots
+    
     # Accept either complex arrays or RI stacks (...,2).
     def _to_c(x):
         x = np.asarray(x)
@@ -83,14 +99,8 @@ def incident_cov_from_snaps(y_lm, H_mn, codes_ln):
     H_mn = _to_c(H_mn)
     codes_ln = _to_c(codes_ln)
 
-    L, M = y_lm.shape
-    N = H_mn.shape[1]
-    GT = np.empty((L*M, N), np.complex64); yT = y_lm.reshape(L*M).astype(np.complex64)
-    for l in range(L): GT[l*M:(l+1)*M,:] = H_mn @ np.diag(codes_ln[l])
-    A = GT.conj().T @ GT; b = GT.conj().T @ yT
-    x = la.solve(A + 1e-6*np.eye(N, dtype=np.complex64), b)
-    R = np.outer(x, x.conj()) / max(1,L)
-    return R.astype(np.complex64)
+    # Delegate to the correct implementation
+    return build_sample_covariance_from_snapshots(y_lm, H_mn, codes_ln, cfg)
 
 
 def ramezani_mod_music_wrapper(y=None, H=None, codes=None, R=None, *,

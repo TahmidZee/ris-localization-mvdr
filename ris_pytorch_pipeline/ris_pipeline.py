@@ -110,6 +110,18 @@ def main():
     g2h.add_argument("--e2e-val-scenes", type=int, default=1000)
     g2h.add_argument("--e2e-seed", type=int, default=0)
     g2h.add_argument("--e2e-oracle-k", action="store_true")
+    g2h.add_argument(
+        "--stage1-study",
+        type=str,
+        default=None,
+        help="If set, skip Stage-1 and rerank from this existing Stage-1 Optuna study name (Stage-2-only).",
+    )
+    g2h.add_argument(
+        "--stage2-study",
+        type=str,
+        default=None,
+        help="Optional Stage-2 study name override (only used with --stage1-study).",
+    )
 
     # --- quick bench (legacy scatter sanity, writes gt_phi0 vs pred_phi0) ---
     g_bench = sub.add_parser("bench", help="Quick bench: writes pairs [gt_phi0, pred_phi0] CSV")
@@ -210,18 +222,32 @@ def main():
             e2e_blind_k=not bool(getattr(args, "e2e_oracle_k", False)),
         )
     elif args.cmd == "hpo2":
-        from .hpo import run_hpo_two_stage
-        run_hpo_two_stage(
-            stage1_trials=int(getattr(args, "stage1_trials", 200)),
-            stage1_epochs=int(getattr(args, "stage1_epochs", 20)),
-            stage2_topk=int(getattr(args, "stage2_topk", 25)),
-            stage2_epochs=int(getattr(args, "stage2_epochs", 20)),
-            space=str(getattr(args, "space", "wide")),
-            early_stop_patience=int(getattr(args, "early_stop_patience", 15)),
-            e2e_val_scenes=int(getattr(args, "e2e_val_scenes", 1000)),
-            e2e_seed=int(getattr(args, "e2e_seed", 0)),
-            e2e_blind_k=not bool(getattr(args, "e2e_oracle_k", False)),
-        )
+        from .hpo import run_hpo_two_stage, run_hpo_stage2_rerank_from_stage1
+        stage1_study = getattr(args, "stage1_study", None)
+        if stage1_study:
+            run_hpo_stage2_rerank_from_stage1(
+                stage1_study_name=str(stage1_study),
+                stage2_topk=int(getattr(args, "stage2_topk", 25)),
+                stage2_epochs=int(getattr(args, "stage2_epochs", 20)),
+                stage2_study_name=getattr(args, "stage2_study", None),
+                space=str(getattr(args, "space", "wide")),
+                early_stop_patience=int(getattr(args, "early_stop_patience", 15)),
+                e2e_val_scenes=int(getattr(args, "e2e_val_scenes", 1000)),
+                e2e_seed=int(getattr(args, "e2e_seed", 0)),
+                e2e_blind_k=not bool(getattr(args, "e2e_oracle_k", False)),
+            )
+        else:
+            run_hpo_two_stage(
+                stage1_trials=int(getattr(args, "stage1_trials", 200)),
+                stage1_epochs=int(getattr(args, "stage1_epochs", 20)),
+                stage2_topk=int(getattr(args, "stage2_topk", 25)),
+                stage2_epochs=int(getattr(args, "stage2_epochs", 20)),
+                space=str(getattr(args, "space", "wide")),
+                early_stop_patience=int(getattr(args, "early_stop_patience", 15)),
+                e2e_val_scenes=int(getattr(args, "e2e_val_scenes", 1000)),
+                e2e_seed=int(getattr(args, "e2e_seed", 0)),
+                e2e_blind_k=not bool(getattr(args, "e2e_oracle_k", False)),
+            )
 
     elif args.cmd == "bench":
         # Quick sanity bench (scatter CSV)

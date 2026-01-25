@@ -16,6 +16,84 @@ from .configs import cfg
 from .music_gpu import get_gpu_estimator
 
 
+def r_samp_sanity_test(*, n: int = 8, seed: int = 0) -> None:
+    """
+    Regression guardrail: R_samp should be a usable covariance proxy.
+
+    We keep this test lightweight (no MVDR), enforcing basic numerical sanity and that
+    R_samp is not degenerate / zero and is at least somewhat correlated with R.
+    """
+    from pathlib import Path
+
+    def _ri_to_c(x):
+        if x is None:
+            return None
+        x = np.asarray(x)
+        if x.shape[-1] == 2:
+            return (x[..., 0] + 1j * x[..., 1]).astype(np.complex64)
+        return x.astype(np.complex64)
+
+    def _nmse(a, b):
+        num = np.linalg.norm(a - b, "fro") ** 2
+        den = np.linalg.norm(b, "fro") ** 2 + 1e-12
+        return float(num / den)
+
+    # IMPORTANT: Avoid loading the full ShardNPZDataset here (can be heavy / memory-fragile on some machines).
+    # Instead, read a single shard with mmap and sample a few indices.
+    val_dir = Path(str(getattr(cfg, "DATA_SHARDS_VAL", f"{cfg.DATA_SHARDS_DIR}/val")))
+    shard_paths = sorted(val_dir.glob("*.npz"))
+    if not shard_paths:
+        raise RuntimeError(f"[r_samp] No .npz shards found under: {val_dir}")
+
+    rng = np.random.default_rng(int(seed))
+    p0 = shard_paths[0]
+    z = np.load(p0, allow_pickle=False, mmap_mode="r")
+    n0 = int(z["R"].shape[0])
+    idx = rng.choice(n0, size=min(int(n), n0), replace=False)
+
+    nmse_list = []
+    herm_list = []
+    tr_list = []
+    nz_list = []
+    N = int(getattr(cfg, "N", 144))
+
+    for i in idx:
+        R = _ri_to_c(z["R"][int(i)]) if ("R" in z.files) else None
+        Rs = _ri_to_c(z["R_samp"][int(i)]) if ("R_samp" in z.files) else None
+        if R is None or Rs is None:
+            continue
+        Rs_h = 0.5 * (Rs + Rs.conj().T)
+        R_h = 0.5 * (R + R.conj().T)
+        herm_list.append(float(np.linalg.norm(Rs - Rs.conj().T, "fro") / (np.linalg.norm(Rs, "fro") + 1e-12)))
+        tr_list.append(float(np.real(np.trace(Rs_h))))
+        nz_list.append(float(np.linalg.norm(Rs_h, "fro")))
+        nmse_list.append(_nmse(Rs_h, R_h))
+
+    if len(nmse_list) == 0:
+        raise RuntimeError("No samples with both R and R_samp found in val shards.")
+
+    # Hermitian should be very close (it is explicitly hermitized).
+    if float(np.median(herm_list)) >= 1e-3:
+        raise RuntimeError(f"[r_samp] not Hermitian enough: median={np.median(herm_list)}")
+
+    # Trace should be normalized near N.
+    if abs(float(np.median(tr_list)) - float(N)) >= 0.10 * float(N):
+        raise RuntimeError(f"[r_samp] trace not near N: median_tr={np.median(tr_list)} vs N={N}")
+
+    # Not degenerate
+    if float(np.median(nz_list)) <= 1e-3:
+        raise RuntimeError("[r_samp] appears degenerate/zero")
+
+    # Loose correlation check (dataset/SNR dependent; keep generous).
+    if float(np.median(nmse_list)) >= 10.0:
+        raise RuntimeError(f"[r_samp] too far from R: median NMSE={np.median(nmse_list):.3f}")
+
+    print(
+        f"✅ r_samp_sanity_test passed (n={len(nmse_list)}, median_nmse={np.median(nmse_list):.3f}, median_tr={np.median(tr_list):.2f})",
+        flush=True,
+    )
+
+
 @torch.no_grad()
 def mvdr_lowrank_equivalence_test(
     *,
@@ -99,6 +177,10 @@ def _main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    ap_rs = sub.add_parser("r_samp", help="Sanity-check R_samp against R (lightweight)")
+    ap_rs.add_argument("--n", type=int, default=8)
+    ap_rs.add_argument("--seed", type=int, default=0)
+
     ap_lr = sub.add_parser("mvdr_lowrank", help="Validate low-rank MVDR vs full MVDR")
     ap_lr.add_argument("--n", type=int, default=5)
     ap_lr.add_argument("--k_lr", type=int, default=10)
@@ -110,6 +192,8 @@ def _main():
     ap_lr.add_argument("--device", type=str, default=None)
 
     args = ap.parse_args()
+    if args.cmd == "r_samp":
+        r_samp_sanity_test(n=args.n, seed=args.seed)
     if args.cmd == "mvdr_lowrank":
         mvdr_lowrank_equivalence_test(
             n_trials=args.n,

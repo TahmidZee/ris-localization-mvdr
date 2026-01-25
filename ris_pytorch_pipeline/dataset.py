@@ -138,8 +138,19 @@ class RISDataset(Dataset):
         pW = 10 ** (p_db / 10) / 1e3
 
         # 2) build s, A, H as before
-        if coherent: s = np.ones(K, np.complex64)
-        else: s = (np.random.randn(K)+1j*np.random.randn(K)).astype(np.complex64)/np.sqrt(2)
+        # Source symbols over L snapshots.
+        #
+        # CRITICAL: For covariance-based methods (MUSIC/MVDR), snapshots must reflect
+        # time-varying source symbols. If we use a single fixed symbol vector across all
+        # snapshots, the RIS-domain signal becomes (approximately) coherent across L and
+        # sample covariance estimates (R_samp) collapse, producing near-flat spectra.
+        #
+        # - coherent=True: fully coherent (use only for stress tests / ablations)
+        # - coherent=False (default): i.i.d. complex Gaussian symbols per snapshot
+        if coherent:
+            s = np.ones((L, K), np.complex64)
+        else:
+            s = (np.random.randn(L, K) + 1j * np.random.randn(L, K)).astype(np.complex64) / np.sqrt(2.0)
 
         A = np.stack([ np.sqrt(pW*(cfg.WAVEL**2)/(4*np.pi*r[k])**2) *
                        nearfield_vec(cfg, phi[k], theta[k], r[k], h_flat, v_flat) for k in range(K) ], 1)
@@ -216,7 +227,8 @@ class RISDataset(Dataset):
         y_clean = np.empty((L, cfg.M), np.complex64)
         for l in range(L):
             Hl = H @ np.diag(codes[l])
-            y_clean[l] = SIGNAL_GAIN * (Hl @ (A @ s))
+            x_l = A @ s[l]  # [N]
+            y_clean[l] = SIGNAL_GAIN * (Hl @ x_l)
 
         # 4) compute signal power and choose / hit target SNR
         p_sig = float(np.mean(np.abs(y_clean)**2))  # clean signal avg power
@@ -242,7 +254,10 @@ class RISDataset(Dataset):
 
         A0 = np.stack([ np.sqrt(pW*(cfg.WAVEL**2)/(4*np.pi*r[k])**2) *
                         nearfield_vec(cfg, phi[k], theta[k], r[k], h_flat, v_flat) for k in range(K) ], 1)
-        R_true = A0 @ np.diag(s) @ np.diag(s.conj()) @ A0.conj().T
+        # Ground-truth spatial covariance in RIS element domain.
+        # Use per-sample average powers across snapshots to match the snapshot process.
+        p_src = np.mean(np.abs(s) ** 2, axis=0).astype(np.float32)  # [K]
+        R_true = A0 @ np.diag(p_src.astype(np.float32)) @ A0.conj().T
         R_true = 0.5 * (R_true + R_true.conj().T)
         R_true *= (cfg.N / (np.trace(R_true).real + 1e-9))  # Normalize to tr(R) = N, not 1
 
@@ -328,9 +343,8 @@ def prepare_shards(out_dir, n_samples: int, shard_size: int = 25000,
                 y_cplx = sdict['y_cplx'].astype(np.complex64)        # [L, M]
                 H_cplx = sdict['H_cplx'].astype(np.complex64)        # [M, N]
                 C_cplx = sdict['codes'].astype(np.complex64)         # [L, N]
-                # build_sample_covariance_from_snapshots expects shapes [L,M], [L,M], [L,N]
-                # Our H_cplx is [M,N]; the builder uses its own per-snapshot formulation
-                R_samp_np = build_sample_covariance_from_snapshots(y_cplx, np.repeat(H_cplx[None, :, :], chosen_L, axis=0), C_cplx, cfg)
+                # build_sample_covariance_from_snapshots accepts H as [M,N] or [L,M,N].
+                R_samp_np = build_sample_covariance_from_snapshots(y_cplx, H_cplx, C_cplx, cfg)
                 # Hermitize (defensive) and convert to RI
                 R_samp_np = 0.5 * (R_samp_np + R_samp_np.conj().T)
                 R_samp[i] = to_ri(R_samp_np.astype(np.complex64))

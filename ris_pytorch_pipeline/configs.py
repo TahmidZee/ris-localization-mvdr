@@ -135,8 +135,12 @@ class SysConfig:
         # - "xyz_f1": Hungarian match, compute 3D Cartesian RMSE over true-positives, plus an (1-F1) term.
         # - "legacy": previous composite based on per-axis RMSEs and success_rate.
         self.HPO_E2E_OBJECTIVE = "xyz_f1"
-        self.HPO_E2E_XYZ_NORM_M = 0.5     # meters; normalization for RMSE_xyz in objective
-        self.HPO_E2E_F1_WEIGHT = 2.0      # weight for (1 - F1) in objective (dimensionless)
+        # NOTE: With early-stage models, rmse_xyz can be several meters and F1 may be near 0.
+        # A too-small xyz_norm makes the objective almost entirely rmse-dominated, reducing
+        # selection pressure to improve detection. These defaults bias slightly toward
+        # detection quality while still rewarding better meter-domain localization.
+        self.HPO_E2E_XYZ_NORM_M = 2.0     # meters; normalization for RMSE_xyz in objective
+        self.HPO_E2E_F1_WEIGHT = 10.0     # weight for (1 - F1) in objective (dimensionless)
 
         # Inference policy (use HPO knobs for Newton+range grid)
         # K-free policy: do NOT use MDL/AIC in the production inference path.
@@ -250,7 +254,10 @@ class SysConfig:
         
         # === L=16 CRITICAL FIX: Hybrid Covariance Blending ===
         self.HYBRID_COV_BLEND = True          # Enable hybrid covariance blending (R_pred + R_samp)
-        self.HYBRID_COV_BETA = 0.30           # Blend weight for sample covariance (0.30 for HPO, 0.40 for final)
+        # R_samp fix applied (Jan 2026): regenerate shards with fixed build_sample_covariance_from_snapshots.
+        # After regeneration, set HYBRID_COV_BETA = 0.30 for HPO, 0.40 for final training.
+        # Set to 0.0 if using OLD shards (pre-fix R_samp is broken).
+        self.HYBRID_COV_BETA = 0.0
         self.HYBRID_COV_DEBUG = True          # Set True for hybrid covariance diagnostics (ONE-TIME PRINT)
 
         # === MVDR (K-free) inference defaults ===
@@ -263,6 +270,11 @@ class SysConfig:
         self.MVDR_THRESH_MODE = "mad"
         self.MVDR_THRESH_DB = 12.0
         self.MVDR_CFAR_Z = 5.0
+
+        # R_samp (offline sample covariance) construction
+        # - matched_filter: fast, stable covariance proxy (recommended default)
+        # - ridge_ls: slower per-snapshot ridge solve (stronger but expensive)
+        self.RSAMP_SOLVER = "matched_filter"
         self.MVDR_DELTA_SCALE = 1e-2
         self.MVDR_DO_REFINEMENT = True
         # Refiner is part of the plan: production inference assumes it is present.
