@@ -1,6 +1,6 @@
 
 import numpy as np, math
-from .configs import cfg
+from .configs import cfg, mdl_cfg
 
 def nearfield_vec(cfg, phi, theta, r, h_flat=None, v_flat=None):
     if h_flat is None or v_flat is None:
@@ -41,11 +41,14 @@ def quantise_phase(vec, bits=3):
     qphase = np.round(np.angle(vec) / step) * step
     return np.exp(1j * qphase).astype(vec.dtype)
 
-def alpha_from_snr_db(snr_db: float) -> float:
+def alpha_from_snr_db(snr_db: float, *, L: int | None = None) -> float:
     """
     SNR-aware shrinkage coefficient (piecewise mapping).
-    Preserves eigengaps at mid/high SNR, increases at low SNR.
-    Tuned for L=16 snapshots.
+
+    Notes:
+    - The base mapping below was tuned around an L≈16 snapshot regime.
+    - We scale it by sqrt(16/L) to reduce shrinkage as snapshot diversity increases.
+      (More snapshots => sample covariance is better conditioned => less shrink needed.)
     """
     d = float(snr_db)
     if d >= 15:     a = 0.02
@@ -53,21 +56,36 @@ def alpha_from_snr_db(snr_db: float) -> float:
     elif d >= 3:    a = 0.07
     elif d >= -2:   a = 0.10
     else:           a = 0.14
-    return float(np.clip(a, 0.02, 0.25))
+    # L-aware scaling (reference L=16). Clamp to sane bounds.
+    if L is None:
+        L = int(getattr(cfg, "L", 16))
+    L = max(1, int(L))
+    scale = math.sqrt(16.0 / float(L))
+    a = a * scale
+    return float(np.clip(a, 1e-4, 0.25))
 
 def shrink(R, snr_db: float = None, base: float = 1e-3, alpha: float = None):
     """
     C11: Convex shrinkage formula.
     Returns (1-α)*R + α*μ*I where μ = tr(R)/N
-    
-    Now uses SNR-aware alpha by default (ignores base parameter).
+
+    IMPORTANT (consistency + HPO):
+    - If `alpha` is provided: use it directly.
+    - Else: compute a default SNR-aware alpha via `alpha_from_snr_db(snr_db)`, and then
+      scale it by `(base / 1e-3)`.
+
+    This makes `base` (typically `mdl_cfg.SHRINK_BASE_ALPHA`) a true knob that affects
+    shrinkage everywhere, including call-sites that historically passed `base=...` but
+    saw no effect because `base` was ignored.
     """
+    if base is None:
+        base = float(getattr(mdl_cfg, "SHRINK_BASE_ALPHA", 1e-3))
     if alpha is None:
         if snr_db is None: raise ValueError("need alpha or snr_db")
-        # Use SNR-aware mapping instead of exponential formula
-        alpha = alpha_from_snr_db(snr_db)
-    
-    # Alpha is already clamped by alpha_from_snr_db
+        # SNR-aware mapping (L-aware) scaled by base relative to the reference 1e-3.
+        alpha0 = alpha_from_snr_db(snr_db, L=int(getattr(cfg, "L", 16)))
+        alpha = float(alpha0) * (float(base) / 1e-3)
+
     alpha = float(np.clip(alpha, 1e-4, 0.25))
     
     mu = np.trace(R).real / R.shape[0]  # Mean eigenvalue

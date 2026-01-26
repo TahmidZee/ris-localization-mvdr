@@ -270,10 +270,12 @@ class HybridModel(nn.Module):
         return R / tr.view(-1,1,1)
     
     def _shrink_alpha(self, snr_db, base=None):
-        """SNR-aware shrinkage coefficient"""
+        """SNR-aware shrinkage coefficient (kept consistent with physics/covariance_utils)."""
+        from .physics import alpha_from_snr_db
         base = float(getattr(mdl_cfg, "SHRINK_BASE_ALPHA", 1e-3)) if base is None else float(base)
-        alpha = base * (10.0 ** (-snr_db / 20.0))
-        return float(max(1e-4, min(alpha, 5e-2)))
+        alpha0 = float(alpha_from_snr_db(float(snr_db), L=int(getattr(cfg, "L", 16))))
+        alpha = alpha0 * (base / 1e-3)
+        return float(max(1e-4, min(alpha, 0.25)))
     
     def _whiten_covariance(self, R):
         """Whiten covariance matrix: R_w = D^(-1/2) R D^(-1/2) where D = diag(R)"""

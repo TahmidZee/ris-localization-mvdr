@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from .configs import cfg, mdl_cfg
+from .physics import alpha_from_snr_db
 
 
 # ---------------------- Torch helpers ----------------------
@@ -23,7 +24,10 @@ def shrink_torch(R: torch.Tensor, snr_db: torch.Tensor, base_alpha: float = None
     """
     Torch-native shrinkage:
       R_shrunk = (1 - alpha) R + alpha * mu I,  where mu = trace(R)/N
-    alpha = base * 10^(-snr_db/20), clamped to [1e-4, 5e-2]
+
+    Consistency note:
+    - We mirror `physics.shrink()` semantics: start from the SNR-aware piecewise mapping
+      (scaled by sqrt(16/L)), then scale by (base_alpha / 1e-3).
     """
     if base_alpha is None:
         base_alpha = float(getattr(mdl_cfg, "SHRINK_BASE_ALPHA", 1e-3))
@@ -31,8 +35,21 @@ def shrink_torch(R: torch.Tensor, snr_db: torch.Tensor, base_alpha: float = None
     device = R.device
     dtype = R.dtype
     snr_db = snr_db.to(device=device, dtype=torch.float32).view(-1)
-    alpha = base_alpha * torch.pow(10.0, -snr_db / 20.0)
-    alpha = alpha.clamp(min=1e-4, max=5e-2).view(B, 1, 1)
+
+    # Build the base alpha via the same piecewise mapping used in NumPy.
+    # Then apply L-aware scaling and the (base/1e-3) scale factor.
+    # Piecewise thresholds: >=15, >=8, >=3, >=-2, else
+    a = torch.empty_like(snr_db)
+    a = torch.where(snr_db >= 15.0, torch.tensor(0.02, device=device), a)
+    a = torch.where((snr_db < 15.0) & (snr_db >= 8.0), torch.tensor(0.04, device=device), a)
+    a = torch.where((snr_db < 8.0) & (snr_db >= 3.0), torch.tensor(0.07, device=device), a)
+    a = torch.where((snr_db < 3.0) & (snr_db >= -2.0), torch.tensor(0.10, device=device), a)
+    a = torch.where(snr_db < -2.0, torch.tensor(0.14, device=device), a)
+
+    L = float(max(1, int(getattr(cfg, "L", 16))))
+    scale_L = float(np.sqrt(16.0 / L))
+    scale_base = float(base_alpha) / 1e-3
+    alpha = (a * float(scale_L) * float(scale_base)).clamp(min=1e-4, max=0.25).view(B, 1, 1)
     tr = torch.diagonal(R, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)  # [B]
     mu = (tr / float(N)).view(B, 1, 1)
     I = torch.eye(N, device=device, dtype=dtype).unsqueeze(0).expand(B, N, N)
@@ -141,8 +158,9 @@ def shrink_np(R: np.ndarray, snr_db: float, base_alpha: float = None) -> np.ndar
     if base_alpha is None:
         base_alpha = float(getattr(mdl_cfg, "SHRINK_BASE_ALPHA", 1e-3))
     N = R.shape[0]
-    alpha = base_alpha * (10.0 ** (-float(snr_db) / 20.0))
-    alpha = float(np.clip(alpha, 1e-4, 5e-2))
+    alpha0 = alpha_from_snr_db(float(snr_db), L=int(getattr(cfg, "L", 16)))
+    alpha = float(alpha0) * (float(base_alpha) / 1e-3)
+    alpha = float(np.clip(alpha, 1e-4, 0.25))
     mu = float(np.real(np.trace(R))) / float(N)
     return (1.0 - alpha) * R + alpha * mu * np.eye(N, dtype=R.dtype)
 
