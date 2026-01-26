@@ -164,7 +164,11 @@ def main() -> None:
     ap.add_argument("--success_tol_theta", type=float, default=5.0)
     ap.add_argument("--success_tol_r", type=float, default=1.0)
 
-    ap.add_argument("--out", default=None, help="Output CSV path (default: results_final_L16_12x12/knob_sweeps/sweep_<timestamp>.csv)")
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="Output CSV path (default: <cfg.RESULTS_DIR>/knob_sweeps/sweep_<timestamp>.csv)",
+    )
     args = ap.parse_args()
 
     ckpt_path = Path(args.ckpt).expanduser().resolve()
@@ -173,7 +177,7 @@ def main() -> None:
 
     # Resolve validation dir
     if args.val_dir is None:
-        val_dir = Path("/home/tahit/ris/MainMusic") / str(getattr(cfg, "DATA_SHARDS_VAL", "data_shards_M64_L16/val"))
+        val_dir = Path(str(getattr(cfg, "DATA_SHARDS_VAL", Path(getattr(cfg, "DATA_SHARDS_DIR", "")) / "val")))
     else:
         val_dir = Path(args.val_dir).expanduser().resolve()
     if not val_dir.exists():
@@ -181,7 +185,7 @@ def main() -> None:
 
     # Output path
     if args.out is None:
-        out_dir = Path("/home/tahit/ris/MainMusic") / str(getattr(cfg, "RESULTS_DIR", "results_final_L16_12x12")) / "knob_sweeps"
+        out_dir = Path(str(getattr(cfg, "RESULTS_DIR", "results_final"))) / "knob_sweeps"
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_path = out_dir / f"sweep_{ts}.csv"

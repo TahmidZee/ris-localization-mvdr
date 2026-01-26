@@ -13,7 +13,7 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent))
 
 from ris_pytorch_pipeline.dataset import prepare_split_shards, set_sampling_overrides_from_cfg
-from ris_pytorch_pipeline.configs import mdl_cfg
+from ris_pytorch_pipeline.configs import cfg, mdl_cfg
 import numpy as np
 
 
@@ -23,15 +23,15 @@ def main():
     print("=" * 80)
     print()
     
-    # Configuration (jittered dataset for robustness; clean set preserved as data_shards_M64_L16_clean)
-    SHARD_DIR = Path("data_shards_M64_L16")
+    # Configuration (derive from cfg so L/M changes don't break this script)
+    SHARD_DIR = Path(str(getattr(cfg, "DATA_SHARDS_DIR", "data_shards")))
     N_TRAIN = 100000
     N_VAL = 10000
     N_TEST = 10000
     SHARD_SIZE = 25000
     SEED = 42
     ETA = 0.0  # keep element perturbation off; use domain randomization instead
-    L = 16     # L=16 snapshots
+    L = int(getattr(cfg, "L", 16))
     
     # Robust training ranges (wider low-SNR tail)
     PHI_FOV = 60.0

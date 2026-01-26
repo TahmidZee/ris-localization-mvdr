@@ -13,7 +13,9 @@ class SysConfig:
         self.M, self.N_H, self.N_V = 16, 12, 12  # M=M_BS (BS antennas), 12x12 UPA
         self.M_BS = self.M  # Alias for clarity in paper
         self.N = self.N_H * self.N_V  # N = M_cov = 144 elements
-        self.L = 16  # temporal snapshots (L≤16 for "few-snapshot" story)
+        # Temporal snapshots. Increasing L increases measurement diversity but also increases compute/memory.
+        # We are moving to L=64 for improved snapshot diversity and robustness.
+        self.L = 64
         
         # M_beams: RIS codebook size (spatial beams in 2D DFT)
         # For excellent θ: set to 64 (8×8 balanced)
@@ -106,13 +108,14 @@ class SysConfig:
         # --- 2D separable DFT codebook (RECOMMENDED for training) ---
         self._build_2d_dft_codebook()
 
-        # --- Results / data / HPO paths (L=16 12x12 system) ---
-        self.RESULTS_DIR = "results_final_L16_12x12"
+        # --- Results / data / HPO paths ---
+        # Keep these derived from L so changing L doesn't silently mix artifacts.
+        self.RESULTS_DIR = f"results_final_L{self.L}_12x12"
         self.LOGS_DIR = f"{self.RESULTS_DIR}/logs"
         self.CKPT_DIR = f"{self.RESULTS_DIR}/checkpoints"
 
-        # shards root for L=16 M_beams=64 data; split folders live here
-        self.DATA_SHARDS_DIR = "data_shards_M64_L16"
+        # shards root for M_beams × L data; split folders live here
+        self.DATA_SHARDS_DIR = f"data_shards_M{self.M_BEAMS_TARGET}_L{self.L}"
         self.DATA_SHARDS_TRAIN = f"{self.DATA_SHARDS_DIR}/train"
         self.DATA_SHARDS_VAL   = f"{self.DATA_SHARDS_DIR}/val"
         self.DATA_SHARDS_TEST  = f"{self.DATA_SHARDS_DIR}/test"

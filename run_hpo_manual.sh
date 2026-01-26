@@ -33,10 +33,12 @@ SPACE="wide"         # Full search space
 EARLY_STOP=6         # Aggressive early stopping (5-6 epochs)
 # Note: CSV export is handled automatically by hpo.py
 
-# Paths
+# Paths (derive from cfg so L/M changes don't break scripts)
 PROJECT_DIR="/home/tahit/ris/MainMusic"
-HPO_DIR="$PROJECT_DIR/results_final/hpo"
-LOG_DIR="$PROJECT_DIR/results_final/logs"
+cd "$PROJECT_DIR"
+HPO_DIR="$PROJECT_DIR/$(python -c "from ris_pytorch_pipeline.configs import cfg; print(cfg.HPO_DIR)")"
+LOG_DIR="$PROJECT_DIR/$(python -c "from ris_pytorch_pipeline.configs import cfg; print(cfg.LOGS_DIR)")"
+SHARDS_DIR="$PROJECT_DIR/$(python -c "from ris_pytorch_pipeline.configs import cfg; print(cfg.DATA_SHARDS_DIR)")"
 
 echo "Configuration:"
 echo "  Project directory: $PROJECT_DIR"
@@ -48,10 +50,10 @@ echo "  Early stopping patience: $EARLY_STOP epochs"
 echo ""
 
 # Verify shards exist
-TRAIN_SHARD="$PROJECT_DIR/data_shards_M64_L16/train/shard_000.npz"
+TRAIN_SHARD="$SHARDS_DIR/train/shard_000.npz"
 if [ ! -f "$TRAIN_SHARD" ]; then
-    echo "✗ ERROR: Training shards not found at $PROJECT_DIR/data_shards_M64_L16/train/"
-    echo "  Please run ./regenerate_shards.sh first"
+    echo "✗ ERROR: Training shards not found at $SHARDS_DIR/train/"
+    echo "  Please regenerate shards first (see regenerate_shards.sh or ris_pipeline pregen-split)."
     exit 1
 fi
 echo "✓ Training shards verified"

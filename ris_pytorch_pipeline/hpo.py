@@ -25,7 +25,14 @@ def _resolve_val_dir() -> Path:
     v = Path(str(getattr(cfg, "DATA_SHARDS_VAL", "")).strip() or "")
     if str(v) and v.exists():
         return v
-    root = Path(str(getattr(cfg, "DATA_SHARDS_DIR", "data_shards_M64_L16")).strip() or "data_shards_M64_L16")
+    # Use configured shards directory (derived from cfg.L / cfg.M_BEAMS_TARGET in configs.py).
+    # Avoid hard-coded L16 fallbacks: derive from cfg if available.
+    shards_dir = str(getattr(cfg, "DATA_SHARDS_DIR", "")).strip()
+    if not shards_dir:
+        L = int(getattr(cfg, "L", 0) or 0)
+        M = int(getattr(cfg, "M_BEAMS_TARGET", 0) or 0)
+        shards_dir = f"data_shards_M{M}_L{L}" if (M > 0 and L > 0) else "data_shards"
+    root = Path(shards_dir)
     return root / "val"
 
 
@@ -389,7 +396,10 @@ def run_hpo(
         # Use distinct study names so results don't mix between objectives.
         mode = str(objective_mode).lower().strip()
         suffix = "surrogate" if mode == "surrogate" else "mvdr_final"
-        study_name = study_name_override or getattr(cfg, "HPO_STUDY_NAME", f"L16_M64_{space}_v2_{suffix}")
+        # Derive study naming from system geometry to avoid mixing studies across L/M.
+        L_tag = f"L{int(getattr(cfg, 'L', 0))}"
+        M_tag = f"M{int(getattr(cfg, 'M_BEAMS_TARGET', 0))}"
+        study_name = study_name_override or getattr(cfg, "HPO_STUDY_NAME", f"{L_tag}_{M_tag}_{space}_v2_{suffix}")
         study = _study(hpo_db, name=study_name, seed=42)
 
         # Optional: enqueue a fixed list of parameter dicts (used by two-stage rerank).
@@ -428,7 +438,10 @@ def run_hpo(
             lam_cov = trial.suggest_float("lam_cov", 0.5, 2.0)   # covariance NMSE weight (primary)
             lam_ang = trial.suggest_float("lam_ang", 0.0, 0.30)  # aux angle weight (regularizer)
             lam_rng = trial.suggest_float("lam_rng", 0.0, 0.30)  # aux range weight (regularizer)
-            shrink_alpha = trial.suggest_float("shrink_alpha", 0.10, 0.20)  # Tightened from [0.10, 0.25]
+            # Shrinkage "base alpha" used by torch/np shrink utilities:
+            #   alpha = base_alpha * 10^(-SNR/20), clamped to <= 5e-2.
+            # For L=64, we generally want *less* shrinkage than L=16. Search in a log range.
+            shrink_base_alpha = trial.suggest_float("shrink_base_alpha", 5e-4, 2e-2, log=True)
             softmax_tau = trial.suggest_float("softmax_tau", 0.15, 0.25)
 
             # Prefer larger batches (avoid BS=32 which degrades quickly)
@@ -449,7 +462,7 @@ def run_hpo(
                 lam_cov=lam_cov,
                 lam_ang=lam_ang,
                 lam_rng=lam_rng,
-                shrink_alpha=shrink_alpha,
+                shrink_base_alpha=shrink_base_alpha,
                 softmax_tau=softmax_tau,
                 batch_size=batch_size,
                 nf_mle_snr_threshold=nf_mle_snr_threshold,
@@ -507,7 +520,7 @@ def run_hpo(
                 mdl_cfg.BATCH_SIZE = s["batch_size"]
 
                 # apply suggestions - conditioning / calibration knobs
-                mdl_cfg.SHRINK_BASE_ALPHA = s["shrink_alpha"]
+                mdl_cfg.SHRINK_BASE_ALPHA = s["shrink_base_alpha"]
                 mdl_cfg.SOFTMAX_TAU = s["softmax_tau"]
 
                 # Now create Trainer (after setting USE_SWA=False)
@@ -743,7 +756,9 @@ def run_hpo_two_stage(
     stamp = time.strftime("%Y%m%d_%H%M%S")
 
     # Stage 1
-    s1_name = f"L16_M64_{space}_2stage_{stamp}_stage1_surrogate"
+    L_tag = f"L{int(getattr(cfg, 'L', 0))}"
+    M_tag = f"M{int(getattr(cfg, 'M_BEAMS_TARGET', 0))}"
+    s1_name = f"{L_tag}_{M_tag}_{space}_2stage_{stamp}_stage1_surrogate"
     run_hpo(
         n_trials=int(stage1_trials),
         epochs_per_trial=int(stage1_epochs),
@@ -763,7 +778,7 @@ def run_hpo_two_stage(
     print(f"[HPO2] Reranking top-K={len(enqueue)} via MVDR-final objective...", flush=True)
 
     # Stage 2
-    s2_name = f"L16_M64_{space}_2stage_{stamp}_stage2_mvdr_final"
+    s2_name = f"{L_tag}_{M_tag}_{space}_2stage_{stamp}_stage2_mvdr_final"
     run_hpo(
         n_trials=len(enqueue),
         epochs_per_trial=int(stage2_epochs),

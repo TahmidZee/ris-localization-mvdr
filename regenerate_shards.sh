@@ -10,15 +10,17 @@ echo "SHARD REGENERATION SCRIPT"
 echo "=============================================================================="
 echo ""
 
-# Configuration
-SHARD_DIR="data_shards_M64_L16"
+# Configuration (derive shard dir + L from cfg by default)
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
+SHARD_DIR="$(python -c "from ris_pytorch_pipeline.configs import cfg; print(cfg.DATA_SHARDS_DIR)")"
 N_TRAIN=100000
 N_VAL=10000
 N_TEST=10000
 SHARD_SIZE=25000
 SEED=42
 ETA=0.0  # No element perturbation
-L=16     # L=16 snapshots (few-snapshot regime)
+L="$(python -c "from ris_pytorch_pipeline.configs import cfg; print(int(cfg.L))")"
 
 # Robust training ranges (match paper setup)
 PHI_FOV=60.0     # ±60° azimuth

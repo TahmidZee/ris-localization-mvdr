@@ -493,7 +493,10 @@ class Trainer:
         if "lam_rng" in best:
             self._hpo_loss_weights["lam_rng"] = float(best["lam_rng"])
         # NOTE: lam_K removed - using MVDR peak detection instead
-        if "shrink_alpha" in best:
+        # Backward compatible: older HPO used "shrink_alpha" but it actually maps to SHRINK_BASE_ALPHA.
+        if "shrink_base_alpha" in best:
+            setattr(mdl_cfg, "SHRINK_BASE_ALPHA", float(best["shrink_base_alpha"]))
+        elif "shrink_alpha" in best:
             setattr(mdl_cfg, "SHRINK_BASE_ALPHA", float(best["shrink_alpha"]))
         if "softmax_tau" in best:
             setattr(mdl_cfg, "SOFTMAX_TAU", float(best["softmax_tau"]))

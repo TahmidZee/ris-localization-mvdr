@@ -88,6 +88,10 @@ overfit_test.log
 correlation_check.py
 test_gpu_music.py
 
+# Local diagnostics / uploaded artifacts (do not commit)
+diagnose_mvdr.py
+hpo_goose/
+
 # Environment files
 .env
 .env.local
