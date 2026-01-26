@@ -272,9 +272,13 @@ class SysConfig:
         self.MVDR_CFAR_Z = 5.0
 
         # R_samp (offline sample covariance) construction
-        # - matched_filter: fast, stable covariance proxy (recommended default)
-        # - ridge_ls: slower per-snapshot ridge solve (stronger but expensive)
-        self.RSAMP_SOLVER = "matched_filter"
+        # - als_lowrank: joint low-rank ALS across snapshots (recommended for offline shards; most MVDR-useful)
+        # - ridge_ls / matched_filter: cheaper heuristics (often not MVDR-useful by themselves)
+        self.RSAMP_SOLVER = "als_lowrank"
+        self.RSAMP_ALS_K = int(getattr(self, "K_MAX", 5))
+        self.RSAMP_ALS_ITERS = 4
+        self.RSAMP_ALS_RIDGE = 1e-2
+        self.RSAMP_ALS_SEED = 0
         self.MVDR_DELTA_SCALE = 1e-2
         self.MVDR_DO_REFINEMENT = True
         # Refiner is part of the plan: production inference assumes it is present.

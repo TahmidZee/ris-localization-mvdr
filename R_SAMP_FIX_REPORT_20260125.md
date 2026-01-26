@@ -22,6 +22,10 @@
 - **(D) Inference path `hybrid_estimate_raw()` built `R_samp` using the wrong channel input**
   - It used `H` from the dataset, which is an *effective per-snapshot* vector `[L,M]`, not the full BS→RIS matrix `[M,N]` required to solve for RIS-domain signals.
 
+### Follow-up Finding (Important): why “numerically sane” still gave MVDR F1=0
+- Even after fixing coherence + mean-centering and making `R_samp` Hermitian/trace-normalized, **MVDR on `R_samp` could still be F1≈0**.
+- Reason: per-snapshot inversion is fundamentally ill-posed here (**M < N**). Estimating a full spatial covariance from a handful of underdetermined snapshots requires an explicitly **joint low-rank** estimator; naive per-snapshot `x_hat` heuristics can be MVDR-useless while still looking “reasonable” under NMSE/trace checks.
+
 ### Fixes Implemented
 - **Dataset generation fix (required for correct `R_samp`)**
   - `ris_pytorch_pipeline/dataset.py`
@@ -31,12 +35,13 @@
 
 - **Correct `R_samp` construction**
   - `ris_pytorch_pipeline/angle_pipeline.py`
-  - Rewrote `build_sample_covariance_from_snapshots()`:
+  - Rewrote `build_sample_covariance_from_snapshots()` and added a stronger solver:
     - Accepts `H` as `[M,N]` or `[L,M,N]`
-    - Estimates per-snapshot RIS-domain `x_hat[l]` via:
-      - default **matched filter** (fast/stable), or
-      - optional `ridge_ls` (stronger, slower)
-    - Forms covariance: \( R_{samp} = \\frac{1}{L} \\sum_l x_{hat,l} x_{hat,l}^H \\)
+    - **Default (recommended) solver: `als_lowrank`**
+      - Joint alternating least squares across snapshots to estimate a low-rank factor \(F\\) such that
+        \(y_l \\approx (H\\,\\mathrm{diag}(c_l))\\,(F s_l)\).
+      - Sets \(R_{samp} = F F^H\) then hermitizes + trace-normalizes.
+    - Keeps `ridge_ls` and `matched_filter` as cheaper heuristics (not recommended for MVDR validation).
     - Hermitizes and trace-normalizes to `tr(R)=N`
 
 - **Naming / call-site consistency**
@@ -51,6 +56,8 @@
   - New command: `python -m ris_pytorch_pipeline.regression_tests r_samp`
     - Checks Hermitian property, trace normalization, non-degeneracy, and loose NMSE correlation vs `R`.
     - Implemented to read **one shard via mmap** to avoid OOM on machines with many shards.
+  - New command: `python -m ris_pytorch_pipeline.regression_tests r_samp_mvdr`
+    - Recomputes `R_samp` from snapshots and runs **tiny MVDR** to ensure **TP>0** (stronger guardrail).
 
 ### Operational Notes
 - **You must regenerate shards** for these fixes to take effect, because `R_samp` is stored in `.npz` shards:

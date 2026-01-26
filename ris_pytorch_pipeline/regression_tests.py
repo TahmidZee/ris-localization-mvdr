@@ -95,6 +95,103 @@ def r_samp_sanity_test(*, n: int = 8, seed: int = 0) -> None:
 
 
 @torch.no_grad()
+def r_samp_mvdr_smoke_test(*, n: int = 8, seed: int = 0) -> None:
+    """
+    Stronger regression guardrail: recompute R_samp from raw snapshots using the configured solver
+    and ensure MVDR peak picking achieves non-zero TP on a tiny deterministic subset.
+
+    This is intentionally small to avoid OOM / long runtime.
+    """
+    from pathlib import Path
+    from .angle_pipeline import build_sample_covariance_from_snapshots
+    from .eval_angles import hungarian_pairs_angles_ranges
+
+    def _ri_to_c_np(x):
+        x = np.asarray(x)
+        if x.shape[-1] == 2:
+            return (x[..., 0] + 1j * x[..., 1]).astype(np.complex64)
+        return x.astype(np.complex64)
+
+    val_dir = Path(str(getattr(cfg, "DATA_SHARDS_VAL", f"{cfg.DATA_SHARDS_DIR}/val")))
+    shard_paths = sorted(val_dir.glob("*.npz"))
+    if not shard_paths:
+        raise RuntimeError(f"[r_samp_mvdr] No .npz shards found under: {val_dir}")
+
+    z = np.load(shard_paths[0], allow_pickle=False, mmap_mode="r")
+    n0 = int(z["y"].shape[0])
+    rng = np.random.default_rng(int(seed))
+    idx = rng.choice(n0, size=min(int(n), n0), replace=False)
+
+    # Tiny MVDR settings to keep it fast
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    est = get_gpu_estimator(cfg, device=device)
+    r_planes = (getattr(est, "default_r_planes_mvdr", None) or est.default_r_planes)[:3]
+    grid_phi, grid_theta = 61, 31
+    Kmax = int(getattr(cfg, "K_MAX", 5))
+    tol_phi, tol_th, tol_r = 5.0, 5.0, 1.0
+
+    TP = FP = FN = total_gt = 0
+    for i in idx:
+        K = int(z["K"][int(i)])
+        if K <= 0:
+            continue
+        ptr = np.asarray(z["ptr"][int(i)], dtype=np.float32).reshape(-1)
+        gt_phi = np.rad2deg(ptr[0:Kmax][:K])
+        gt_th = np.rad2deg(ptr[Kmax:2 * Kmax][:K])
+        gt_r = ptr[2 * Kmax:3 * Kmax][:K]
+        total_gt += K
+
+        y = _ri_to_c_np(z["y"][int(i)])
+        H_full = _ri_to_c_np(z["H_full"][int(i)])
+        codes = _ri_to_c_np(z["codes"][int(i)])
+
+        R_samp = build_sample_covariance_from_snapshots(y, H_full, codes, cfg, tikhonov_alpha=1e-3)
+        R_t = torch.from_numpy(R_samp).to(torch.complex64).to(device)
+
+        sources, _ = est.detect_sources_mvdr(
+            R_t,
+            grid_phi=grid_phi,
+            grid_theta=grid_theta,
+            r_planes=r_planes,
+            delta_scale=1e-2,
+            threshold_db=12.0,
+            threshold_mode="mad",
+            cfar_z=5.0,
+            max_sources=Kmax,
+            do_refinement=False,
+        )
+
+        phi_p = np.array([s[0] for s in sources], dtype=np.float32)
+        th_p = np.array([s[1] for s in sources], dtype=np.float32)
+        r_p = np.array([s[2] for s in sources], dtype=np.float32)
+
+        pairs = hungarian_pairs_angles_ranges(phi_p, th_p, r_p, gt_phi, gt_th, gt_r)
+        tp_i = sum(
+            1
+            for pi, gi in pairs
+            if abs(phi_p[pi] - gt_phi[gi]) <= tol_phi
+            and abs(th_p[pi] - gt_th[gi]) <= tol_th
+            and abs(r_p[pi] - gt_r[gi]) <= tol_r
+        )
+        TP += tp_i
+        FP += max(0, len(phi_p) - tp_i)
+        FN += max(0, K - tp_i)
+
+    if total_gt == 0:
+        raise RuntimeError("[r_samp_mvdr] No valid GT samples found.")
+
+    prec = TP / max(1, TP + FP)
+    rec = TP / max(1, TP + FN)
+    f1 = 2.0 * prec * rec / max(1e-12, prec + rec)
+
+    # We expect non-zero TP if R_samp carries usable structure.
+    if TP <= 0:
+        raise RuntimeError(f"[r_samp_mvdr] TP=0 (FP={FP}, FN={FN}, F1={f1:.3f})")
+
+    print(f"✅ r_samp_mvdr_smoke_test passed (TP={TP}, FP={FP}, FN={FN}, F1={f1:.3f})", flush=True)
+
+
+@torch.no_grad()
 def mvdr_lowrank_equivalence_test(
     *,
     n_trials: int = 5,
@@ -181,6 +278,10 @@ def _main():
     ap_rs.add_argument("--n", type=int, default=8)
     ap_rs.add_argument("--seed", type=int, default=0)
 
+    ap_rsm = sub.add_parser("r_samp_mvdr", help="Smoke-test MVDR on recomputed R_samp (tiny)")
+    ap_rsm.add_argument("--n", type=int, default=8)
+    ap_rsm.add_argument("--seed", type=int, default=0)
+
     ap_lr = sub.add_parser("mvdr_lowrank", help="Validate low-rank MVDR vs full MVDR")
     ap_lr.add_argument("--n", type=int, default=5)
     ap_lr.add_argument("--k_lr", type=int, default=10)
@@ -194,6 +295,8 @@ def _main():
     args = ap.parse_args()
     if args.cmd == "r_samp":
         r_samp_sanity_test(n=args.n, seed=args.seed)
+    if args.cmd == "r_samp_mvdr":
+        r_samp_mvdr_smoke_test(n=args.n, seed=args.seed)
     if args.cmd == "mvdr_lowrank":
         mvdr_lowrank_equivalence_test(
             n_trials=args.n,

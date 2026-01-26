@@ -61,10 +61,12 @@ These changes were added after reviewing failure modes observed in logs (e.g. se
 
 **Fixes:**
 - **`dataset.py`**: Make source symbols vary over snapshots (`s` is `[L,K]`), update `y_clean` generation to use `s[l]`, and compute `R_true` from average per-source power across snapshots.
-- **`angle_pipeline.py`**: Rewrite `build_sample_covariance_from_snapshots()` to compute a true sample covariance \(R_{samp}=\\frac{1}{L}\\sum x_{hat}x_{hat}^H\) without mean-centering; accept `H` as `[M,N]` or `[L,M,N]`; add configurable solver (`RSAMP_SOLVER`).
+- **`angle_pipeline.py`**: Rewrite `build_sample_covariance_from_snapshots()` and add a **joint low-rank solver**:
+  - default `RSAMP_SOLVER="als_lowrank"` (offline shards) uses ALS across snapshots to estimate a low-rank factor \(F\) and sets \(R_{samp}=F F^H\), then hermitizes + trace-normalizes.
+  - keep `ridge_ls` / `matched_filter` as cheaper heuristics (often MVDR-useless by themselves in the **M<N** regime).
 - **`baseline.py`**: Replace the old rank-1 `incident_cov_from_snaps()` behavior with a wrapper that delegates to `build_sample_covariance_from_snapshots()`.
 - **`infer.py`**: Fix `hybrid_estimate_raw()` to only build `R_samp` from `H_full` (or use precomputed `R_samp`); stop repeating `H_full` unnecessarily in `hybrid_estimate_final()`.
-- **`regression_tests.py`**: Add `r_samp` sanity test (mmap-based, lightweight) to prevent silent regressions.
+- **`regression_tests.py`**: Add `r_samp` sanity test (mmap-based, lightweight) + `r_samp_mvdr` tiny MVDR smoke test to prevent silent regressions.
 
 **Report:** `R_SAMP_FIX_REPORT_20260125.md`
 

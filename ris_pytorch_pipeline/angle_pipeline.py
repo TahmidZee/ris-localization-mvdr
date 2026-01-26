@@ -95,35 +95,108 @@ def build_sample_covariance_from_snapshots(y, H, codes, cfg, tikhonov_alpha=1e-3
     else:
         raise ValueError(f"H must be [M,N] or [L,M,N], got {H.shape}")
 
-    # Solver choice: matched-filter (fast) or ridge_ls (slower, stronger).
-    solver = str(getattr(cfg, "RSAMP_SOLVER", "matched_filter")).lower().strip()
+    # Solver choice:
+    # - matched_filter: fast heuristic (often too weak for MVDR peak picking)
+    # - ridge_ls: per-snapshot ridge solve (still limited because M < N)
+    # - als_lowrank: joint low-rank alternating least squares across snapshots (recommended for offline shards)
+    solver = str(getattr(cfg, "RSAMP_SOLVER", "als_lowrank")).lower().strip()
 
-    x_hat = np.zeros((L, N), dtype=np.complex128)
-    for ell in range(L):
-        H_ell = H_stack[ell].astype(np.complex128)     # [M,N]
-        c_ell = codes[ell].astype(np.complex128)       # [N]
-        y_ell = y[ell].astype(np.complex128)           # [M]
-        # Effective sensing matrix: G = H @ diag(codes[ell]) == H * codes[ell][None,:]
-        G = H_ell * c_ell[None, :]                     # [M,N]
-        if solver == "ridge_ls":
-            GH_G = G.conj().T @ G                      # [N,N]
-            GH_y = G.conj().T @ y_ell                  # [N]
-            tr = float(np.trace(GH_G).real)
-            alpha_scaled = float(tikhonov_alpha) * tr / max(1, N)
-            reg = GH_G + alpha_scaled * np.eye(N, dtype=np.complex128)
+    if solver == "als_lowrank":
+        # Joint low-rank ALS across snapshots:
+        #   y_l ≈ (H @ diag(c_l)) @ (F s_l) ,  F:[N,K], s_l:[K]
+        # Solve for {s_l} given F, then update F via stacked ridge LS; repeat.
+        K = int(getattr(cfg, "RSAMP_ALS_K", getattr(cfg, "K_MAX", 5)))
+        K = max(1, min(K, int(getattr(cfg, "K_MAX", K))))
+        n_iter = int(getattr(cfg, "RSAMP_ALS_ITERS", 4))
+        ridge = float(getattr(cfg, "RSAMP_ALS_RIDGE", 1e-2))
+
+        # Stack per-snapshot sensing matrices B_l = H * c_l[None,:]
+        B_stack = np.zeros((L * M, N), dtype=np.complex128)
+        y_stack = np.zeros((L * M,), dtype=np.complex128)
+        for ell in range(L):
+            H_ell = H_stack[ell].astype(np.complex128)
+            c_ell = codes[ell].astype(np.complex128)
+            B_l = H_ell * c_ell[None, :]  # [M,N]
+            B_stack[ell * M : (ell + 1) * M, :] = B_l
+            y_stack[ell * M : (ell + 1) * M] = y[ell].astype(np.complex128)
+
+        # Init F: random + small matched-filter hint
+        rng = np.random.default_rng(int(getattr(cfg, "RSAMP_ALS_SEED", 0)))
+        F = (rng.standard_normal((N, K)) + 1j * rng.standard_normal((N, K))).astype(np.complex128) / np.sqrt(2.0)
+        # Normalize columns
+        F = F / (np.linalg.norm(F, axis=0, keepdims=True) + 1e-12)
+
+        # ALS loop
+        s = np.zeros((L, K), dtype=np.complex128)
+        eyeK = np.eye(K, dtype=np.complex128)
+        eyeNK = np.eye(N * K, dtype=np.complex128)
+        for _ in range(max(1, n_iter)):
+            # 1) Solve s_l given F
+            for ell in range(L):
+                B_l = B_stack[ell * M : (ell + 1) * M, :]  # [M,N]
+                A_l = B_l @ F  # [M,K]
+                AH_A = A_l.conj().T @ A_l
+                AH_y = A_l.conj().T @ y[ell].astype(np.complex128)
+                tr = float(np.trace(AH_A).real)
+                lam = ridge * tr / max(1.0, float(K))
+                try:
+                    s[ell] = np.linalg.solve(AH_A + lam * eyeK, AH_y)
+                except np.linalg.LinAlgError:
+                    s[ell] = np.linalg.lstsq(AH_A + lam * eyeK, AH_y, rcond=None)[0]
+
+            # 2) Solve F given s (stacked ridge LS over vec(F))
+            # Build A_big = [D_1 B_stack, ..., D_K B_stack] where D_k scales rows by s_lk per snapshot.
+            A_big = np.zeros((L * M, N * K), dtype=np.complex128)
+            for k in range(K):
+                col0 = k * N
+                # row scale factors for this component: s[ell,k] repeated M times
+                scale = np.repeat(s[:, k], M).astype(np.complex128)  # [L*M]
+                A_big[:, col0 : col0 + N] = (scale[:, None] * B_stack)
+
+            # Ridge solve
+            AH_A = A_big.conj().T @ A_big
+            AH_y = A_big.conj().T @ y_stack
+            tr = float(np.trace(AH_A).real)
+            lam = ridge * tr / max(1.0, float(N * K))
             try:
-                x_hat[ell] = np.linalg.solve(reg, GH_y)
+                f_vec = np.linalg.solve(AH_A + lam * eyeNK, AH_y)
             except np.linalg.LinAlgError:
-                x_hat[ell] = np.linalg.lstsq(reg, GH_y, rcond=None)[0]
-        else:
-            # Matched filter: cheap and stable (works well as a covariance proxy).
-            x_hat[ell] = (G.conj().T @ y_ell) / max(1.0, float(M))
+                f_vec = np.linalg.lstsq(AH_A + lam * eyeNK, AH_y, rcond=None)[0]
+            F = f_vec.reshape(K, N).T  # [N,K]
 
-    # Sample covariance over snapshots (NO mean-centering).
-    R_samp = (x_hat.conj().T @ x_hat) / max(1.0, float(L))  # [N,N]
+            # Re-normalize columns to control scale ambiguity
+            F = F / (np.linalg.norm(F, axis=0, keepdims=True) + 1e-12)
 
-    # Cast back to complex64 for consistency
-    R_samp = R_samp.astype(np.complex64)
+        R_samp = (F @ F.conj().T).astype(np.complex64)
+
+    else:
+        # Per-snapshot heuristic x_hat -> covariance (limited because M < N per snapshot)
+        x_hat = np.zeros((L, N), dtype=np.complex128)
+        for ell in range(L):
+            H_ell = H_stack[ell].astype(np.complex128)     # [M,N]
+            c_ell = codes[ell].astype(np.complex128)       # [N]
+            y_ell = y[ell].astype(np.complex128)           # [M]
+            # Effective sensing matrix: G = H @ diag(codes[ell]) == H * codes[ell][None,:]
+            G = H_ell * c_ell[None, :]                     # [M,N]
+            if solver == "ridge_ls":
+                GH_G = G.conj().T @ G                      # [N,N]
+                GH_y = G.conj().T @ y_ell                  # [N]
+                tr = float(np.trace(GH_G).real)
+                alpha_scaled = float(tikhonov_alpha) * tr / max(1, N)
+                reg = GH_G + alpha_scaled * np.eye(N, dtype=np.complex128)
+                try:
+                    x_hat[ell] = np.linalg.solve(reg, GH_y)
+                except np.linalg.LinAlgError:
+                    x_hat[ell] = np.linalg.lstsq(reg, GH_y, rcond=None)[0]
+            else:
+                # Matched filter: cheap and stable (heuristic covariance proxy).
+                x_hat[ell] = (G.conj().T @ y_ell) / max(1.0, float(M))
+
+        # Sample covariance over snapshots (NO mean-centering).
+        R_samp = (x_hat.conj().T @ x_hat).astype(np.complex64) / max(1.0, float(L))  # [N,N]
+
+    # Ensure complex64
+    R_samp = R_samp.astype(np.complex64, copy=False)
     
     # Hermitize and trace-normalize
     R_samp = 0.5 * (R_samp + R_samp.conj().T)
