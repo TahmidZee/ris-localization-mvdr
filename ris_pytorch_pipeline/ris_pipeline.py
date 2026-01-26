@@ -11,11 +11,12 @@ def main():
     # --- flat pregen (single folder) ---
     g1 = sub.add_parser("pregen", help="Pre-generate NPZ shards (single folder)")
     g1.add_argument("--n", type=int, default=200000)
-    g1.add_argument("--shard", type=int, default=25000)
+    g1.add_argument("--shard", type=int, default=int(getattr(cfg, "SHARD_SIZE_DEFAULT", 25000)))
     g1.add_argument("--eta", type=float, default=0.05)
     g1.add_argument("--L", type=int, default=None)
     g1.add_argument("--seed", type=int, default=42)
     g1.add_argument("--out_dir", type=str, default=str(getattr(cfg, "DATA_SHARDS_DIR", "results_final/data/shards")))
+    g1.add_argument("--with-rsamp", action="store_true", help="Store + precompute R_samp inside shards (VERY expensive at L>=64).")
 
     # robust-track knobs for pregen
     for g in (g1,):
@@ -39,11 +40,12 @@ def main():
     g1s.add_argument("--n-train", type=int, default=160000)
     g1s.add_argument("--n-val",   type=int, default=40000)
     g1s.add_argument("--n-test",  type=int, default=8000)
-    g1s.add_argument("--shard", type=int, default=25000)
+    g1s.add_argument("--shard", type=int, default=int(getattr(cfg, "SHARD_SIZE_DEFAULT", 25000)))
     g1s.add_argument("--eta", type=float, default=0.05)
     g1s.add_argument("--L", type=int, default=None)
     g1s.add_argument("--seed", type=int, default=42)
     g1s.add_argument("--out_dir", type=str, default=str(getattr(cfg, "DATA_SHARDS_DIR", "results_final/data/shards")))
+    g1s.add_argument("--with-rsamp", action="store_true", help="Store + precompute R_samp inside shards (VERY expensive at L>=64).")
     # same robust args
     for g in (g1s,):
         g.add_argument("--phi-fov-deg", type=float, default=60.0)
@@ -179,6 +181,11 @@ def main():
         mdl_cfg.DR_WAVELEN_JITTER   = getattr(args, "dr_wav_jitter")
         mdl_cfg.DR_DSPACING_JITTER  = getattr(args, "dr_dspacing_jitter")
         set_sampling_overrides_from_cfg(mdl_cfg)
+
+        # Shard format knobs
+        if bool(getattr(args, "with_rsamp", False)):
+            cfg.STORE_RSAMP_IN_SHARDS = True
+            cfg.PRECOMPUTE_RSAMP_IN_SHARDS = True
 
         if args.cmd == "pregen":
             prepare_shards(Path(args.out_dir), n_samples=args.n,

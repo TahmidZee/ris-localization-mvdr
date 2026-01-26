@@ -17,7 +17,7 @@ SHARD_DIR="$(python -c "from ris_pytorch_pipeline.configs import cfg; print(cfg.
 N_TRAIN=100000
 N_VAL=10000
 N_TEST=10000
-SHARD_SIZE=25000
+SHARD_SIZE="$(python -c "from ris_pytorch_pipeline.configs import cfg; print(int(getattr(cfg,'SHARD_SIZE_DEFAULT', 25000)))")"
 SEED=42
 ETA=0.0  # No element perturbation
 L="$(python -c "from ris_pytorch_pipeline.configs import cfg; print(int(cfg.L))")"
@@ -37,6 +37,7 @@ echo "  Validation samples: $N_VAL"
 echo "  Test samples: $N_TEST"
 echo "  Shard size: $SHARD_SIZE"
 echo "  L (snapshots): $L"
+echo "  Store R_samp in shards: $(python -c \"from ris_pytorch_pipeline.configs import cfg; print(bool(getattr(cfg,'STORE_RSAMP_IN_SHARDS', False)))\")"
 echo "  PHI FOV: ±${PHI_FOV}°, THETA FOV: ±${THETA_FOV}°"
 echo "  Range: ${R_MIN}m to ${R_MAX}m"
 echo "  SNR: ${SNR_MIN} dB to ${SNR_MAX} dB"

@@ -263,6 +263,16 @@ class SysConfig:
         self.HYBRID_COV_BETA = 0.0
         self.HYBRID_COV_DEBUG = True          # Set True for hybrid covariance diagnostics (ONE-TIME PRINT)
 
+        # --- Shard generation controls (important for L>=64) ---
+        # Generating and storing R_samp inside shards is extremely expensive in RAM/CPU at L=64
+        # (and not needed when HYBRID_COV_BETA=0.0 / R_pred-only training).
+        self.STORE_RSAMP_IN_SHARDS = bool(getattr(self, "STORE_RSAMP_IN_SHARDS", (float(self.HYBRID_COV_BETA) > 0.0)))
+        self.PRECOMPUTE_RSAMP_IN_SHARDS = bool(getattr(self, "PRECOMPUTE_RSAMP_IN_SHARDS", self.STORE_RSAMP_IN_SHARDS))
+        self.STORE_H_FULL_IN_SHARDS = bool(getattr(self, "STORE_H_FULL_IN_SHARDS", True))
+        # Smaller shards prevent "looks stuck" behavior due to huge in-RAM preallocations.
+        self.SHARD_SIZE_DEFAULT = int(getattr(self, "SHARD_SIZE_DEFAULT", (2000 if int(self.L) >= 64 else 25000)))
+        self.SHARD_PROGRESS_EVERY = int(getattr(self, "SHARD_PROGRESS_EVERY", (200 if int(self.L) >= 64 else 1000)))
+
         # === MVDR (K-free) inference defaults ===
         # Used by ris_pytorch_pipeline.infer.hybrid_estimate_final (MVDR-first).
         self.MVDR_GRID_PHI = 361

@@ -70,6 +70,12 @@ def r_samp_sanity_test(*, n: int = 8, seed: int = 0) -> None:
         nmse_list.append(_nmse(Rs_h, R_h))
 
     if len(nmse_list) == 0:
+        if "R_samp" not in z.files:
+            raise RuntimeError(
+                "No R_samp found in val shards. If you want this test, regenerate shards with "
+                "`python -m ris_pytorch_pipeline.ris_pipeline pregen-split --with-rsamp ...` "
+                "(note: very expensive at L>=64)."
+            )
         raise RuntimeError("No samples with both R and R_samp found in val shards.")
 
     # Hermitian should be very close (it is explicitly hermitized).

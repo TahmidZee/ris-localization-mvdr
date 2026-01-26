@@ -1,5 +1,5 @@
 # ris_pytorch_pipeline/dataset.py
-import numpy as np, math, os
+import numpy as np, math, os, time
 from torch.utils.data import Dataset
 import torch
 from .configs import cfg, mdl_cfg
@@ -289,17 +289,35 @@ def prepare_shards(out_dir, n_samples: int, shard_size: int = 25000,
 
     for s in range(n_shards):
         n_this = min(shard_size, n_samples - s*shard_size)
+        t0 = time.time()
+
+        # Shard format controls (important for L>=64).
+        store_h_full = bool(getattr(cfg, "STORE_H_FULL_IN_SHARDS", True))
+        store_rsamp = bool(getattr(cfg, "STORE_RSAMP_IN_SHARDS", False))
+        precompute_rsamp = store_rsamp and bool(getattr(cfg, "PRECOMPUTE_RSAMP_IN_SHARDS", True))
+        prog_every = int(getattr(cfg, "SHARD_PROGRESS_EVERY", 1000))
+        prog_every = max(1, prog_every)
+
+        print(
+            f"[pregen] shard {s+1}/{n_shards}: n={n_this} L={chosen_L} "
+            f"store_rsamp={store_rsamp} precompute_rsamp={precompute_rsamp} store_h_full={store_h_full}",
+            flush=True,
+        )
         y = np.zeros((n_this, chosen_L, cfg.M, 2), np.float32)
         H = np.zeros((n_this, chosen_L, cfg.M, 2), np.float32)  # H_eff per snapshot (for backward compat)
-        H_full = np.zeros((n_this, cfg.M, cfg.N, 2), np.float32)  # NEW: Full BS→RIS channel [M_BS, N]
+        H_full = np.zeros((n_this, cfg.M, cfg.N, 2), np.float32) if store_h_full else None  # Optional: Full BS→RIS channel [M_BS, N]
         codes = np.zeros((n_this, chosen_L, cfg.N, 2), np.float32)
         ptr = np.zeros((n_this, 3*cfg.K_MAX), np.float32)
         Kvec = np.zeros((n_this,), np.int32)
         snr = np.zeros((n_this,), np.float32)
         R = np.zeros((n_this, cfg.N, cfg.N, 2), np.float32)
-        R_samp = np.zeros((n_this, cfg.N, cfg.N, 2), np.float32)  # NEW: offline sample covariance
+        R_samp = np.zeros((n_this, cfg.N, cfg.N, 2), np.float32) if store_rsamp else None  # Optional: offline sample covariance
 
         for i in range(n_this):
+            if (i % prog_every) == 0:
+                dt = time.time() - t0
+                rate = float(i) / max(dt, 1e-9)
+                print(f"[pregen]   {i}/{n_this} ({rate:.2f} samples/s)", flush=True)
             np.random.seed(int(seed) + s*shard_size + i)
             ds = RISDataset(n_samples=1, phase=2, eta_perturb=eta_perturb)
             sdict = ds.snapshot(override_L=chosen_L)
@@ -312,8 +330,9 @@ def prepare_shards(out_dir, n_samples: int, shard_size: int = 25000,
             H_cplx = sdict['H_cplx']  # [M_BS, N] - BS to RIS channel matrix
             C_cplx = sdict['codes']   # [L, N] - RIS codes for L snapshots
             
-            # 1) Store the full channel matrix once per sample (NEW!)
-            H_full[i] = to_ri(H_cplx.astype(np.complex64))  # [M_BS, N, 2]
+            # 1) Store the full channel matrix once per sample (optional)
+            if store_h_full and (H_full is not None):
+                H_full[i] = to_ri(H_cplx.astype(np.complex64))  # [M_BS, N, 2]
             
             # 2) Also store per-snapshot effective H for backward compatibility
             H_eff = np.zeros((chosen_L, cfg.M), dtype=np.complex64)
@@ -338,22 +357,32 @@ def prepare_shards(out_dir, n_samples: int, shard_size: int = 25000,
             Rc = Rc * (cfg.N / max(tr, 1e-9))  # Normalize to tr(R) = N, not 1
             R[i] = to_ri(Rc.astype(np.complex64))
 
-            # --- NEW: Offline R_samp precompute (NumPy, CPU) for hybrid blending ---
-            try:
-                y_cplx = sdict['y_cplx'].astype(np.complex64)        # [L, M]
-                H_cplx = sdict['H_cplx'].astype(np.complex64)        # [M, N]
-                C_cplx = sdict['codes'].astype(np.complex64)         # [L, N]
-                # build_sample_covariance_from_snapshots accepts H as [M,N] or [L,M,N].
-                R_samp_np = build_sample_covariance_from_snapshots(y_cplx, H_cplx, C_cplx, cfg)
-                # Hermitize (defensive) and convert to RI
-                R_samp_np = 0.5 * (R_samp_np + R_samp_np.conj().T)
-                R_samp[i] = to_ri(R_samp_np.astype(np.complex64))
-            except Exception:
-                # If it fails, leave zeros; training will fall back to pure R_pred
-                R_samp[i] = 0.0
+            # --- Optional: Offline R_samp precompute (VERY expensive at L>=64) ---
+            if store_rsamp and (R_samp is not None):
+                if precompute_rsamp:
+                    try:
+                        y_cplx = sdict["y_cplx"].astype(np.complex64)        # [L, M]
+                        H_cplx = sdict["H_cplx"].astype(np.complex64)        # [M, N]
+                        C_cplx = sdict["codes"].astype(np.complex64)         # [L, N]
+                        # build_sample_covariance_from_snapshots accepts H as [M,N] or [L,M,N].
+                        R_samp_np = build_sample_covariance_from_snapshots(y_cplx, H_cplx, C_cplx, cfg)
+                        R_samp_np = 0.5 * (R_samp_np + R_samp_np.conj().T)
+                        R_samp[i] = to_ri(R_samp_np.astype(np.complex64))
+                    except Exception:
+                        # If it fails, leave zeros; training will fall back to pure R_pred
+                        R_samp[i] = 0.0
+                else:
+                    # Stored-but-not-precomputed: leave zeros (format compatibility)
+                    R_samp[i] = 0.0
 
-        np.savez(out_dir / f"shard_{s:03d}.npz",
-                 y=y, H=H, H_full=H_full, codes=codes, ptr=ptr, K=Kvec, snr=snr, R=R, R_samp=R_samp)
+        payload = dict(y=y, H=H, codes=codes, ptr=ptr, K=Kvec, snr=snr, R=R)
+        if store_h_full and (H_full is not None):
+            payload["H_full"] = H_full
+        if store_rsamp and (R_samp is not None):
+            payload["R_samp"] = R_samp
+        np.savez(out_dir / f"shard_{s:03d}.npz", **payload)
+        dt = time.time() - t0
+        print(f"[pregen] shard {s+1}/{n_shards} saved in {dt/60.0:.1f} min → {out_dir}/shard_{s:03d}.npz", flush=True)
 
 class ShardNPZDataset(Dataset):
     """
