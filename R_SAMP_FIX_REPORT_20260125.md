@@ -26,6 +26,25 @@
 - Even after fixing coherence + mean-centering and making `R_samp` Hermitian/trace-normalized, **MVDR on `R_samp` could still be F1≈0**.
 - Reason: per-snapshot inversion is fundamentally ill-posed here (**M < N**). Estimating a full spatial covariance from a handful of underdetermined snapshots requires an explicitly **joint low-rank** estimator; naive per-snapshot `x_hat` heuristics can be MVDR-useless while still looking “reasonable” under NMSE/trace checks.
 
+### Key Technical Finding: rank deficiency makes `R_samp` fundamentally misaligned
+We ran a direct subspace diagnostic on the current shard format and configuration:
+
+- **BS antennas**: `M=16`
+- **RIS elements**: `N=144` (12×12)
+- **Snapshots**: `L=16`
+
+This is a strongly underdetermined regime (**M << N**). Even with a joint estimator, we observed that `R_samp` does **not** recover the true signal subspace:
+
+- `R` (ground truth) has effective rank ≈ K (1–4) as expected.
+- `R_samp` has effective rank ≈ M (≈16) and its top-K subspace is poorly aligned with `R`.
+- **Top-K subspace overlap** between `R` and `R_samp` was typically **~0.10–0.15** (1.0 would be perfect).
+
+Interpretation: `R_samp` can be numerically valid but still **MVDR-useless** because it puts energy in the wrong spatial directions.
+
+Practical consequence:
+- **Do not rely on `R_samp` as a standalone covariance for MVDR localization** in this configuration.
+- Treat `R_samp` as an optional/diagnostic signal only; the production-aligned path is NN → `R_pred` → MVDR-first inference.
+
 ### Fixes Implemented
 - **Dataset generation fix (required for correct `R_samp`)**
   - `ris_pytorch_pipeline/dataset.py`
