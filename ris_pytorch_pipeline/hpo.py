@@ -477,6 +477,14 @@ def run_hpo(
                 flush=True,
             )
 
+            mode_local = str(objective_mode).lower().strip()
+            if mode_local != "surrogate":
+                print(
+                    f"[HPO Trial {trial.number}] NOTE: objective_mode={mode_local}. "
+                    f"Training/early-stop uses fast surrogate validation; MVDR-final E2E scoring runs ONCE after training.",
+                    flush=True,
+                )
+
             # snapshot current mdl_cfg knobs we're about to modify
             keys = [
                 "D_MODEL",
@@ -524,10 +532,12 @@ def run_hpo(
                 mdl_cfg.SOFTMAX_TAU = s["softmax_tau"]
 
                 # Now create Trainer (after setting USE_SWA=False)
+                # IMPORTANT: Even for objective_mode="mvdr_final", we keep Trainer validation in fast "surrogate"
+                # mode (MUSIC-free) for speed. MVDR-final is evaluated once at the end of the trial.
                 cfg.VAL_PRIMARY = "surrogate"
                 cfg.USE_MUSIC_METRICS_IN_VAL = False  # No MUSIC during HPO!
                 print(
-                    f"[HPO Trial {trial.number}] Creating Trainer (VAL_PRIMARY={cfg.VAL_PRIMARY}, MUSIC={cfg.USE_MUSIC_METRICS_IN_VAL})...",
+                    f"[HPO Trial {trial.number}] Creating Trainer (VAL_PRIMARY={cfg.VAL_PRIMARY}, MUSIC={cfg.USE_MUSIC_METRICS_IN_VAL}, objective_mode={mode_local})...",
                     flush=True,
                 )
                 t = Trainer(from_hpo=False)
@@ -608,8 +618,7 @@ def run_hpo(
                         raise optuna.TrialPruned(msg)
                     raise
 
-                # Optional MVDR-first end-to-end scoring
-                mode_local = str(objective_mode).lower().strip()
+                # Optional MVDR-first end-to-end scoring (production-aligned objective)
                 final_obj = float(best_val) if best_val is not None else float("inf")
                 if mode_local != "surrogate":
                     try:
