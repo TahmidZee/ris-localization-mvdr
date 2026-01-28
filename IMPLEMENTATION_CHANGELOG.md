@@ -930,3 +930,16 @@ objective = (rmse_xyz_all / xyz_norm) + f1_weight * (1 - F1)
 - Legacy objective still computed and logged as `objective_legacy` with legacy FP/FN semantics for comparison.
 
 *End of Changelog*
+
+## 14) Backbone loss policy updated for MVDR-first training (subspace align ON, peak contrast OFF)
+
+**Why:** Stage-2 MVDR-final reranking showed a near-flat objective signal when the backbone is under-trained on small per-trial budgets. We updated the default backbone loss policy to prioritize learning an MVDR-usable covariance (correct signal subspace) and defer peak-shaping to the SpectrumRefiner stage.
+
+**Changes:**
+- **Enabled**: `lam_subspace_align` (subspace alignment) for backbone training.
+- **Disabled**: `lam_peak_contrast` for backbone training (defer peak shaping to SpectrumRefiner heatmap supervision).
+- **Safety**: increased default peak-contrast softmax temperature (`PEAK_CONTRAST_TAU`) to reduce numerical risk if peak-contrast is enabled in ablations.
+
+**Files:**
+- `ris_pytorch_pipeline/configs.py`
+- `ris_pytorch_pipeline/loss.py`

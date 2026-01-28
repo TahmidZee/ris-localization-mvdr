@@ -32,6 +32,12 @@ This aligns with prior audits:
 - See `SYSTEM_REALISM_AUDIT_20260126.md` (rank-deficiency + realism notes)
 - See `R_SAMP_FIX_REPORT_20260125.md` (why `R_samp` can be MVDR-useless when `M<<N`, and what was fixed)
 
+### Update (2026-01-27): Stage-2 HPO interpretation + loss policy
+- **Stage-2 HPO was running MVDR-final correctly**, but the **MVDR-final signal was near-flat** because the backbone was not learning a usable covariance under the small per-trial budget (10k train / 1k val, early-stop ~16 epochs).
+- **Interpretation**: not an Optuna bug; it’s “no learning ⇒ no reranking signal”.
+- **Action**: validate learning with a **full training run** (100k train / 10k val) before spending more compute on Stage-2 reranking.
+- **Backbone loss policy**: enable **subspace alignment** (`lam_subspace_align`) and keep **peak contrast** (`lam_peak_contrast`) **off** (defer peak shaping to SpectrumRefiner via heatmap supervision).
+
 ---
 
 ## Globecom Checklist (Minimum vs Stretch)
