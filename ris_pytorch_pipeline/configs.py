@@ -67,23 +67,27 @@ class SysConfig:
         self.SOFT_PROJECTOR_P = 0.7  # Power in eigen weights
         self.SOFT_PROJECTOR_TAU = 1e-6  # Regularization in eigen weights
         
-        # Training-inference alignment (ENABLED with schedule)
+        # Training-inference alignment (subspace alignment ENABLED, peak contrast DISABLED)
+        # Peak contrast disabled during backbone training; SpectrumRefiner handles peak quality.
         # Loss weight schedule: warm-up → main → final
         # Warm-up (first 2-3 epochs): lower structure terms to prevent early peaky gradients
-        self.LAM_SUBSPACE_ALIGN_WARMUP = 0.02
-        self.LAM_PEAK_CONTRAST_WARMUP = 0.05
+        self.LAM_SUBSPACE_ALIGN_WARMUP = 0.2
+        self.LAM_PEAK_CONTRAST_WARMUP = 0.0   # DISABLED: defer to SpectrumRefiner
         # Main phase (most of training)
-        self.LAM_SUBSPACE_ALIGN = 0.05  # ENABLED: Subspace alignment loss weight
-        self.LAM_PEAK_CONTRAST = 0.1   # ENABLED: Peak contrast loss weight
-        # Final phase (last 10-20% of epochs): bump structure slightly
-        self.LAM_SUBSPACE_ALIGN_FINAL = 0.07
-        self.LAM_PEAK_CONTRAST_FINAL = 0.12
+        self.LAM_SUBSPACE_ALIGN = 0.5   # ENABLED: Subspace alignment loss weight (essential for MVDR)
+        self.LAM_PEAK_CONTRAST = 0.0    # DISABLED: SpectrumRefiner handles peak quality
+        # Final phase (last 10-20% of epochs): bump subspace alignment slightly
+        self.LAM_SUBSPACE_ALIGN_FINAL = 0.5
+        self.LAM_PEAK_CONTRAST_FINAL = 0.0    # DISABLED: defer to SpectrumRefiner
 
         # Peak-contrast (MVDR-local) loss knobs
-        # Used only when lam_peak_contrast > 0 (disabled by default in HPO via HPO_DISABLE_UNSTABLE_LOSS_TERMS).
+        # Used only when lam_peak_contrast > 0 (disabled by default for backbone training;
+        # SpectrumRefiner handles peak quality via heatmap supervision).
         self.PEAK_CONTRAST_STENCIL = 3        # odd size; 3 => 3x3 stencil (cheap), 5 => 5x5 (stronger, slower)
         self.PEAK_CONTRAST_DELTA_RAD = 0.10   # ±delta around GT (radians) ~ ±5.7°
-        self.PEAK_CONTRAST_TAU = 0.10         # softmax temperature for contrast CE
+        # Tau controls softmax temperature. Higher tau → softer distribution, more stable gradients.
+        # Increased from 0.10 to 0.50 to avoid numerical overflow in cross_entropy.
+        self.PEAK_CONTRAST_TAU = 0.50
         
         self.LAM_COV_PRED = 0.05       # Auxiliary NMSE on R_pred (5% of lam_cov=1.0, prevents hiding)
         
@@ -391,7 +395,8 @@ class SysConfig:
                 "lam_cov": 0.1,
                 "lam_subspace_align": 0.5,
                 "lam_aux": 1.0,
-                "lam_peak_contrast": 0.1,
+                # Peak contrast disabled during backbone training; SpectrumRefiner handles peak quality.
+                "lam_peak_contrast": 0.0,
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
             "refiner": {

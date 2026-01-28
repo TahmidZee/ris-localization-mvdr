@@ -395,8 +395,10 @@ class UltimateHybridLoss(nn.Module):
         if stencil % 2 == 0:
             stencil += 1
         delta = float(getattr(cfg, "PEAK_CONTRAST_DELTA_RAD", 0.10))
-        tau = float(getattr(cfg, "PEAK_CONTRAST_TAU", 0.10))
-        tau = max(tau, 1e-3)
+        # tau controls softmax temperature. Higher tau → softer distribution, more stable gradients.
+        # Default increased from 0.10 to 0.50 to avoid numerical overflow in cross_entropy.
+        tau = float(getattr(cfg, "PEAK_CONTRAST_TAU", 0.50))
+        tau = max(tau, 0.1)  # Floor at 0.1 to prevent gradient explosion
 
         # Mask for valid sources
         mask = (torch.arange(Kmax, device=device).unsqueeze(0) < K_true.unsqueeze(1)).float()  # [B,Kmax]
