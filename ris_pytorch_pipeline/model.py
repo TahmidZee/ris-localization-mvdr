@@ -167,8 +167,20 @@ class HybridModel(nn.Module):
         self.H_proj    = nn.Linear(cfg.L * cfg.M * 2, D // 2)  # FIXED: L*M (not M*N) to match H.reshape(B,-1)
         self.codes_conv= nn.Conv1d(cfg.N * 2, D // 2, 5, padding=2)
 
+        # --- SNR embedding (lets the backbone adapt features to noise regime) ---
+        # NOTE: This changes the model architecture and invalidates old checkpoints (expected).
+        self.snr_dim = max(8, D // 8)
+        self.snr_embed = nn.Sequential(
+            nn.Linear(1, self.snr_dim),
+            nn.GELU(),
+            nn.Linear(self.snr_dim, self.snr_dim),
+        )
+
         # --- fusion ---
-        self.fusion = nn.Linear(D + D // 2 + D // 2, D)
+        self.fusion = nn.Linear(D + D // 2 + D // 2 + self.snr_dim, D)
+
+        # --- normalization (stabilize large heads) ---
+        self.cov_ln = nn.LayerNorm(D)
 
         # --- covariance factors (angle & range) ---
         self.cov_fact_angle = nn.Linear(D, cfg.N * cfg.K_MAX * 2)   # real+imag
@@ -333,11 +345,22 @@ class HybridModel(nn.Module):
         c_feat = F.gelu(self.codes_conv(C_seq)).mean(2)                   # [B, D/2]
 
         # --- fuse ---
-        feats = F.gelu(self.fusion(torch.cat([x, H_feat, c_feat], dim=1)))  # [B, D]
+        # Provide SNR to the backbone as a learnable conditioning feature.
+        if snr_db is None:
+            snr_t = torch.zeros((B, 1), device=x.device, dtype=torch.float32)
+        else:
+            # Accept scalar or [B]; cast to float32 for stability.
+            snr_t = snr_db
+            if not torch.is_tensor(snr_t):
+                snr_t = torch.tensor(snr_t, device=x.device)
+            snr_t = snr_t.to(device=x.device, dtype=torch.float32).view(B, 1)
+        snr_feat = self.snr_embed(snr_t)  # [B, snr_dim]
+        feats = F.gelu(self.fusion(torch.cat([x, H_feat, c_feat, snr_feat], dim=1)))  # [B, D]
 
         # --- factor heads (simplified - disable PSD parameterization for AMP compatibility) ---
-        cf_ang = self.cov_fact_angle(feats)                              # [B, N*K*2]
-        cf_rng = self.cov_fact_range(feats)                              # [B, N*K*2]
+        feats_cov = self.cov_ln(feats)
+        cf_ang = self.cov_fact_angle(feats_cov)                          # [B, N*K*2]
+        cf_rng = self.cov_fact_range(feats_cov)                          # [B, N*K*2]
         
         # Note: PSD parameterization re-enabled in spectral branch under autocast(False)
         # The main factor heads use direct linear layers for speed, while K-head uses PSD covariance
@@ -351,6 +374,14 @@ class HybridModel(nn.Module):
                 return torch.complex(xr.view(-1, cfg.N, cfg.K_MAX), xi.view(-1, cfg.N, cfg.K_MAX))
             
             A_angle = _vec2c(cf_ang)  # [B, N, K]
+            # Apply the same magnitude leash used elsewhere before whitening.
+            if bool(getattr(cfg, "FACTOR_COLNORM_ENABLE", True)):
+                eps = float(getattr(cfg, "FACTOR_COLNORM_EPS", 1e-6))
+                max_norm = float(getattr(cfg, "FACTOR_COLNORM_MAX", 1e3))
+                col = torch.linalg.norm(A_angle, dim=-2, keepdim=True).clamp_min(eps)  # [B,1,K]
+                if max_norm > 0:
+                    col = col.clamp(max=max_norm)
+                A_angle = A_angle / col
             R_learned = A_angle @ A_angle.conj().transpose(-2, -1)  # [B, N, N]
             
             # CRITICAL FIX: Whiten covariance before AntiDiagPool for better angle separability
