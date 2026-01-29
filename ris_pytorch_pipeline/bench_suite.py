@@ -202,9 +202,15 @@ def _estimate_hybrid(model, sample, blind_k=True):
         else:
             return ri_np.astype(np.complex64)
     
+    # CRITICAL: H_full (true BS→RIS channel [M,N]) is required; H_eff is no longer used.
+    H_full = sample.get("H_full")
+    if H_full is None:
+        raise RuntimeError("Hybrid evaluation requires H_full in shards (field 'H_full' missing). "
+                          "Regenerate shards with store_h_full=True.")
+    
     s = {
         "y_cplx": to_complex_numpy(sample["y"]),
-        "H_cplx": to_complex_numpy(sample["H"]),
+        "H_full": to_complex_numpy(H_full),  # Use H_full instead of H_eff
         "codes": to_complex_numpy(sample["codes"]),
         "K": int(sample["K"]),
         "snr_db": float(sample["snr"]),
@@ -518,7 +524,10 @@ def run_bench_csv(model, n=300, oracle=False, outf="bench_blind.csv"):
     N = min(n, len(dset))
     for i in range(N):
         it = dset[i]
-        s = {"y": it["y"], "H": it["H"], "codes": it["codes"], "K": int(it["K"]), "snr_db": float(it["snr"])}
+        H_full = it.get("H_full")
+        if H_full is None:
+            raise RuntimeError("bench_suite requires H_full in shards. Regenerate with store_h_full=True.")
+        s = {"y": it["y"], "H_full": H_full, "codes": it["codes"], "K": int(it["K"]), "snr_db": float(it["snr"])}
         pr = hybrid_estimate_final(model, s, force_K=(int(it["K"]) if oracle else None), k_policy="mdl", do_newton=True)
         gt_phi = _gt_from_item(it)[0]
         gt_phi0 = float(gt_phi[0]) if len(gt_phi) > 0 else 0.0

@@ -125,8 +125,19 @@ def collate_pad_to_kmax_with_snr(batch: List[Dict[str, Any]], K_max: int) -> Dic
                     snr_values.append(torch.tensor(0.0, dtype=torch.float32))  # Default SNR
             out["snr_db"] = torch.stack(snr_values, dim=0)  # [B] - map to snr_db
             
+        elif key == "H_full":
+            # H_full may be None in old shards - skip if any sample is missing it
+            values = [sample.get(key) for sample in batch]
+            if any(v is None for v in values):
+                # Don't include H_full if any sample is missing it
+                continue
+            out[key] = torch.stack([torch.as_tensor(v) for v in values], dim=0)
+            
         else:
             # Other tensors (y, H, codes) - stack normally
+            val = batch[0].get(key)
+            if val is None:
+                continue  # Skip None keys
             out[key] = torch.stack([torch.as_tensor(sample[key]) for sample in batch], dim=0)
     
     return out

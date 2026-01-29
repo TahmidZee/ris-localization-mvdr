@@ -165,9 +165,10 @@ class HybridModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, getattr(mdl_cfg, 'N_BLOCKS', 4))
 
-        # --- H path (per-snapshot effective response H_eff[l] = H_full @ code_l, stored in shards) ---
-        # Keep this as a global summary feature.
-        self.H_proj    = nn.Linear(cfg.L * cfg.M * 2, D // 2)  # L*M (H stored as [L,M,2])
+        # --- H_full path (true BS→RIS channel [M, N]) ---
+        # CRITICAL FIX: Use the FULL channel matrix, not the collapsed H_eff = H @ c.
+        # This gives the network the actual sensing operator it needs to recover RIS-domain covariance.
+        self.H_proj    = nn.Linear(cfg.M * cfg.N * 2, D // 2)  # M*N (H_full stored as [M,N,2])
 
         # --- SNR embedding (lets the backbone adapt features to noise regime) ---
         # NOTE: This changes the model architecture and invalidates old checkpoints (expected).
@@ -315,19 +316,22 @@ class HybridModel(nn.Module):
         
         return R_whitened
 
-    def forward(self, y, H, codes, snr_db=None, R_samp=None):
+    def forward(self, y, H_full, codes, snr_db=None, R_samp=None):
         """
-        y:     [B, L, M, 2]   (ri)
-        H:     [B, L, M, 2]   (ri) - FIXED: L first, not M
-        codes: [B, L, N, 2]   (ri) - FIXED: L first, not Lc
-        snr_db: [B] optional SNR values for shrinkage
+        y:      [B, L, M, 2]   (ri) - received signal snapshots
+        H_full: [B, M, N, 2]   (ri) - FULL BS→RIS channel matrix (NOT the collapsed H_eff)
+        codes:  [B, L, N, 2]   (ri) - RIS phase codes per snapshot
+        snr_db: [B] optional SNR values for conditioning
         R_samp: Optional sample covariance for hybrid blending (supports complex [B,N,N] or RI [B,N,N,2])
+        
+        CRITICAL: H_full is the TRUE sensing operator [M, N]. Previously we passed H_eff = H @ c,
+        which collapsed the RIS dimension and made the inverse problem ill-posed.
         """
         B, L = y.shape[0], y.shape[1]
         
         # CRITICAL: Assert shapes right before use
         assert y.shape == (B, cfg.L, cfg.M, 2), f"y shape mismatch: {y.shape} != ({B}, {cfg.L}, {cfg.M}, 2)"
-        assert H.shape == (B, cfg.L, cfg.M, 2), f"H shape mismatch: {H.shape} != ({B}, {cfg.L}, {cfg.M}, 2)"
+        assert H_full.shape == (B, cfg.M, cfg.N, 2), f"H_full shape mismatch: {H_full.shape} != ({B}, {cfg.M}, {cfg.N}, 2)"
         assert codes.shape == (B, cfg.L, cfg.N, 2), f"codes shape mismatch: {codes.shape} != ({B}, {cfg.L}, {cfg.N}, 2)"
 
         # --- joint token features: per snapshot (y_l, code_l) ---
@@ -340,11 +344,11 @@ class HybridModel(nn.Module):
         tok = tok.permute(0, 2, 1)                                        # [B, L, D]
         x = self.transformer(tok).mean(1)                                 # [B, D]
 
-        # --- H features ---
-        # Enforce the shape and match H_proj
-        B, Lh, Mh, Ch = H.shape
-        assert (Lh, Mh, Ch) == (cfg.L, cfg.M, 2), f"Expected H[B,{cfg.L},{cfg.M},2], got {H.shape}"
-        H_feat = F.gelu(self.H_proj(H.reshape(B, -1)))                    # [B, D/2]
+        # --- H_full features ---
+        # The full channel matrix [M, N] provides the actual sensing operator.
+        B, Mh, Nh, Ch = H_full.shape
+        assert (Mh, Nh, Ch) == (cfg.M, cfg.N, 2), f"Expected H_full[B,{cfg.M},{cfg.N},2], got {H_full.shape}"
+        H_feat = F.gelu(self.H_proj(H_full.reshape(B, -1)))               # [B, D/2]
 
         # --- fuse ---
         # Provide SNR to the backbone as a learnable conditioning feature.

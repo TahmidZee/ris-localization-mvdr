@@ -148,10 +148,13 @@ def _eval_mvdr_final_on_val_subset(
         num_gt = len(gt_phi_deg)
         total_num_gt += num_gt
 
+        # CRITICAL: H_full (true BS→RIS channel [M,N]) is required.
+        H_full = it.get("H_full")
+        if H_full is None:
+            raise RuntimeError("HPO evaluation requires H_full in shards. Regenerate with store_h_full=True.")
         s = {
             "y": it["y"],
-            "H": it["H"],
-            "H_full": it.get("H_full", None),
+            "H_full": H_full,  # Use H_full instead of H_eff
             "codes": it["codes"],
             "K": int(it["K"]),
             "snr_db": float(it["snr"]),

@@ -1009,14 +1009,18 @@ class Trainer:
                 
             # CRITICAL FIX: Network forward in FP16, loss computation in FP32
             # ENABLE AMP for faster training (we've fixed the numerical issues)
+            # CRITICAL: Pass H_full (true channel [M,N]) instead of H_eff (collapsed [L,M]).
+            # This gives the network the actual sensing operator for RIS-domain covariance recovery.
+            if H_full is None:
+                raise ValueError("H_full is required for training. Regenerate shards with store_h_full=True.")
             if self.train_refiner_only:
                 # Backbone is frozen; run it under no_grad and train only SpectrumRefiner.
                 with torch.no_grad():
                     with torch.amp.autocast('cuda', enabled=self.amp):
-                        preds = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
+                        preds = self.model(y=y, H_full=H_full, codes=C, snr_db=snr, R_samp=R_samp)
             else:
                 with torch.amp.autocast('cuda', enabled=self.amp):
-                    preds = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
+                    preds = self.model(y=y, H_full=H_full, codes=C, snr_db=snr, R_samp=R_samp)
             
             # CRITICAL FIX: LOSS IN FP32 - turn off autocast for numerical stability
             # Cast EVERYTHING to FP32 before loss computation (preds AND labels)
@@ -1512,8 +1516,10 @@ class Trainer:
 
             if self.train_refiner_only:
                 # Backbone factors -> MVDR spectrum -> SpectrumRefiner -> heatmap loss
+                if H_full is None:
+                    raise ValueError("H_full is required for training. Regenerate shards with store_h_full=True.")
                 with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
-                    preds_half = self.model(y=y, H=H, codes=C, snr_db=snr)
+                    preds_half = self.model(y=y, H_full=H_full, codes=C, snr_db=snr)
 
                 with torch.amp.autocast('cuda', enabled=False):
                     # Cast labels to FP32
@@ -1556,8 +1562,10 @@ class Trainer:
                     loss = self.loss_fn({"refined_spectrum": refined}, labels_fp32)
             else:
                 # Expert fix: Forward can stay FP16 for speed
+                if H_full is None:
+                    raise ValueError("H_full is required for training. Regenerate shards with store_h_full=True.")
                 with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
-                    preds_half = self.model(y=y, H=H, codes=C, snr_db=snr)
+                    preds_half = self.model(y=y, H_full=H_full, codes=C, snr_db=snr)
                 
                 # Expert fix: Loss MUST be in FP32 for numerical stability (SVD/eigens/divides)
                 with torch.amp.autocast('cuda', enabled=False):
@@ -1788,8 +1796,10 @@ class Trainer:
                 labels = {"R_true": R_true, "ptr": ptr, "K": K, "snr_db": snr}
                 
                 # Forward pass
+                if H_full is None:
+                    raise ValueError("H_full is required for training. Regenerate shards with store_h_full=True.")
                 with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
-                    preds_half = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
+                    preds_half = self.model(y=y, H_full=H_full, codes=C, snr_db=snr, R_samp=R_samp)
                 
                 # Loss in FP32
                 with torch.amp.autocast('cuda', enabled=False):
@@ -2287,8 +2297,10 @@ class Trainer:
                 y, H, C, ptr, K, R_in, snr, H_full, R_samp = self._unpack_any_batch(batch)
                 
                 # Forward pass
+                if H_full is None:
+                    raise ValueError("H_full is required for training. Regenerate shards with store_h_full=True.")
                 with torch.amp.autocast('cuda', enabled=(self.amp and self.device.type == "cuda")):
-                    preds = self.model(y=y, H=H, codes=C, snr_db=snr, R_samp=R_samp)
+                    preds = self.model(y=y, H_full=H_full, codes=C, snr_db=snr, R_samp=R_samp)
                 
                 # Extract predictions (convert to numpy for Hungarian matching)
                 phi_soft = preds["phi_soft"].cpu().numpy()  # [B, K_MAX]
@@ -2938,21 +2950,25 @@ class Trainer:
                         batch_val = self._first_val_batch
                         if isinstance(batch_val, dict):
                             y_val = batch_val["y"].to(self.device)
-                            H_val = batch_val["H"].to(self.device)
+                            H_full_val = batch_val.get("H_full")
+                            if H_full_val is None:
+                                H_full_val = batch_val["H"]  # Fallback for old shards (will fail at runtime)
+                            H_full_val = H_full_val.to(self.device)
                             codes_val = batch_val["codes"].to(self.device)
                             snr_val = batch_val.get("snr_db")
                             if snr_val is not None:
                                 snr_val = snr_val.to(self.device)
                         else:
-                            # Unpack tuple (now has 8 elements with H_full)
+                            # Unpack tuple (now has 9 elements: y, H, C, ptr, K, R, snr, H_full, R_samp)
                             y_val = batch_val[0].to(self.device)
-                            H_val = batch_val[1].to(self.device)
+                            H_full_val = batch_val[7] if len(batch_val) > 7 else batch_val[1]  # H_full at index 7
+                            H_full_val = H_full_val.to(self.device)
                             codes_val = batch_val[2].to(self.device)
                             snr_val = batch_val[6] if len(batch_val) > 6 else None
                             if snr_val is not None:
                                 snr_val = snr_val.to(self.device)
                         
-                        preds_val = self.model(y_val, H_val, codes_val, snr_val)
+                        preds_val = self.model(y=y_val, H_full=H_full_val, codes=codes_val, snr_db=snr_val)
                         
                         # Form R_hat from first sample
                         cf_ang = preds_val["cov_fact_angle"][0].detach().cpu().numpy()  # [N*K_MAX*2]

@@ -294,14 +294,20 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     # --- unpack sample ---
     # Accept either complex inputs (*_cplx) or RI inputs (default dataset format).
     y_c = _ri_to_c_np(sample.get("y_cplx", sample.get("y")))
-    H_c = _ri_to_c_np(sample.get("H_cplx", sample.get("H")))
     C_c = _ri_to_c_np(sample.get("codes_cplx", sample.get("codes")))
-    if y_c is None or H_c is None or C_c is None:
-        raise ValueError("sample must contain y/H/codes (either *_cplx complex or RI [...,2])")
+    
+    # CRITICAL: Use H_full (true BS→RIS channel [M,N]), NOT H_eff (collapsed [L,M]).
+    # H_full is required for the network to see the actual sensing operator.
+    H_full_c = _ri_to_c_np(sample.get("H_full_cplx", sample.get("H_full")))
+    if H_full_c is None:
+        raise ValueError("sample must contain H_full (shape [M,N]) - regenerate shards with store_h_full=True")
+    
+    if y_c is None or C_c is None:
+        raise ValueError("sample must contain y and codes (either *_cplx complex or RI [...,2])")
 
-    # y: [L,M], H: [L,M] (feature path), codes: [L,N]
+    # y: [L,M], H_full: [M,N], codes: [L,N]
     y_t = torch.from_numpy(y_c).to(torch.complex64).unsqueeze(0).to(dev)
-    H_t = torch.from_numpy(H_c).to(torch.complex64).unsqueeze(0).to(dev)
+    H_full_t = torch.from_numpy(H_full_c).to(torch.complex64).unsqueeze(0).to(dev)
     C_t = torch.from_numpy(C_c).to(torch.complex64).unsqueeze(0).to(dev)
 
     snr_db = float(sample.get("snr_db", sample.get("snr", 10.0)))
@@ -310,7 +316,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     # IMPORTANT: During training we pass per-sample SNR into the model; inference must match.
     # Otherwise any SNR-conditioned shrinkage/gating inside the model will be effectively disabled.
     with torch.no_grad():
-        pred = model(_to_ri_t(y_t), _to_ri_t(H_t), _to_ri_t(C_t), snr_db=snr_db, R_samp=None)
+        pred = model(y=_to_ri_t(y_t), H_full=_to_ri_t(H_full_t), codes=_to_ri_t(C_t), snr_db=snr_db, R_samp=None)
 
     # --- build R_pred from factors (match loss.py fallback) ---
     def _vec2c_flat(v_flat: np.ndarray) -> np.ndarray:
@@ -339,11 +345,10 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     R_samp = None
     if sample.get("R_samp") is not None:
         R_samp = _ri_to_c_np(sample.get("R_samp"))
-    elif sample.get("H_full") is not None:
-        # Build R_samp from snapshots using full channel (preferred)
+    else:
+        # Build R_samp from snapshots using H_full (already loaded above)
         try:
             from .angle_pipeline import build_sample_covariance_from_snapshots
-            H_full_c = _ri_to_c_np(sample.get("H_full"))  # [M,N]
             # build_sample_covariance_from_snapshots accepts [M,N] directly (no need to repeat)
             R_samp = build_sample_covariance_from_snapshots(y_c, H_full_c, C_c, cfg, tikhonov_alpha=1e-3)
         except Exception:
