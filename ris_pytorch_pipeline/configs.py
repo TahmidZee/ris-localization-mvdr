@@ -67,18 +67,20 @@ class SysConfig:
         self.SOFT_PROJECTOR_P = 0.7  # Power in eigen weights
         self.SOFT_PROJECTOR_TAU = 1e-6  # Regularization in eigen weights
         
-        # Training-inference alignment (subspace alignment ENABLED, peak contrast DISABLED)
-        # Peak contrast disabled during backbone training; SpectrumRefiner handles peak quality.
+        # Training-inference alignment (subspace alignment ENABLED; peak contrast lightly enabled)
+        # Rationale (Jan 2026): MVDR on R_true is strong, but MVDR on R_pred collapsed (very low F1),
+        # implying R_pred's signal subspace is not yet MVDR-usable. We therefore increase subspace
+        # pressure and enable a small, stable peak-contrast term to encourage MVDR-usable spectra.
         # Loss weight schedule: warm-up → main → final
         # Warm-up (first 2-3 epochs): lower structure terms to prevent early peaky gradients
-        self.LAM_SUBSPACE_ALIGN_WARMUP = 0.2
-        self.LAM_PEAK_CONTRAST_WARMUP = 0.0   # DISABLED: defer to SpectrumRefiner
+        self.LAM_SUBSPACE_ALIGN_WARMUP = 0.5
+        self.LAM_PEAK_CONTRAST_WARMUP = 0.0   # warm-up off for stability
         # Main phase (most of training)
-        self.LAM_SUBSPACE_ALIGN = 0.5   # ENABLED: Subspace alignment loss weight (essential for MVDR)
-        self.LAM_PEAK_CONTRAST = 0.0    # DISABLED: SpectrumRefiner handles peak quality
+        self.LAM_SUBSPACE_ALIGN = 2.0   # stronger: needed to make R_pred MVDR-usable
+        self.LAM_PEAK_CONTRAST = 0.02   # small: nudges MVDR peak shape without destabilizing training
         # Final phase (last 10-20% of epochs): bump subspace alignment slightly
-        self.LAM_SUBSPACE_ALIGN_FINAL = 0.5
-        self.LAM_PEAK_CONTRAST_FINAL = 0.0    # DISABLED: defer to SpectrumRefiner
+        self.LAM_SUBSPACE_ALIGN_FINAL = 2.0
+        self.LAM_PEAK_CONTRAST_FINAL = 0.02
 
         # Peak-contrast (MVDR-local) loss knobs
         # Used only when lam_peak_contrast > 0 (disabled by default for backbone training;
@@ -343,6 +345,10 @@ class SysConfig:
         self.SURROGATE_DET_TOL_THETA_DEG = 5.0
         self.SURROGATE_DET_TOL_R_M = 1.0
         
+        # --- Surrogate subspace metric (MVDR-critical, eval-time only) ---
+        self.SURROGATE_SUBSPACE_METRICS = True
+        self.SURROGATE_SUBSPACE_MAX_SCENES = 32
+        
         # === Validation & Checkpointing Strategy ===
         # VAL_PRIMARY options:
         # - "loss": legacy, NMSE-driven (not recommended for production)
@@ -393,10 +399,10 @@ class SysConfig:
             },
             "joint": {
                 "lam_cov": 0.1,
-                "lam_subspace_align": 0.5,
+                "lam_subspace_align": 2.0,
                 "lam_aux": 1.0,
-                # Peak contrast disabled during backbone training; SpectrumRefiner handles peak quality.
-                "lam_peak_contrast": 0.0,
+                # Small peak-contrast for MVDR-usability (stable tau=0.5).
+                "lam_peak_contrast": 0.02,
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
             "refiner": {
@@ -443,7 +449,9 @@ class ModelConfig:
         self.EPOCHS = 60
         self.LR_INIT = 3e-4
         self.PATIENCE = 15
-        self.AMP = True
+        # Disable AMP by default for numerical stability (covariance / MVDR-adjacent training is sensitive).
+        # You can re-enable for speed once training is stable (few/no nonfinite grad skips).
+        self.AMP = False
         self.OPT = "adamw"
         self.WEIGHT_DECAY = 1e-4
         self.SEED = 42

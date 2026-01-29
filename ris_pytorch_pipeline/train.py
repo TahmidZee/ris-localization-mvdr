@@ -1762,6 +1762,13 @@ class Trainer:
         peak_fp = 0
         peak_fn = 0
         pssr_db_vals = []
+
+        # Optional: subspace overlap diagnostics (MVDR-critical).
+        do_subspace = bool(getattr(cfg, "SURROGATE_SUBSPACE_METRICS", False))
+        subspace_max_scenes = int(getattr(cfg, "SURROGATE_SUBSPACE_MAX_SCENES", 0))
+        subspace_max_scenes = max(0, subspace_max_scenes)
+        subspace_evald = 0
+        subspace_overlaps = []
         
         iters = len(loader) if max_batches is None else min(len(loader), max_batches)
         
@@ -1810,12 +1817,12 @@ class Trainer:
                         else:
                             labels_fp32[k] = v
 
-                    # TRAIN/VAL ALIGNMENT: build blended covariance (R_blend) in validation exactly like training.
-                    # Without this, val loss becomes apples-to-oranges when HYBRID_COV_BETA>0 and R_samp exists.
-                    if (R_samp is not None) and ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
+                    # TRAIN/VAL/INFER ALIGNMENT:
+                    # Always build an effective covariance from the factor heads, even when R_samp is absent.
+                    # This enables MVDR-like validation (peak metrics + subspace overlap) and ensures that
+                    # "surrogate" metrics actually correlate with MVDR-first performance.
+                    if ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
                         try:
-                            R_samp_c = _ri_to_c(R_samp.float())
-                            R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
                             lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
                             R_pred = build_R_pred_from_factor_vecs(
                                 preds["cov_fact_angle"],
@@ -1824,17 +1831,27 @@ class Trainer:
                                 Kmax=int(cfg.K_MAX),
                                 lam_range=lam_range,
                             )
-                            beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
-                            R_blend = build_effective_cov_torch(
+                            # Optional hybrid blend if offline R_samp exists (currently typically absent).
+                            R_samp_c = None
+                            beta = 0.0
+                            if R_samp is not None:
+                                try:
+                                    R_samp_c = _ri_to_c(R_samp.float())
+                                    R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
+                                    beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
+                                except Exception:
+                                    R_samp_c = None
+                                    beta = 0.0
+                            R_eff = build_effective_cov_torch(
                                 R_pred,
-                                snr_db=None,
-                                R_samp=R_samp_c.detach(),
-                                beta=beta,
-                                diag_load=False,
-                                apply_shrink=False,
+                                snr_db=snr,                       # match inference (SNR-aware shrink)
+                                R_samp=(R_samp_c.detach() if R_samp_c is not None else None),
+                                beta=(beta if (R_samp_c is not None) else None),
+                                diag_load=True,
+                                apply_shrink=True,
                                 target_trace=float(cfg.N),
                             )
-                            preds["R_blend"] = R_blend
+                            preds["R_blend"] = R_eff
                         except Exception:
                             pass
                     
@@ -1966,6 +1983,46 @@ class Trainer:
                     except Exception:
                         # Never let metrics break validation.
                         pass
+
+                # ---------- Subspace overlap metric (optional) ----------
+                if do_subspace and ("R_blend" in preds) and (subspace_max_scenes == 0 or subspace_evald < subspace_max_scenes):
+                    try:
+                        # Compare top-K eigenspaces of R_eff_pred vs R_true_eff.
+                        # Use torch SVD/eigh on a capped number of scenes to keep it cheap.
+                        from .covariance_utils import build_effective_cov_torch
+                        K_true_list = K.cpu().tolist()
+                        Rb = preds["R_blend"]  # [B,N,N] complex
+                        # Build effective R_true to match R_blend conditioning (diagload+shrink+trace=N).
+                        R_true_eff = build_effective_cov_torch(
+                            R_true_c,
+                            snr_db=snr,
+                            R_samp=None,
+                            beta=None,
+                            diag_load=True,
+                            apply_shrink=True,
+                            target_trace=float(cfg.N),
+                        )
+                        for i in range(B):
+                            if subspace_max_scenes != 0 and subspace_evald >= subspace_max_scenes:
+                                break
+                            k_i = int(K_true_list[i])
+                            if k_i <= 0:
+                                continue
+                            # Eigenvectors (ascending eigenvalues)
+                            eval_p, evec_p = torch.linalg.eigh(Rb[i].to(torch.complex64))
+                            eval_t, evec_t = torch.linalg.eigh(R_true_eff[i].to(torch.complex64))
+                            k_i = int(max(1, min(k_i, int(getattr(cfg, "K_MAX", 5)), evec_p.shape[0] - 1)))
+                            Up = evec_p[:, -k_i:]  # [N,k]
+                            Ut = evec_t[:, -k_i:]
+                            # singular values of Ut^H Up are cos(principal angles)
+                            s = torch.linalg.svdvals(Ut.conj().transpose(-2, -1) @ Up)
+                            s = torch.clamp(s.real, 0.0, 1.0)
+                            ov = float(torch.mean(s * s).detach().cpu().item())
+                            if np.isfinite(ov):
+                                subspace_overlaps.append(ov)
+                                subspace_evald += 1
+                    except Exception:
+                        pass
         
         # Compute summary metrics
         avg_loss = total_loss / max(1, n_samples)
@@ -2000,6 +2057,16 @@ class Trainer:
             "aux_r_rmse": r_rmse,
             "score": score,
         }
+        if do_subspace and subspace_overlaps:
+            ov_med = float(np.median(subspace_overlaps))
+            ov_mean = float(np.mean(subspace_overlaps))
+            metrics["subspace_overlap_med"] = ov_med
+            metrics["subspace_overlap_mean"] = ov_mean
+            print(f"[VAL SUBSPACE] scenes={len(subspace_overlaps)} overlap_med={ov_med:.3f} overlap_mean={ov_mean:.3f}", flush=True)
+            # Optionally include in the surrogate score (higher overlap is better).
+            w_sub = float(getattr(cfg, "SURROGATE_SUBSPACE_WEIGHT", 1.0))
+            score += w_sub * ov_mean
+            metrics["score"] = score
 
         # Optional peak-level metrics
         if do_peak_metrics and peak_evald > 0:
