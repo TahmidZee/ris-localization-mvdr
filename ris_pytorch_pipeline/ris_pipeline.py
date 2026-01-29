@@ -431,12 +431,15 @@ def main():
             m.eval()
             B = 1
             y = it["y"].unsqueeze(0) if torch.is_tensor(it["y"]) else torch.from_numpy(it["y"]).unsqueeze(0)
-            H = it["H"].unsqueeze(0) if torch.is_tensor(it["H"]) else torch.from_numpy(it["H"]).unsqueeze(0)
+            H_full = it.get("H_full", None)
+            if H_full is None:
+                raise RuntimeError("Shard is missing 'H_full'. Regenerate shards with store_h_full=True.")
+            H_full = H_full.unsqueeze(0) if torch.is_tensor(H_full) else torch.from_numpy(H_full).unsqueeze(0)
             C = it["codes"].unsqueeze(0) if torch.is_tensor(it["codes"]) else torch.from_numpy(it["codes"]).unsqueeze(0)
             snr = it.get("snr", it.get("snr_db", 10.0))
             snr = snr.unsqueeze(0) if torch.is_tensor(snr) else torch.tensor([float(snr)], dtype=torch.float32)
             with torch.no_grad():
-                out = m(y=y.float(), H=H.float(), codes=C.float(), snr_db=snr)
+                out = m(y=y.float(), H_full=H_full.float(), codes=C.float(), snr_db=snr)
             ok = all(k in out for k in ("cov_fact_angle", "cov_fact_range", "phi_theta_r"))
             print("[DOCTOR] forward keys:", sorted(out.keys()), "ok=", ok, flush=True)
             if not ok:

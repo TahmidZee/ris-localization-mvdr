@@ -564,14 +564,27 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
     # y/H/codes conversion (same as final)
     if "y_cplx" in sample:
         y = torch.from_numpy(sample["y_cplx"]).to(torch.complex64).unsqueeze(0).to(device)
-        H = torch.from_numpy(sample["H_cplx"]).to(torch.complex64).unsqueeze(0).to(device)
+        # Prefer H_full if provided; H_cplx is legacy H_eff and is no longer accepted by the backbone.
+        if sample.get("H_full_cplx") is not None:
+            H_full = torch.from_numpy(sample["H_full_cplx"]).to(torch.complex64).unsqueeze(0).to(device)
+        elif sample.get("H_full") is not None:
+            H_full_np = sample["H_full"]
+            if torch.is_tensor(H_full_np):
+                H_full_np = H_full_np.numpy()
+            H_full = torch.from_numpy(H_full_np[..., 0] + 1j * H_full_np[..., 1]).to(torch.complex64).unsqueeze(0).to(device)
+        else:
+            raise ValueError("sample must contain H_full for inference (H_cplx/H_eff is not supported)")
     else:
-        y_data = sample["y"]; H_data = sample["H"]; codes_data = sample["codes"]
+        y_data = sample["y"]; codes_data = sample["codes"]
+        H_full_data = sample.get("H_full", None)
+        if H_full_data is None:
+            raise ValueError("sample must contain H_full for inference (H/H_eff is not supported)")
         if torch.is_tensor(y_data): y_data = y_data.numpy()
-        if torch.is_tensor(H_data): H_data = H_data.numpy()
+        if torch.is_tensor(H_full_data): H_full_data = H_full_data.numpy()
         if torch.is_tensor(codes_data): codes_data = codes_data.numpy()
         y = torch.from_numpy(y_data[:, :, 0] + 1j * y_data[:, :, 1]).to(torch.complex64).unsqueeze(0).to(device)
-        H = torch.from_numpy(H_data[:, :, 0] + 1j * H_data[:, :, 1]).to(torch.complex64).unsqueeze(0).to(device)
+        # H_full: [M,N,2] -> complex [M,N]
+        H_full = torch.from_numpy(H_full_data[:, :, 0] + 1j * H_full_data[:, :, 1]).to(torch.complex64).unsqueeze(0).to(device)
     codes_data = sample["codes"]
     if torch.is_tensor(codes_data): codes_data = codes_data.numpy()
     codes = torch.from_numpy(codes_data[:, :, 0] + 1j * codes_data[:, :, 1]).to(torch.complex64).unsqueeze(0).to(device)
@@ -608,7 +621,7 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
     except Exception:
         R_samp_t = None
     with torch.no_grad():
-        pred = model(to_ri_t(y), to_ri_t(H), to_ri_t(codes), R_samp=R_samp_t)
+        pred = model(y=to_ri_t(y), H_full=to_ri_t(H_full), codes=to_ri_t(codes), R_samp=R_samp_t)
 
     # K estimation: use MDL (K-head removed)
     if force_K is not None:
