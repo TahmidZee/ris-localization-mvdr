@@ -72,6 +72,10 @@ def _infer_arch_from_state_dict(sd: dict) -> dict:
                 arch["d_model"] = int(sd["fusion.bias"].numel())
             elif "transformer.layers.0.self_attn.in_proj_weight" in sd:
                 arch["d_model"] = int(sd["transformer.layers.0.self_attn.in_proj_weight"].shape[1])
+            # Backward/forward compatibility for old/new tokenizers
+            elif "y_conv_tok.weight" in sd:
+                # [D/2, 2M, k]
+                arch["d_model"] = int(sd["y_conv_tok.weight"].shape[0]) * 2
             elif "y_conv2.weight" in sd:
                 arch["d_model"] = int(sd["y_conv2.weight"].shape[0])
     except Exception:
