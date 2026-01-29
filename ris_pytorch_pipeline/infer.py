@@ -10,6 +10,17 @@ import torch.nn.functional as F
 
 _REFINER_FALLBACK_COUNT = 0
 
+def _log_refiner_fallback_once(reason: str):
+    """
+    Avoid spamming logs when running benchmark suites (called per sample).
+    Prints the first few occurrences and then stays quiet.
+    """
+    global _REFINER_FALLBACK_COUNT
+    _REFINER_FALLBACK_COUNT += 1
+    # Print first N, then every 200th as a heartbeat.
+    if _REFINER_FALLBACK_COUNT <= 3 or (_REFINER_FALLBACK_COUNT % 200 == 0):
+        print(f"[INFER] {reason} -> MVDR fallback", flush=True)
+
 def _load_hpo_best_dict(p=None):
     if p is None:
         p = getattr(cfg, 'HPO_BEST_JSON', str(Path(getattr(cfg, "HPO_DIR", cfg.RESULTS_DIR)) / "best.json"))
@@ -389,7 +400,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             else:
                 nlog = int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1))
             if nlog != 0 and ((_REFINER_FALLBACK_COUNT - 1) % max(1, nlog) == 0):
-                print("[INFER] Refiner unavailable/disabled -> MVDR fallback", flush=True)
+                _log_refiner_fallback_once("Refiner unavailable/disabled")
             return _mvdr_fallback()
         raise ValueError(
             "SpectrumRefiner is required for inference but was not attached to the model and fallback is disabled. "
@@ -454,7 +465,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             except Exception as e:
                 if allow_fallback:
                     if (not bool(getattr(cfg, "HPO_MODE", False))) and (int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0):
-                        print(f"[INFER] Refiner rejected ({e}) -> MVDR fallback", flush=True)
+                        _log_refiner_fallback_once(f"Refiner rejected ({e})")
                     return _mvdr_fallback()
                 raise
 
@@ -474,7 +485,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             if idx.numel() > 0 and idx.shape[0] > max_raw:
                 if allow_fallback:
                     if (not bool(getattr(cfg, "HPO_MODE", False))) and (int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1)) != 0):
-                        print(f"[INFER] Refiner rejected (too many peaks: {idx.shape[0]}) -> MVDR fallback", flush=True)
+                        _log_refiner_fallback_once(f"Refiner rejected (too many peaks: {idx.shape[0]})")
                     return _mvdr_fallback()
                 # else: keep going and rely on top-K truncation
         if idx.numel() == 0:
