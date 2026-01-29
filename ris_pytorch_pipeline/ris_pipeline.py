@@ -386,7 +386,7 @@ def main():
 
     elif args.cmd == "doctor":
         # Lightweight environment + dataset + forward-pass checks.
-        import os, sys
+        import os
         import numpy as np
         import torch
         print("[DOCTOR] cfg.RESULTS_DIR:", cfg.RESULTS_DIR, flush=True)
