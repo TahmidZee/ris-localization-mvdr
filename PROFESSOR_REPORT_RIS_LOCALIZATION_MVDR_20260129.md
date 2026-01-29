@@ -23,6 +23,7 @@ Each scene provides **L time snapshots**. For snapshot \(\ell\), the RIS applies
 ### 2.1 Inputs per scene (what the model sees)
 - **BS snapshots**: \(y \in \mathbb{C}^{L \times M}\) (M BS antennas)
 - **RIS codes**: \(c \in \mathbb{C}^{L \times N}\) (N RIS elements)
+- **BS→RIS channel (full operator)**: \(H_{\text{full}} \in \mathbb{C}^{M \times N}\)
 - **SNR value**: `snr_db` (we pass it to the model so it can adapt to noise level)
 
 ### 2.2 Outputs and inference (what we do with the model output)
@@ -168,21 +169,51 @@ We confirmed:
 ### 8.2 We fixed major stability and architecture issues
 We implemented the architecture upgrades listed above (joint tokens, SNR embedding, LayerNorm, factor leash), and simplified training by disabling a curriculum that caused phase-to-phase metric drift.
 
-### 8.3 Training is now stable and improving
-In the current full training run (100k train / 10k val, L=64), validation surrogate metrics steadily improve through ~epoch 36:
-- validation loss decreases substantially
-- auxiliary RMSEs decrease (angles and range)
+### 8.3 Critical discovery (root-cause bug): we were feeding a lossy channel surrogate to the model
+We found a major information bottleneck in the original shard/model interface:
+- The shards stored `H` as a per-snapshot **collapsed effective response** \(H_{\text{eff},\ell} = H_{\text{full}} c_\ell \in \mathbb{C}^{M}\).
+- The backbone was built to consume only this collapsed \(H_{\text{eff}}\) (shape \([L,M]\)), not the true operator \(H_{\text{full}}\) (shape \([M,N]\)).
 
-The next decisive checkpoint is the **direct MVDR-end benchmark** (B1/B2) on the current checkpoint to confirm that improvements translate into end performance.
+This collapses the RIS dimension and removes critical information needed to recover an RIS-domain covariance reliably. We implemented a **breaking-but-correct fix**:
+- the backbone now consumes **\(H_{\text{full}}\in\mathbb{C}^{M\times N}\)** (stored in shards as `H_full`)
+- training/inference/benchmarks now require `H_full`
+- old checkpoints are not compatible (the model input dimensionality changed)
+
+This fix matters because it changes the upstream inference problem from “guess RIS covariance from a collapsed proxy” to “predict covariance with access to the true sensing operator.”
+
+### 8.4 Diagnostic result: R_samp vs R_true (decisive evidence about identifiability)
+We ran a targeted diagnostic that compares MVDR localization using:
+- \(R_{\text{true}}\): oracle RIS-domain covariance (ground truth)
+- \(R_{\text{samp}}\): covariance estimated from the actual snapshots **on-the-fly** using \(y\), \(H_{\text{full}}\), and \(c\)
+
+On a small test subset (N=200 scenes):
+- **MVDR on \(R_{\text{true}}\)**: essentially perfect (cm-level RMSPE, ~0.02° angles)
+- **MVDR on \(R_{\text{samp}}\)**:
+  - Blind-K mode: median RMSPE ≈ **1.18 m** (angles ~1°)
+  - Oracle-K mode: median RMSPE ≈ **3.96 m** (angles ~19°)
+
+Interpretation (important):
+- \(R_{\text{samp}}\) contains useful information but its spectrum is often **cluttered**; forcing exactly K peaks (Oracle-K) can pick weak/spurious peaks.
+- This shows that in our current regime, “perfect covariance → perfect MVDR,” but “covariance estimated from limited measurements” is a major bottleneck.
+
+### 8.5 Current status
+We are running a short “reality check” training run (30 epochs) **with the corrected \(H_{\text{full}}\) input**. The goal is to determine whether the H_full fix alone changes learning dynamics and MVDR-end outcomes.
 
 ---
 
 ## 9) Immediate next steps
-1. Run Hybrid-only MVDR-end evaluation on the current checkpoint:
+1. Finish the short 30-epoch run with the corrected \(H_{\text{full}}\) interface.
+2. Run Hybrid-only MVDR-end evaluation on the resulting checkpoint:
    - `suite --bench B1 --limit 1000 --no-baselines`
    - `suite --bench B2 --limit 1000 --no-baselines`
-2. If MVDR-end improves as expected, continue training to convergence and then train the SpectrumRefiner stage.
-3. If MVDR-end does not improve, examine validation-time subspace/peak proxy diagnostics and adjust loss weights (especially `lam_cov` vs `lam_subspace_align`) in a controlled way.
+3. Decision gate:
+   - If MVDR-end improves clearly relative to prior baselines, proceed to full training + SpectrumRefiner.
+   - If not, we should **pivot the formulation** rather than only tuning loss weights:
+     - either add measurement diversity (recommended): few-tone wideband (8–16 tones over 20–100 MHz) in an indoor sub-6 scenario
+     - or change the learning target: direct set prediction of \((\phi,\theta,r)\) rather than full covariance recovery
+4. Align simulator assumptions with a defensible deployment:
+   - For “2–10 m indoor localization,” a sub-6 carrier (e.g., 3.5 GHz) with larger aperture (e.g., RIS 16×16 and BS 32–64 antennas) is a coherent scenario.
+   - For “28 GHz near-field at 10 m,” the RIS must be much larger (tens of elements per side) to be physically consistent.
 
 ---
 
