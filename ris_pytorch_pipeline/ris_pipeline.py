@@ -328,6 +328,68 @@ def main():
             from .paper_export import export_paper_material
             export_paper_material()
 
+    elif args.cmd == "doctor":
+        # Lightweight environment + dataset + forward-pass checks.
+        import os, sys
+        import numpy as np
+        import torch
+        print("[DOCTOR] cfg.RESULTS_DIR:", cfg.RESULTS_DIR, flush=True)
+        print("[DOCTOR] cfg.DATA_SHARDS_DIR:", getattr(cfg, "DATA_SHARDS_DIR", None), flush=True)
+        print("[DOCTOR] cfg.DATA_SHARDS_TRAIN:", getattr(cfg, "DATA_SHARDS_TRAIN", None), flush=True)
+        print("[DOCTOR] cfg.DATA_SHARDS_VAL:", getattr(cfg, "DATA_SHARDS_VAL", None), flush=True)
+        print("[DOCTOR] cfg.DATA_SHARDS_TEST:", getattr(cfg, "DATA_SHARDS_TEST", None), flush=True)
+        print("[DOCTOR] torch:", torch.__version__, "cuda_available=", torch.cuda.is_available(), flush=True)
+        if torch.cuda.is_available():
+            try:
+                print("[DOCTOR] cuda device:", torch.cuda.get_device_name(0), flush=True)
+            except Exception:
+                pass
+
+        # Dataset check: ensure at least one shard exists.
+        def _count_npz(p: str) -> int:
+            try:
+                d = Path(p)
+                if not d.exists():
+                    return 0
+                return len(list(d.glob("*.npz")))
+            except Exception:
+                return 0
+
+        n_tr = _count_npz(getattr(cfg, "DATA_SHARDS_TRAIN", ""))
+        n_va = _count_npz(getattr(cfg, "DATA_SHARDS_VAL", ""))
+        n_te = _count_npz(getattr(cfg, "DATA_SHARDS_TEST", ""))
+        print(f"[DOCTOR] shards: train={n_tr} val={n_va} test={n_te}", flush=True)
+
+        if (n_tr + n_va + n_te) == 0:
+            print("[DOCTOR] ❌ No .npz shards found. Run pregen-split first.", flush=True)
+            raise SystemExit(2)
+
+        # Load one sample and run a forward pass (catches shape regressions after arch changes).
+        try:
+            from .dataset import ShardNPZDataset
+            d0 = getattr(cfg, "DATA_SHARDS_VAL", getattr(cfg, "DATA_SHARDS_TRAIN", None))
+            ds = ShardNPZDataset(d0)
+            it = ds[0]
+            from .model import HybridModel
+            m = HybridModel()
+            m.eval()
+            B = 1
+            y = it["y"].unsqueeze(0) if torch.is_tensor(it["y"]) else torch.from_numpy(it["y"]).unsqueeze(0)
+            H = it["H"].unsqueeze(0) if torch.is_tensor(it["H"]) else torch.from_numpy(it["H"]).unsqueeze(0)
+            C = it["codes"].unsqueeze(0) if torch.is_tensor(it["codes"]) else torch.from_numpy(it["codes"]).unsqueeze(0)
+            snr = it.get("snr", it.get("snr_db", 10.0))
+            snr = snr.unsqueeze(0) if torch.is_tensor(snr) else torch.tensor([float(snr)], dtype=torch.float32)
+            with torch.no_grad():
+                out = m(y=y.float(), H=H.float(), codes=C.float(), snr_db=snr)
+            ok = all(k in out for k in ("cov_fact_angle", "cov_fact_range", "phi_theta_r"))
+            print("[DOCTOR] forward keys:", sorted(out.keys()), "ok=", ok, flush=True)
+            if not ok:
+                raise RuntimeError("Missing expected outputs from model forward")
+            print("[DOCTOR] ✅ OK", flush=True)
+        except Exception as e:
+            print(f"[DOCTOR] ❌ forward/dataset check failed: {e}", flush=True)
+            raise SystemExit(3)
+
     else:
         parser.print_help()
 
