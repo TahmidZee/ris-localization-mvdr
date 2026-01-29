@@ -239,3 +239,27 @@ Only if absolutely needed; likely unnecessary.
 - If using frequency-flat \(H\) initially, state it as an ablation; final results should use TR 38.901 delay taps.
 - Coherence assumption: the pilot burst duration fits within indoor coherence for slow motion.
 
+---
+
+## 12) Paper paragraph templates (ready to paste)
+
+### 12.1 Simulation scenario (deployment + geometry)
+> **Scenario.** We consider RIS-assisted localization in an **indoor office** environment. A BS equipped with an \(M\)-element array and an RIS with \(N\) passive elements are deployed at fixed, known locations. A user equipment (UE) transmits uplink pilots while the RIS applies programmable phase configurations. The UE is assumed quasi-static over the pilot burst duration.
+
+### 12.2 OFDM numerology and pilot sampling (NR-like, FR1)
+> **OFDM numerology.** We adopt an NR-like OFDM profile in FR1 with **subcarrier spacing \(\Delta f=30\) kHz (μ=1)** and **normal cyclic prefix**, corresponding to **14 OFDM symbols per slot** and **0.5 ms slot duration** (TS 38.211). We consider channel bandwidths of **50 MHz** (NRB≈133) or **100 MHz** (NRB≈273), where the occupied subcarriers are \(N_{sc}=12\cdot\text{NRB}\) (TS 38.104).
+>
+> **Pilot-tone subsampling.** Rather than simulating all occupied subcarriers, we sample **\(F\)** pilot tones uniformly across the occupied band (CSI-RS-like). This yields frequency diversity while keeping computation tractable; unless stated otherwise we use \(F=256\) for 50 MHz or \(F=512\) for 100 MHz.
+
+### 12.3 RIS coding protocol (mapping to L “snapshots”)
+> **RIS coding over pilot symbols.** We apply **\(L\)** RIS phase configurations across **\(L\)** pilot OFDM symbols within a coherence interval (TDD uplink pilots). For RIS configuration \(\ell\) and pilot tone \(k\), the BS collects frequency-domain measurements \(y[\ell,k,m]\) across antennas \(m=1..M\). We store measurements as \(y\in\mathbb{C}^{L\times F\times M}\), RIS codes as \(c\in\mathbb{C}^{L\times N}\), and use the BS–RIS channel operator \(H\in\mathbb{C}^{M\times N}\) (or a tap-domain representation) to form the per-tone effective sensing matrix \(G_{\ell,k}=H[k]\mathrm{diag}(c_\ell)\).
+
+### 12.4 Channel model (TR 38.901 Indoor Office)
+> **Channel model.** The BS–RIS and RIS–UE channels are generated using a **3GPP TR 38.901 Indoor Office** clustered multipath model with realistic delay and angular spreads. To capture frequency selectivity over 50–100 MHz, we generate multipath taps and compute per-tone frequency responses via the standard phase rotation \(\exp(-j2\pi f_k \tau)\) (TR 38.901). A frequency-flat channel assumption, when used, is treated as an ablation and is explicitly labeled as such.
+
+### 12.5 Model realism knobs (RIS non-idealities)
+> **RIS non-idealities.** To avoid idealized assumptions, we optionally include RIS phase quantization (e.g., 2–3 bits), reflection magnitude \(<1\), and static per-element phase offsets. These settings are reported alongside results.
+
+### 12.6 What we do NOT simulate (explicit scope statement)
+> **Scope.** We do not simulate the full NR PHY (coding, HARQ, scheduler) because it does not change the core pilot measurement model for localization. We also do not require simulation of all occupied subcarriers; pilot-tone subsampling is used to retain realism while controlling computational cost.
+
