@@ -303,8 +303,10 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     snr_db = float(sample.get("snr_db", sample.get("snr", 10.0)))
 
     # --- model forward (no grad) ---
+    # IMPORTANT: During training we pass per-sample SNR into the model; inference must match.
+    # Otherwise any SNR-conditioned shrinkage/gating inside the model will be effectively disabled.
     with torch.no_grad():
-        pred = model(_to_ri_t(y_t), _to_ri_t(H_t), _to_ri_t(C_t), snr_db=None, R_samp=None)
+        pred = model(_to_ri_t(y_t), _to_ri_t(H_t), _to_ri_t(C_t), snr_db=snr_db, R_samp=None)
 
     # --- build R_pred from factors (match loss.py fallback) ---
     def _vec2c_flat(v_flat: np.ndarray) -> np.ndarray:
