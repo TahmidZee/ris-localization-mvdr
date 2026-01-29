@@ -421,7 +421,10 @@ class ModelConfig:
     USE_SWA = True  # Enable SWA for last 20% epochs to improve generalization
     SWA_START_FRAC = 0.8  # Start SWA at 80% through training (last 20% epochs)
     SWA_LR_FACTOR = 0.1  # SWA learning rate = initial_lr * SWA_LR_FACTOR
-    USE_3_PHASE_CURRICULUM = True  # Enable 3-phase curriculum (disable for HPO)
+    # The old "3-phase curriculum" changes loss weight scales mid-run (e.g., lam_cov 0.25 -> 0.7),
+    # which makes surrogate scores non-comparable across phases and can trigger misleading early
+    # stopping. Default OFF; if you enable it, prefer phase-aware early-stop or fixed-score metrics.
+    USE_3_PHASE_CURRICULUM = False
 
     # geometry helpers if needed
     DH, DV = 3, 3

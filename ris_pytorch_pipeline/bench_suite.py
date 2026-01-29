@@ -159,7 +159,21 @@ def _estimate_with_baseline(kind, sample, blind_k=True):
     K_hat = estimate_k_blind(R_inc, T=int(y_ri.shape[0]), kmax=int(getattr(cfg, "K_MAX", 5))) if blind_k else int(sample["K"])
     t0 = time.time()
     if kind == "ramezani":
-        phi, tht, rr = ramezani_mod_music_wrapper(R_inc, K_hat)
+        # NOTE: ramezani_mod_music_wrapper uses keyword-only signature (R=..., K=...).
+        # Passing positional args will trigger its assertion and crash the suite.
+        phi, tht, rr = ramezani_mod_music_wrapper(
+            R=R_inc,
+            K=K_hat,
+            N_H=int(getattr(cfg, "N_H", cfg.N_H)),
+            N_V=int(getattr(cfg, "N_V", cfg.N_V)),
+            d_H=float(getattr(cfg, "d_H", 0.5 * float(getattr(cfg, "WAVEL", 0.3)))),
+            d_V=float(getattr(cfg, "d_V", 0.5 * float(getattr(cfg, "WAVEL", 0.3)))),
+            wavelength=float(getattr(cfg, "WAVEL", 0.3)),
+            # Keep sub-RIS small and cheap; wrapper defaults also work, but be explicit.
+            DH=3,
+            DV=3,
+            range_grid=int(getattr(cfg, "RANGE_GRID_STEPS", 61)),
+        )
     elif kind == "decoupled_mod":
         phi, tht, rr = decoupled_mod_music(R_inc, K_hat)
     elif kind == "dcd":
@@ -198,19 +212,24 @@ def _run_on_dataset(tag, dset, baselines=("ramezani","dcd","nfssn"), blind_k=Tru
                              mode=("Blind-K" if blind_k else "Oracle-K")))
             # Baselines
             for base in baselines:
-                (ph_b, tht_b, rr_b), t_b = _estimate_with_baseline(base, item, blind_k=blind_k)
-                err_b = _match_err(gt, (ph_b, tht_b, rr_b), return_rmspe=True)
-                who = ("Ramezani-MOD-MUSIC" if base=="ramezani" else
-                       "DCD-MUSIC" if base=="dcd" else
-                       "NF-SubspaceNet" if base=="nfssn" else
-                       "Decoupled-MOD-MUSIC")
-                recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who=who,
-                                 phi=err_b[0], theta=err_b[1], rng=err_b[2], rmspe=err_b[3],
-                                 t_hybrid_ms=np.nan,
-                                 t_mod_ms=t_b if base in ("ramezani","decoupled_mod") else np.nan,
-                                 t_dcd_ms=t_b if base=="dcd" else np.nan,
-                                 t_nfssn_ms=t_b if base=="nfssn" else np.nan,
-                                 mode=("Blind-K" if blind_k else "Oracle-K")))
+                try:
+                    (ph_b, tht_b, rr_b), t_b = _estimate_with_baseline(base, item, blind_k=blind_k)
+                    err_b = _match_err(gt, (ph_b, tht_b, rr_b), return_rmspe=True)
+                    who = ("Ramezani-MOD-MUSIC" if base=="ramezani" else
+                           "DCD-MUSIC" if base=="dcd" else
+                           "NF-SubspaceNet" if base=="nfssn" else
+                           "Decoupled-MOD-MUSIC")
+                    recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who=who,
+                                     phi=err_b[0], theta=err_b[1], rng=err_b[2], rmspe=err_b[3],
+                                     t_hybrid_ms=np.nan,
+                                     t_mod_ms=t_b if base in ("ramezani","decoupled_mod") else np.nan,
+                                     t_dcd_ms=t_b if base=="dcd" else np.nan,
+                                     t_nfssn_ms=t_b if base=="nfssn" else np.nan,
+                                     mode=("Blind-K" if blind_k else "Oracle-K")))
+                except Exception as e:
+                    # Baselines are optional; never fail the suite for Hybrid evaluation.
+                    print(f"[BASELINE] Warning: baseline '{base}' failed on sample {idx}: {e}", flush=True)
+                    continue
         out = BENCH_DIR / f"{tag}.csv"
         pd.DataFrame(recs).to_csv(out, index=False)
         print(f"[{tag}] Saved {out} in {(time.time()-t0):.1f}s")
