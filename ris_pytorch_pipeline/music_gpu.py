@@ -1058,6 +1058,7 @@ class GPUMusicEstimator:
                             threshold_mode: str = "max_db",
                             cfar_z: float = 5.0,
                             max_sources: int = 5,
+                            force_k: Optional[int] = None,
                             do_refinement: bool = True,
                             prepared: bool = False) -> Tuple[List[Tuple[float, float, float, float]], np.ndarray]:
         """
@@ -1100,6 +1101,15 @@ class GPUMusicEstimator:
                 )
                 refined.append((phi_ref, theta_ref, r_ref, conf_ref))
             candidates = refined
+
+        # If oracle-K is requested, do NOT threshold; return the top-K candidates by confidence.
+        # This makes oracle-K benchmarking meaningful (otherwise thresholding can drop below K).
+        if force_k is not None:
+            k = int(force_k)
+            if k <= 0:
+                return [], spectrum_max
+            candidates = sorted(candidates, key=lambda x: float(x[3]), reverse=True)
+            return candidates[:k], spectrum_max
         
         # Stage 3: Threshold-based detection
         if len(candidates) == 0:

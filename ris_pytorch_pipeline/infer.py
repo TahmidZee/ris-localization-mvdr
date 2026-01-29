@@ -383,6 +383,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
                 threshold_mode=str(getattr(cfg, "MVDR_THRESH_MODE", "mad")),
                 cfar_z=float(getattr(cfg, "MVDR_CFAR_Z", 5.0)),
                 max_sources=max_sources,
+                force_k=(int(force_K) if (force_K is not None) else None),
                 do_refinement=bool(getattr(cfg, "MVDR_DO_REFINEMENT", True)),
             )
             if len(sources) == 0:
@@ -477,13 +478,15 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
 
         # Apply absolute or relative thresholding (relative is default; avoids brittle calibration).
         peak_thresh = getattr(cfg, "REFINER_PEAK_THRESH", None)
-        if peak_thresh is not None:
-            is_max = is_max & (prob2d >= float(peak_thresh))
-        else:
-            rel = float(getattr(cfg, "REFINER_REL_THRESH", 0.20))
-            rel = float(np.clip(rel, 0.0, 1.0))
-            pmax = float(prob2d.max().item()) if prob2d.numel() > 0 else 0.0
-            is_max = is_max & (prob2d >= (rel * pmax))
+        # Oracle-K mode: do NOT apply thresholds; just take the top-K local maxima.
+        if force_K is None:
+            if peak_thresh is not None:
+                is_max = is_max & (prob2d >= float(peak_thresh))
+            else:
+                rel = float(getattr(cfg, "REFINER_REL_THRESH", 0.20))
+                rel = float(np.clip(rel, 0.0, 1.0))
+                pmax = float(prob2d.max().item()) if prob2d.numel() > 0 else 0.0
+                is_max = is_max & (prob2d >= (rel * pmax))
 
         idx = torch.nonzero(is_max, as_tuple=False)
         if bool(getattr(cfg, "REFINER_GUARD_ENABLE", True)):
@@ -495,17 +498,22 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
                     return _mvdr_fallback()
                 # else: keep going and rely on top-K truncation
         if idx.numel() == 0:
-            # Fallback: take the global max (still K-free; avoids MDL fallback).
+            # Fallback: take top-K from the full grid (no NMS).
             flat = prob2d.flatten()
             if flat.numel() == 0:
                 return [], [], []
-            inds = torch.argmax(flat).view(1)
+            k_take = int(force_K) if (force_K is not None) else 1
+            k_take = max(1, min(k_take, int(flat.numel())))
+            inds = torch.topk(flat, k_take).indices
             idx = torch.stack([inds // prob2d.shape[1], inds % prob2d.shape[1]], dim=1)
 
         # Sort peaks by probability desc
         vals = prob2d[idx[:, 0], idx[:, 1]]
         order = torch.argsort(vals, descending=True)
-        idx = idx[order][:max_sources]
+        # In oracle-K mode, return exactly K peaks (up to available).
+        k_keep = int(force_K) if (force_K is not None) else int(max_sources)
+        k_keep = max(1, min(k_keep, int(idx.shape[0])))
+        idx = idx[order][:k_keep]
 
         # Convert to angles and pick best range plane per peak
         sources = []
