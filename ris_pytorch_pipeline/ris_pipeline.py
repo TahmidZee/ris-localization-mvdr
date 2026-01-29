@@ -135,6 +135,11 @@ def main():
     g_suite.add_argument("--oracle_too", action="store_true", help="Also run an all-oracle pass")
     g_suite.add_argument("--include_decoupled", action="store_true", help="Include Decoupled-MOD-MUSIC baseline")
     g_suite.add_argument("--limit", type=int, default=None, help="Limit per sweep (debug)")
+    g_suite.add_argument(
+        "--no-baselines",
+        action="store_true",
+        help="Run Hybrid-only (MVDR-first) evaluation without baseline methods (Ramezani/DCD/NFSSN).",
+    )
 
     # --- plots/tables/export/doctor (optional) ---
     sub.add_parser("plots", help="Render standard benchmark plots")
@@ -273,27 +278,28 @@ def main():
             B5_by_range_bins_blind, B6_by_phi_fov_blind, B7_oracle_full_sweep,
             B4_k2_snr_sweep, B8_rmse_vs_K_at_snr, B9_heatmap_K_by_SNR,
         )
+        baselines = tuple() if bool(getattr(args, "no_baselines", False)) else ("ramezani", "dcd", "nfssn")
 
         if args.bench:
             # Run exactly one benchmark slice (nice for debugging figures)
             b = args.bench
-            if b == "B1": B1_all_blind()
-            elif b == "B2": B2_all_oracle()
-            elif b == "B3": B3_by_K_blind()
-            elif b == "B4": B4_by_SNR_blind()
-            elif b == "B5": B5_by_range_bins_blind()
-            elif b == "B6": B6_by_phi_fov_blind()
+            if b == "B1": B1_all_blind(baselines=baselines, limit=args.limit)
+            elif b == "B2": B2_all_oracle(baselines=baselines, limit=args.limit)
+            elif b == "B3": B3_by_K_blind(baselines=baselines)
+            elif b == "B4": B4_by_SNR_blind(baselines=baselines)
+            elif b == "B5": B5_by_range_bins_blind(baselines=baselines)
+            elif b == "B6": B6_by_phi_fov_blind(baselines=baselines)
             elif b == "B7": B7_oracle_full_sweep()
-            elif b == "B4_k2_snr_sweep": B4_k2_snr_sweep()
-            elif b == "B8_rmse_vs_K_at_snr": B8_rmse_vs_K_at_snr(snr_target=args.snr, tol=args.tol)
-            elif b == "B9_heatmap_K_by_SNR": B9_heatmap_K_by_SNR()
+            elif b == "B4_k2_snr_sweep": B4_k2_snr_sweep(baselines=baselines)
+            elif b == "B8_rmse_vs_K_at_snr": B8_rmse_vs_K_at_snr(snr_target=args.snr, tol=args.tol, baselines=baselines)
+            elif b == "B9_heatmap_K_by_SNR": B9_heatmap_K_by_SNR(baselines=baselines)
             else:
                 raise SystemExit(f"Unknown bench {b}")
         else:
             # Full battery (B1..B7 + B4′ + B8 + B9)
-            run_full_suite(include_decoupled=args.include_decoupled, limit=args.limit)
+            run_full_suite(include_decoupled=args.include_decoupled, limit=args.limit, baselines=baselines)
             if args.oracle_too:
-                B2_all_oracle()
+                B2_all_oracle(baselines=baselines, limit=args.limit)
 
 
     elif args.cmd == "plots":
