@@ -56,14 +56,29 @@ def _match_err(gt, pr, r_scale=1.0, w_phi=1.0, w_theta=1.0, w_r=0.0, return_rmsp
         return float("nan"), float("nan"), float("nan")
     
     # Hungarian matching
-    dphi = ang_wrap_diff(phi_t[:, None], phi_p[None, :])
-    dtht = ang_wrap_diff(theta_t[:, None], theta_p[None, :])
-    if (r_t.size > 0) and (r_p.size > 0):
-        dr = (r_t[:, None] - r_p[None, :]) / max(1e-9, r_scale)
+    #
+    # IMPORTANT:
+    # For near-field localization we ultimately care about 3D position error (RMSPE).
+    # If we match only on angles (w_r=0), multi-source scenes can be mismatched in range,
+    # artificially inflating the reported 3D error even when angles look decent.
+    #
+    # When return_rmspe=True, prefer matching directly in Cartesian distance (meters).
+    if return_rmspe and (r_t.size > 0) and (r_p.size > 0):
+        gt_x, gt_y, gt_z = _cartesian_from_spherical(phi_t, theta_t, r_t)
+        pr_x, pr_y, pr_z = _cartesian_from_spherical(phi_p, theta_p, r_p)
+        dx = gt_x[:, None] - pr_x[None, :]
+        dy = gt_y[:, None] - pr_y[None, :]
+        dz = gt_z[:, None] - pr_z[None, :]
+        # Optionally normalize by r_scale to keep costs in a stable range
+        C = np.sqrt(dx*dx + dy*dy + dz*dz) / max(1e-9, float(r_scale))
     else:
-        dr = np.zeros_like(dphi)
-    
-    C = w_phi*np.abs(dphi) + w_theta*np.abs(dtht) + w_r*np.abs(dr)
+        dphi = ang_wrap_diff(phi_t[:, None], phi_p[None, :])
+        dtht = ang_wrap_diff(theta_t[:, None], theta_p[None, :])
+        if (r_t.size > 0) and (r_p.size > 0):
+            dr = (r_t[:, None] - r_p[None, :]) / max(1e-9, r_scale)
+        else:
+            dr = np.zeros_like(dphi)
+        C = w_phi*np.abs(dphi) + w_theta*np.abs(dtht) + w_r*np.abs(dr)
     
     if Kt <= Kp:
         row_ind, col_ind = linear_sum_assignment(C)
