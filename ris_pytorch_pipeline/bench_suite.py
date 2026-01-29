@@ -136,6 +136,60 @@ def _gt_from_item(item):
     return ([], [], [])
 
 
+# --------------- Detection metrics (TP/FP/FN, Precision/Recall/F1) ---------------
+
+def _det_metrics(gt, pr, *, tol_phi_deg: float = 5.0, tol_theta_deg: float = 5.0, tol_r_m: float = 1.0):
+    """
+    Set-based detection metrics for multi-source localization.
+    A prediction is a TP if it can be matched 1-1 to a GT source within tolerances.
+    Uses Hungarian matching with an invalid-pair mask.
+    """
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    phi_t, theta_t, r_t = [np.asarray(x, dtype=np.float64) for x in gt]
+    phi_p, theta_p, r_p = [np.asarray(x, dtype=np.float64) for x in pr]
+    Kt, Kp = int(phi_t.size), int(phi_p.size)
+
+    if Kt == 0 and Kp == 0:
+        return dict(tp=0, fp=0, fn=0, precision=1.0, recall=1.0, f1=1.0, K_pred=0)
+    if Kt == 0:
+        return dict(tp=0, fp=Kp, fn=0, precision=0.0, recall=1.0, f1=0.0, K_pred=Kp)
+    if Kp == 0:
+        return dict(tp=0, fp=0, fn=Kt, precision=1.0, recall=0.0, f1=0.0, K_pred=0)
+
+    def ang_wrap_diff(a, b):
+        return np.arctan2(np.sin(a - b), np.cos(a - b))
+
+    dphi = np.abs(ang_wrap_diff(phi_t[:, None], phi_p[None, :]))      # [Kt,Kp] rad
+    dtht = np.abs(ang_wrap_diff(theta_t[:, None], theta_p[None, :]))  # [Kt,Kp] rad
+    dr = np.abs(r_t[:, None] - r_p[None, :]) if (r_t.size and r_p.size) else np.zeros_like(dphi)
+
+    tol_phi = np.deg2rad(float(tol_phi_deg))
+    tol_theta = np.deg2rad(float(tol_theta_deg))
+    tol_r = float(tol_r_m)
+    ok = (dphi <= tol_phi) & (dtht <= tol_theta) & (dr <= tol_r)
+
+    # Cost for matching: use 3D distance for valid pairs; huge cost for invalid pairs.
+    gt_x, gt_y, gt_z = _cartesian_from_spherical(phi_t, theta_t, r_t)
+    pr_x, pr_y, pr_z = _cartesian_from_spherical(phi_p, theta_p, r_p)
+    dx = gt_x[:, None] - pr_x[None, :]
+    dy = gt_y[:, None] - pr_y[None, :]
+    dz = gt_z[:, None] - pr_z[None, :]
+    dist = np.sqrt(dx * dx + dy * dy + dz * dz)
+
+    BIG = 1e9
+    C = np.where(ok, dist, BIG)
+    row_ind, col_ind = linear_sum_assignment(C)
+    tp = int(np.sum(C[row_ind, col_ind] < BIG))
+    fp = int(Kp - tp)
+    fn = int(Kt - tp)
+    precision = float(tp) / max(1.0, float(tp + fp))
+    recall = float(tp) / max(1.0, float(tp + fn))
+    f1 = (2.0 * precision * recall) / max(1e-12, (precision + recall))
+    return dict(tp=tp, fp=fp, fn=fn, precision=precision, recall=recall, f1=f1, K_pred=Kp)
+
+
 # --------------- Estimators ---------------
 
 def _estimate_hybrid(model, sample, blind_k=True):
@@ -221,8 +275,16 @@ def _run_on_dataset(tag, dset, baselines=("ramezani","dcd","nfssn"), blind_k=Tru
             # Hybrid
             (ph_h, tht_h, rr_h), t_h = _estimate_hybrid(model, item, blind_k=blind_k)
             err_h = _match_err(gt, (ph_h, tht_h, rr_h), return_rmspe=True)
+            det_h = _det_metrics(
+                gt, (ph_h, tht_h, rr_h),
+                tol_phi_deg=float(getattr(cfg, "SURROGATE_DET_TOL_PHI_DEG", 5.0)),
+                tol_theta_deg=float(getattr(cfg, "SURROGATE_DET_TOL_THETA_DEG", 5.0)),
+                tol_r_m=float(getattr(cfg, "SURROGATE_DET_TOL_R_M", 1.0)),
+            )
             recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who="Hybrid",
                              phi=err_h[0], theta=err_h[1], rng=err_h[2], rmspe=err_h[3],
+                             K_pred=int(det_h["K_pred"]), tp=int(det_h["tp"]), fp=int(det_h["fp"]), fn=int(det_h["fn"]),
+                             precision=float(det_h["precision"]), recall=float(det_h["recall"]), f1=float(det_h["f1"]),
                              t_hybrid_ms=t_h, t_mod_ms=np.nan, t_dcd_ms=np.nan, t_nfssn_ms=np.nan,
                              mode=("Blind-K" if blind_k else "Oracle-K")))
             # Baselines
@@ -230,12 +292,20 @@ def _run_on_dataset(tag, dset, baselines=("ramezani","dcd","nfssn"), blind_k=Tru
                 try:
                     (ph_b, tht_b, rr_b), t_b = _estimate_with_baseline(base, item, blind_k=blind_k)
                     err_b = _match_err(gt, (ph_b, tht_b, rr_b), return_rmspe=True)
+                    det_b = _det_metrics(
+                        gt, (ph_b, tht_b, rr_b),
+                        tol_phi_deg=float(getattr(cfg, "SURROGATE_DET_TOL_PHI_DEG", 5.0)),
+                        tol_theta_deg=float(getattr(cfg, "SURROGATE_DET_TOL_THETA_DEG", 5.0)),
+                        tol_r_m=float(getattr(cfg, "SURROGATE_DET_TOL_R_M", 1.0)),
+                    )
                     who = ("Ramezani-MOD-MUSIC" if base=="ramezani" else
                            "DCD-MUSIC" if base=="dcd" else
                            "NF-SubspaceNet" if base=="nfssn" else
                            "Decoupled-MOD-MUSIC")
                     recs.append(dict(tag=tag, SNR=float(item["snr"]), K=int(item["K"]), who=who,
                                      phi=err_b[0], theta=err_b[1], rng=err_b[2], rmspe=err_b[3],
+                                     K_pred=int(det_b["K_pred"]), tp=int(det_b["tp"]), fp=int(det_b["fp"]), fn=int(det_b["fn"]),
+                                     precision=float(det_b["precision"]), recall=float(det_b["recall"]), f1=float(det_b["f1"]),
                                      t_hybrid_ms=np.nan,
                                      t_mod_ms=t_b if base in ("ramezani","decoupled_mod") else np.nan,
                                      t_dcd_ms=t_b if base=="dcd" else np.nan,
