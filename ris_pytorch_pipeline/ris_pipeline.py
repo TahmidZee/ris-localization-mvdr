@@ -3,6 +3,7 @@ from pathlib import Path
 from .configs import cfg, mdl_cfg, set_seed
 from .dataset import prepare_shards, prepare_split_shards, set_sampling_overrides_from_cfg
 from .train import Trainer
+import sys, time
 
 def main():
     parser = argparse.ArgumentParser("RIS PyTorch Pipeline")
@@ -71,6 +72,8 @@ def main():
     g2.add_argument("--use_shards", action="store_true")
     g2.add_argument("--from_hpo", type=str, default=None,
                     help="Path to results_final/hpo/best.json")
+    g2.add_argument("--log-file", type=str, default=None, help="Optional: write stdout/stderr to this file (also prints to console).")
+    g2.add_argument("--no-log-file", action="store_true", help="Disable automatic log file for this run.")
 
     # --- train SpectrumRefiner (Option B Stage 2) ---
     g2r = sub.add_parser("train-refiner", help="Train SpectrumRefiner on MVDR spectra (freeze backbone)")
@@ -84,6 +87,8 @@ def main():
     g2r.add_argument("--grid_theta", type=int, default=41)
     g2r.add_argument("--out_ckpt_dir", type=str, default=None, help="Override cfg.CKPT_DIR for refiner stage")
     g2r.add_argument("--from_hpo", type=str, default=None, help="Optional best.json for backbone arch params")
+    g2r.add_argument("--log-file", type=str, default=None, help="Optional: write stdout/stderr to this file (also prints to console).")
+    g2r.add_argument("--no-log-file", action="store_true", help="Disable automatic log file for this run.")
 
     # --- HPO ---
     g = sub.add_parser("hpo", help="Hyperparameter optimization")
@@ -163,6 +168,44 @@ def main():
     Path(cfg.RESULTS_DIR, "benches").mkdir(parents=True, exist_ok=True)
     Path(cfg.RESULTS_DIR, "figs").mkdir(parents=True, exist_ok=True)
 
+    # --- optional log-to-file helper (train + train-refiner) ---
+    class _Tee:
+        def __init__(self, stream, f):
+            self.stream = stream
+            self.f = f
+        def write(self, s):
+            self.stream.write(s)
+            self.f.write(s)
+        def flush(self):
+            try:
+                self.stream.flush()
+            except Exception:
+                pass
+            try:
+                self.f.flush()
+            except Exception:
+                pass
+
+    def _with_log_file(run_fn, *, log_path: str | None, enable: bool):
+        if (not enable) or (log_path is None):
+            return run_fn()
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", buffering=1) as f:
+            f.write(f"\n===== RUN START {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(f"cmd: {sys.argv}\n")
+            f.flush()
+            out0, err0 = sys.stdout, sys.stderr
+            sys.stdout = _Tee(out0, f)
+            sys.stderr = _Tee(err0, f)
+            try:
+                return run_fn()
+            finally:
+                sys.stdout.flush(); sys.stderr.flush()
+                sys.stdout, sys.stderr = out0, err0
+                with open(log_path, "a", buffering=1) as f2:
+                    f2.write(f"\n===== RUN END {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+                    f2.flush()
+
     # ---- command router ----
     if args.cmd in ("pregen","pregen-split"):
         # Push CLI robust options into mdl_cfg, then enable overrides for *pregen only*
@@ -203,8 +246,15 @@ def main():
                                  eta_perturb=args.eta, override_L=args.L)
 
     elif args.cmd == "train":
-        t = Trainer(from_hpo=args.from_hpo)
-        t.fit(epochs=args.epochs, n_train=args.n_train, n_val=args.n_val, use_shards=args.use_shards)
+        # Default: write a timestamped log under cfg.LOGS_DIR unless disabled.
+        auto_log = not bool(getattr(args, "no_log_file", False))
+        log_path = getattr(args, "log_file", None)
+        if log_path is None and auto_log:
+            log_path = str(Path(cfg.LOGS_DIR) / f"full_train_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        def _run():
+            t = Trainer(from_hpo=args.from_hpo)
+            return t.fit(epochs=args.epochs, n_train=args.n_train, n_val=args.n_val, use_shards=args.use_shards)
+        _with_log_file(_run, log_path=log_path, enable=auto_log)
 
     elif args.cmd == "train-refiner":
         # Configure stage-2 refiner training (Option B)
@@ -217,8 +267,14 @@ def main():
             cfg.CKPT_DIR = str(args.out_ckpt_dir)
             Path(cfg.CKPT_DIR).mkdir(parents=True, exist_ok=True)
 
-        t = Trainer(from_hpo=args.from_hpo)
-        t.fit(epochs=args.epochs, n_train=args.n_train, n_val=args.n_val, use_shards=args.use_shards)
+        auto_log = not bool(getattr(args, "no_log_file", False))
+        log_path = getattr(args, "log_file", None)
+        if log_path is None and auto_log:
+            log_path = str(Path(cfg.LOGS_DIR) / f"train_refiner_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        def _run():
+            t = Trainer(from_hpo=args.from_hpo)
+            return t.fit(epochs=args.epochs, n_train=args.n_train, n_val=args.n_val, use_shards=args.use_shards)
+        _with_log_file(_run, log_path=log_path, enable=auto_log)
 
     elif args.cmd == "hpo":
         from .hpo import run_hpo
