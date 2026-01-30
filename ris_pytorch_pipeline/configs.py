@@ -7,14 +7,21 @@ class SysConfig:
         # TERMINOLOGY (critical for paper!):
         # - M or M_BS: Base station antennas (hardware, measurements per snapshot)
         # - M_beams: RIS codebook size (spatial beams, set via M_BEAMS_TARGET below)
-        # - M_cov or N: Covariance dimension for MDL/AIC (= RIS elements = 144)
+        # - M_cov or N: Covariance dimension for MDL/AIC (= RIS elements)
         # - L: Temporal snapshots (time budget)
         
-        self.M, self.N_H, self.N_V = 16, 12, 12  # M=M_BS (BS antennas), 12x12 UPA
-        self.M_BS = self.M  # Alias for clarity in paper
-        self.N = self.N_H * self.N_V  # N = M_cov = 144 elements
-        # Temporal snapshots. Increasing L increases measurement diversity but also increases compute/memory.
-        # We are moving to L=64 for improved snapshot diversity and robustness.
+        # === CARRIER / WAVELENGTH (OFDM upgrade: 3.5 GHz FR1 mid-band) ===
+        self.CARRIER_HZ = 3.5e9                          # 3.5 GHz carrier frequency
+        self.WAVEL = 3e8 / self.CARRIER_HZ               # ≈ 0.0857 m wavelength
+        
+        # === ARRAY DIMENSIONS (moderate identifiability regime) ===
+        # BS: 64 antennas (8×8 UPA) - provides strong measurement diversity
+        # RIS: 256 elements (16×16 UPA) - matches literature for indoor sub-6 GHz
+        self.M, self.N_H, self.N_V = 64, 16, 16          # M=64 BS antennas, 16×16 RIS
+        self.M_BS = self.M                               # Alias for clarity in paper
+        self.N = self.N_H * self.N_V                     # N = 256 RIS elements
+        
+        # Temporal snapshots. L=64 provides good diversity for wideband.
         self.L = 64
         
         # M_beams: RIS codebook size (spatial beams in 2D DFT)
@@ -23,10 +30,9 @@ class SysConfig:
         # For baseline: set to 16 (4×4 balanced)
         self.M_BEAMS_TARGET = 64  # Options: 16, 24, 30, 32, 36, 48, 64
 
-        # For 1 GHz: wavelength = c/f = 3e8/1e9 = 0.3 m
-        self.WAVEL = 0.3  # 1 GHz frequency 
-        self.k0 = 2 * math.pi / self.WAVEL
-        self.d_H = self.d_V = 0.5 * self.WAVEL  # λ/2 spacing
+        # Derived geometry from wavelength
+        self.k0 = 2 * math.pi / self.WAVEL               # ≈ 73.3 rad/m
+        self.d_H = self.d_V = 0.5 * self.WAVEL           # λ/2 spacing ≈ 0.043 m
         # FOV: φ ±60°, θ ±30° for realistic wall-mounted panel (train=inference)
         self.ANGLE_RANGE_PHI = math.pi / 3.0    # ±60° azimuth  
         self.ANGLE_RANGE_THETA = math.pi / 6.0  # ±30° elevation
@@ -115,13 +121,13 @@ class SysConfig:
         self._build_2d_dft_codebook()
 
         # --- Results / data / HPO paths ---
-        # Keep these derived from L so changing L doesn't silently mix artifacts.
-        self.RESULTS_DIR = f"results_final_L{self.L}_12x12"
+        # Keep these derived from M, N, L so changing dimensions doesn't silently mix artifacts.
+        self.RESULTS_DIR = f"results_M{self.M}_N{self.N}_L{self.L}"
         self.LOGS_DIR = f"{self.RESULTS_DIR}/logs"
         self.CKPT_DIR = f"{self.RESULTS_DIR}/checkpoints"
 
-        # shards root for M_beams × L data; split folders live here
-        self.DATA_SHARDS_DIR = f"data_shards_M{self.M_BEAMS_TARGET}_L{self.L}"
+        # shards root for M × N × L data; split folders live here
+        self.DATA_SHARDS_DIR = f"data_shards_M{self.M}_N{self.N}_L{self.L}"
         self.DATA_SHARDS_TRAIN = f"{self.DATA_SHARDS_DIR}/train"
         self.DATA_SHARDS_VAL   = f"{self.DATA_SHARDS_DIR}/val"
         self.DATA_SHARDS_TEST  = f"{self.DATA_SHARDS_DIR}/test"
