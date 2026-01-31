@@ -316,9 +316,11 @@ class Trainer:
         head_params = []
         # Head keys used for optimizer grouping (head gets higher LR than backbone).
         # NOTE: K-head components removed - using MVDR peak detection instead
+        # Include all prediction heads for higher LR (structural R needs aux_power too)
         HEAD_KEYS = (
-            'head', 'classifier', 'aux_angles', 'aux_range',
-            'cov_fact_angle', 'cov_fact_range', 'logits_gg'
+            'head', 'classifier', 'aux_angles', 'aux_range', 'aux_power',
+            'cov_fact_angle', 'cov_fact_range', 'logits_gg',
+            'phi_logits', 'theta_logits'  # Factored soft-argmax heads
         )
         
         if self.train_refiner_only:
@@ -1306,9 +1308,11 @@ class Trainer:
                 # Expert fix: Improved gradient flow instrumentation
                 import math
                 # NOTE: K-head removed - using MVDR peak detection instead
+                # Include all prediction heads for higher LR (structural R needs aux_power too)
                 HEAD_KEYS = (
-                    'head', 'classifier', 'aux_angles', 'aux_range',
-                    'cov_fact_angle', 'cov_fact_range', 'logits_gg'
+                    'head', 'classifier', 'aux_angles', 'aux_range', 'aux_power',
+                    'cov_fact_angle', 'cov_fact_range', 'logits_gg',
+                    'phi_logits', 'theta_logits'  # Factored soft-argmax heads
                 )
                 
                 def _group_grad_norm(params):
@@ -2590,17 +2594,18 @@ class Trainer:
         # scheduler (cosine with warmup for stability)
         # NOTE: Scheduler is stepped once per EPOCH, so use epoch-based counting
         total_epochs = max(1, epochs)
-        warmup_epochs = max(1, min(3, total_epochs // 10))  # 1-3 epochs warmup
+        # AGGRESSIVE: Start at 0.8× LR, reach 1.0× by epoch 2
+        warmup_epochs = max(1, min(2, total_epochs // 20))  # Just 1-2 epochs warmup
         
         # Create warmup + cosine scheduler (epoch-based, NOT batch-based)
         def lr_lambda(epoch_step):
             if epoch_step < warmup_epochs:
-                # Linear warmup from 0.5 to 1.0 over warmup_epochs
-                return 0.5 + 0.5 * (epoch_step / max(1, warmup_epochs))
+                # AGGRESSIVE: Start at 0.8× instead of 0.5×, quick ramp to 1.0×
+                return 0.8 + 0.2 * (epoch_step / max(1, warmup_epochs))
             else:
-                # Cosine annealing after warmup: 1.0 → 0.1 (don't decay to 0)
+                # Cosine annealing after warmup: 1.0 → 0.2 (higher floor for continued learning)
                 progress = (epoch_step - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-                return 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * progress))
+                return 0.2 + 0.8 * 0.5 * (1 + np.cos(np.pi * progress))
         
         self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lr_lambda)
         # CRITICAL: Initialize scheduler step counter to avoid warning
