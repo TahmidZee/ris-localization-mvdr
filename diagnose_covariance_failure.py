@@ -20,9 +20,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from ris_pytorch_pipeline.configs import cfg, mdl_cfg
 from ris_pytorch_pipeline.dataset import ShardNPZDataset
-from ris_pytorch_pipeline.infer import load_model, estimate_k_ic_from_cov
 from ris_pytorch_pipeline.covariance_utils import build_effective_cov_torch
 from ris_pytorch_pipeline.loss import _vec2c
+
+# IMPORTANT: Use OLD architecture to analyze existing checkpoint
+# Disable slimming options so we can load the checkpoint
+mdl_cfg.USE_FACTORED_SOFTARGMAX = False
+mdl_cfg.USE_CONV_HPROJ = False
+
+from ris_pytorch_pipeline.infer import load_model, estimate_k_ic_from_cov
 
 def to_complex(ri_tensor):
     """Convert [B, N, N, 2] real/imag to [B, N, N] complex"""
