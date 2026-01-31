@@ -1146,60 +1146,37 @@ class Trainer:
 
                     if R_pred is not None:
                         # Quick sanity before blending:
-                        Bn, Nn = R_pred.shape[:2]
-                        assert R_pred.shape == (Bn, Nn, Nn), f"R_pred bad shape: {R_pred.shape}"
-                    
-                    # Quick sanity before blending:
                         B, N = R_pred.shape[:2]
-                    
-                    # CRITICAL FIX: Don't normalize R_pred to N (it's rank-deficient)
-                    # Only normalize the final R_blend to N after blending
-                    
-                    # CRITICAL FIX: Construct R_samp from snapshots (NEVER use R_true!)
-                    # This must match the inference pipeline exactly
-                    # OPTIMIZED: Use more efficient computation to avoid hanging
-                    # Prefer offline precomputed R_samp; avoid online LS in hot path
-                        B, N = R_pred.shape[:2]
+                        assert R_pred.shape == (B, N, N), f"R_pred bad shape: {R_pred.shape}"
+                        
+                        # Build R_blend for loss (optional hybrid blending with R_samp)
                         if R_samp is not None:
-                        R_samp_c = _ri_to_c(R_samp.to(torch.float32))
-                        # Beta schedule
-                        if hasattr(self, 'beta_warmup_epochs') and self.beta_warmup_epochs is not None and epoch <= self.beta_warmup_epochs:
-                            beta = self.beta_start + (self.beta_final - self.beta_start) * (epoch / max(1, self.beta_warmup_epochs))
-                        else:
-                            beta = self.beta_final
-                        # Optional jitter
-                        if self.model.training and (self.beta_warmup_epochs is None or epoch > self.beta_warmup_epochs):
-                            jitter = getattr(cfg, 'BETA_JITTER_HPO', 0.02) if hasattr(self, '_hpo_loss_weights') and self._hpo_loss_weights else getattr(cfg, 'BETA_JITTER_FULL', 0.05)
-                            if jitter > 0.0:
-                                beta = float((beta + jitter * (2.0 * torch.rand((), device=R_pred.device) - 1.0)).clamp(0.0, 0.95))
-                        if epoch == 1 and bi == 0:
-                            print(f"[Beta] epoch={epoch}, beta={beta:.3f} (offline R_samp)", flush=True)
-                        # Build blended covariance using the canonical helper (no shrink/diag-load here).
-                        # Optional timings for diagnosing "hangs" in first forward/loss/backward.
-                        import os, time
-                        _dbg_timing = (os.environ.get("DEBUG_TIMINGS", "") == "1")
-                        if _dbg_timing and epoch == 1 and bi == 0:
-                            t0 = time.perf_counter()
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                            print("[TIMING] build_effective_cov_torch: start", flush=True)
-                        R_blend = build_effective_cov_torch(
-                            R_pred,
-                            snr_db=None,                 # do NOT shrink here; loss applies it consistently
-                            R_samp=R_samp_c.detach(),    # no grad through sample cov
-                            beta=float(beta),
-                            diag_load=False,
-                            apply_shrink=False,
-                            target_trace=float(N),
-                        )
-                        if _dbg_timing and epoch == 1 and bi == 0:
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                            print(f"[TIMING] build_effective_cov_torch: done in {time.perf_counter()-t0:.3f}s", flush=True)
+                            R_samp_c = _ri_to_c(R_samp.to(torch.float32))
+                            # Beta schedule
+                            if hasattr(self, 'beta_warmup_epochs') and self.beta_warmup_epochs is not None and epoch <= self.beta_warmup_epochs:
+                                beta = self.beta_start + (self.beta_final - self.beta_start) * (epoch / max(1, self.beta_warmup_epochs))
+                            else:
+                                beta = self.beta_final
+                            # Optional jitter
+                            if self.model.training and (self.beta_warmup_epochs is None or epoch > self.beta_warmup_epochs):
+                                jitter = getattr(cfg, 'BETA_JITTER_HPO', 0.02) if hasattr(self, '_hpo_loss_weights') and self._hpo_loss_weights else getattr(cfg, 'BETA_JITTER_FULL', 0.05)
+                                if jitter > 0.0:
+                                    beta = float((beta + jitter * (2.0 * torch.rand((), device=R_pred.device) - 1.0)).clamp(0.0, 0.95))
+                            if epoch == 1 and bi == 0:
+                                print(f"[Beta] epoch={epoch}, beta={beta:.3f} (offline R_samp)", flush=True)
+                            R_blend = build_effective_cov_torch(
+                                R_pred,
+                                snr_db=None,
+                                R_samp=R_samp_c.detach(),
+                                beta=float(beta),
+                                diag_load=False,
+                                apply_shrink=False,
+                                target_trace=float(N),
+                            )
                             preds_fp32['R_blend'] = R_blend
                         else:
                             # No offline R_samp available → use pure R_pred
-                            if epoch == 1 and bi == 0 and getattr(cfg, "HYBRID_COV_BLEND", True) and getattr(cfg, "HYBRID_COV_BETA", 0.0) > 0.0:
+                            if epoch == 1 and bi == 0:
                                 print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
                             preds_fp32['R_blend'] = build_effective_cov_torch(
                                 R_pred,
