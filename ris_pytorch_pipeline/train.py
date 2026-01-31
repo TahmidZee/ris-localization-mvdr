@@ -914,8 +914,10 @@ class Trainer:
         C    = batch["codes"].to(self.device, non_blocking=True)
         ptr  = batch["ptr"].to(self.device, non_blocking=True)
         K    = batch["K"].to(self.device, non_blocking=True)
-        R_in = batch["R"].to(self.device, non_blocking=True)
-        snr  = batch.get("snr_db", torch.zeros(y.shape[0], device=self.device)).to(self.device, non_blocking=True)
+        # Handle both key names for backward compat: R_true (new) or R (old)
+        R_in = batch.get("R_true", batch.get("R")).to(self.device, non_blocking=True)
+        # Handle both key names: snr_db (new) or snr (old)
+        snr  = batch.get("snr_db", batch.get("snr", torch.zeros(y.shape[0], device=self.device))).to(self.device, non_blocking=True)
         # CRITICAL: Also extract H_full if present (for hybrid covariance blending)
         H_full = batch.get("H_full", None)
         if H_full is not None:

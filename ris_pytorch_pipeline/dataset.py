@@ -474,7 +474,11 @@ class ShardNPZDataset(Dataset):
         r_t     = a[2 * KMAX:3 * KMAX][:k].clone()
 
         return dict(
-            y=y_t, H=H_t, H_full=H_full_t, codes=C_t, ptr=ptr_t, K=K_t, snr=snr_t, R=R_t, R_samp=R_samp_t,
+            y=y_t, H=H_t, H_full=H_full_t, codes=C_t, ptr=ptr_t, K=K_t,
+            # Key aliases for backward/forward compatibility:
+            snr=snr_t, snr_db=snr_t,  # Training expects 'snr_db'
+            R=R_t, R_true=R_t,        # Training expects 'R_true'
+            R_samp=R_samp_t,
             phi=phi_t, theta=theta_t, r=r_t,
         )
 

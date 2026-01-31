@@ -455,14 +455,33 @@ def main():
             ds = ShardNPZDataset(d0)
             it = ds[0]
             
-            # Check required keys
-            required_keys = ["y", "codes", "H_full", "R_true", "ptr", "K", "snr_db"]
-            missing_keys = [k for k in required_keys if k not in it]
-            if missing_keys:
-                print(f"  ❌ Missing required keys: {missing_keys}")
+            # Check required keys (with aliases for backward compat: R_true/R, snr_db/snr)
+            all_keys = set(it.keys())
+            print(f"  Shard keys: {sorted(all_keys)}")
+            
+            # Required with aliases
+            has_y = "y" in all_keys
+            has_codes = "codes" in all_keys
+            has_H_full = "H_full" in all_keys
+            has_R = ("R_true" in all_keys) or ("R" in all_keys)
+            has_ptr = "ptr" in all_keys
+            has_K = "K" in all_keys
+            has_snr = ("snr_db" in all_keys) or ("snr" in all_keys)
+            
+            missing = []
+            if not has_y: missing.append("y")
+            if not has_codes: missing.append("codes")
+            if not has_H_full: missing.append("H_full")
+            if not has_R: missing.append("R or R_true")
+            if not has_ptr: missing.append("ptr")
+            if not has_K: missing.append("K")
+            if not has_snr: missing.append("snr or snr_db")
+            
+            if missing:
+                print(f"  ❌ Missing required keys: {missing}")
                 print("     Regenerate shards with updated pregen.")
                 raise SystemExit(4)
-            print(f"  ✅ All required keys present: {sorted(it.keys())}")
+            print(f"  ✅ All required keys present")
             
             # Check shapes match current config
             y_shape = tuple(it["y"].shape)
@@ -483,13 +502,16 @@ def main():
                 raise SystemExit(4)
             print(f"  ✅ H_full shape: {H_shape} (matches config)")
             
-            R_shape = tuple(it["R_true"].shape)
+            # Get R (may be keyed as R_true or R)
+            R_key = "R_true" if "R_true" in it else "R"
+            R_data = it[R_key]
+            R_shape = tuple(R_data.shape)
             expected_R = (cfg.N, cfg.N, 2)
             if R_shape != expected_R:
-                print(f"  ❌ R_true shape mismatch: shard has {R_shape}, config expects {expected_R}")
+                print(f"  ❌ {R_key} shape mismatch: shard has {R_shape}, config expects {expected_R}")
                 print("     ⚠️  REGENERATE SHARDS with current config!")
                 raise SystemExit(4)
-            print(f"  ✅ R_true shape: {R_shape} (matches config)")
+            print(f"  ✅ {R_key} shape: {R_shape} (matches config)")
             
             ptr_shape = tuple(it["ptr"].shape)
             expected_ptr = (3 * cfg.K_MAX,)
@@ -517,17 +539,17 @@ def main():
             print(f"    theta: [{np.rad2deg(theta_gt.min()):.1f}°, {np.rad2deg(theta_gt.max()):.1f}°]")
             print(f"    r: [{r_gt.min():.2f}m, {r_gt.max():.2f}m]")
             
-            # Check R_true is valid (not all zeros, reasonable eigenvalues)
-            R_true_np = it["R_true"].numpy() if torch.is_tensor(it["R_true"]) else it["R_true"]
-            R_true_c = R_true_np[..., 0] + 1j * R_true_np[..., 1]
-            eigs = np.linalg.eigvalsh(R_true_c)
-            print(f"  R_true eigenvalues: min={eigs.min():.4f}, max={eigs.max():.4f}")
+            # Check R is valid (not all zeros, reasonable eigenvalues)
+            R_np = R_data.numpy() if torch.is_tensor(R_data) else R_data
+            R_c = R_np[..., 0] + 1j * R_np[..., 1]
+            eigs = np.linalg.eigvalsh(R_c)
+            print(f"  {R_key} eigenvalues: min={eigs.min():.4f}, max={eigs.max():.4f}")
             if eigs.max() < 1e-6:
-                print("  ❌ R_true appears to be all zeros!")
+                print(f"  ❌ {R_key} appears to be all zeros!")
                 raise SystemExit(4)
             if eigs.min() < -1e-6:
-                print("  ⚠️  R_true has negative eigenvalues (not PSD)")
-            print("  ✅ R_true is valid")
+                print(f"  ⚠️  {R_key} has negative eigenvalues (not PSD)")
+            print(f"  ✅ {R_key} is valid")
             
         except SystemExit:
             raise
