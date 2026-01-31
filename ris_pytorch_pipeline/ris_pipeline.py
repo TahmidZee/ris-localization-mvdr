@@ -385,23 +385,47 @@ def main():
             export_paper_material()
 
     elif args.cmd == "doctor":
-        # Lightweight environment + dataset + forward-pass checks.
+        # Comprehensive environment + dataset + forward-pass + shard compatibility checks.
         import os
         import numpy as np
         import torch
-        print("[DOCTOR] cfg.RESULTS_DIR:", cfg.RESULTS_DIR, flush=True)
-        print("[DOCTOR] cfg.DATA_SHARDS_DIR:", getattr(cfg, "DATA_SHARDS_DIR", None), flush=True)
-        print("[DOCTOR] cfg.DATA_SHARDS_TRAIN:", getattr(cfg, "DATA_SHARDS_TRAIN", None), flush=True)
-        print("[DOCTOR] cfg.DATA_SHARDS_VAL:", getattr(cfg, "DATA_SHARDS_VAL", None), flush=True)
-        print("[DOCTOR] cfg.DATA_SHARDS_TEST:", getattr(cfg, "DATA_SHARDS_TEST", None), flush=True)
-        print("[DOCTOR] torch:", torch.__version__, "cuda_available=", torch.cuda.is_available(), flush=True)
+        
+        print("=" * 60)
+        print("[DOCTOR] RIS Pipeline Health Check")
+        print("=" * 60)
+        
+        # 1. Config check
+        print("\n[1/6] Configuration Check")
+        print(f"  cfg.M = {cfg.M} (BS antennas)")
+        print(f"  cfg.N = {cfg.N} (RIS elements, {cfg.N_H}x{cfg.N_V})")
+        print(f"  cfg.L = {cfg.L} (RIS configurations)")
+        print(f"  cfg.K_MAX = {cfg.K_MAX} (max sources)")
+        print(f"  cfg.WAVEL = {cfg.WAVEL:.4f} m")
+        print(f"  cfg.RANGE_R = {cfg.RANGE_R}")
+        print(f"  cfg.RANGE_EPS_M = {getattr(cfg, 'RANGE_EPS_M', 'NOT SET (using default 1e-3)')}")
+        print(f"  cfg.RESULTS_DIR = {cfg.RESULTS_DIR}")
+        print(f"  cfg.DATA_SHARDS_DIR = {getattr(cfg, 'DATA_SHARDS_DIR', None)}")
+        
+        # 2. Model config check
+        print("\n[2/6] Model Configuration Check")
+        print(f"  USE_STRUCTURED_R = {getattr(mdl_cfg, 'USE_STRUCTURED_R', False)}")
+        print(f"  USE_FACTORED_SOFTARGMAX = {getattr(mdl_cfg, 'USE_FACTORED_SOFTARGMAX', False)}")
+        print(f"  USE_CONV_HPROJ = {getattr(mdl_cfg, 'USE_CONV_HPROJ', False)}")
+        
+        # 3. PyTorch check
+        print("\n[3/6] PyTorch Environment")
+        print(f"  torch version: {torch.__version__}")
+        print(f"  CUDA available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
             try:
-                print("[DOCTOR] cuda device:", torch.cuda.get_device_name(0), flush=True)
-            except Exception:
-                pass
+                print(f"  CUDA device: {torch.cuda.get_device_name(0)}")
+                free_b, total_b = torch.cuda.mem_get_info(0)
+                print(f"  CUDA memory: {free_b/1e9:.1f} GB free / {total_b/1e9:.1f} GB total")
+            except Exception as e:
+                print(f"  CUDA info error: {e}")
 
-        # Dataset check: ensure at least one shard exists.
+        # 4. Shard existence check
+        print("\n[4/6] Shard Existence Check")
         def _count_npz(p: str) -> int:
             try:
                 d = Path(p)
@@ -414,41 +438,165 @@ def main():
         n_tr = _count_npz(getattr(cfg, "DATA_SHARDS_TRAIN", ""))
         n_va = _count_npz(getattr(cfg, "DATA_SHARDS_VAL", ""))
         n_te = _count_npz(getattr(cfg, "DATA_SHARDS_TEST", ""))
-        print(f"[DOCTOR] shards: train={n_tr} val={n_va} test={n_te}", flush=True)
+        print(f"  train shards: {n_tr}")
+        print(f"  val shards: {n_va}")
+        print(f"  test shards: {n_te}")
 
         if (n_tr + n_va + n_te) == 0:
-            print("[DOCTOR] ❌ No .npz shards found. Run pregen-split first.", flush=True)
+            print("  ❌ No .npz shards found. Run pregen first.")
             raise SystemExit(2)
+        print("  ✅ Shards exist")
 
-        # Load one sample and run a forward pass (catches shape regressions after arch changes).
+        # 5. Shard compatibility check (CRITICAL)
+        print("\n[5/6] Shard Compatibility Check")
         try:
             from .dataset import ShardNPZDataset
             d0 = getattr(cfg, "DATA_SHARDS_VAL", getattr(cfg, "DATA_SHARDS_TRAIN", None))
             ds = ShardNPZDataset(d0)
             it = ds[0]
+            
+            # Check required keys
+            required_keys = ["y", "codes", "H_full", "R_true", "ptr", "K", "snr_db"]
+            missing_keys = [k for k in required_keys if k not in it]
+            if missing_keys:
+                print(f"  ❌ Missing required keys: {missing_keys}")
+                print("     Regenerate shards with updated pregen.")
+                raise SystemExit(4)
+            print(f"  ✅ All required keys present: {sorted(it.keys())}")
+            
+            # Check shapes match current config
+            y_shape = tuple(it["y"].shape)
+            expected_y = (cfg.L, cfg.M, 2)
+            if y_shape != expected_y:
+                print(f"  ❌ y shape mismatch: shard has {y_shape}, config expects {expected_y}")
+                print(f"     Shard M={y_shape[1]}, config M={cfg.M}")
+                print("     ⚠️  REGENERATE SHARDS with current config!")
+                raise SystemExit(4)
+            print(f"  ✅ y shape: {y_shape} (matches config)")
+            
+            H_shape = tuple(it["H_full"].shape)
+            expected_H = (cfg.M, cfg.N, 2)
+            if H_shape != expected_H:
+                print(f"  ❌ H_full shape mismatch: shard has {H_shape}, config expects {expected_H}")
+                print(f"     Shard M×N={H_shape[0]}×{H_shape[1]}, config M×N={cfg.M}×{cfg.N}")
+                print("     ⚠️  REGENERATE SHARDS with current config!")
+                raise SystemExit(4)
+            print(f"  ✅ H_full shape: {H_shape} (matches config)")
+            
+            R_shape = tuple(it["R_true"].shape)
+            expected_R = (cfg.N, cfg.N, 2)
+            if R_shape != expected_R:
+                print(f"  ❌ R_true shape mismatch: shard has {R_shape}, config expects {expected_R}")
+                print("     ⚠️  REGENERATE SHARDS with current config!")
+                raise SystemExit(4)
+            print(f"  ✅ R_true shape: {R_shape} (matches config)")
+            
+            ptr_shape = tuple(it["ptr"].shape)
+            expected_ptr = (3 * cfg.K_MAX,)
+            if ptr_shape != expected_ptr:
+                print(f"  ❌ ptr shape mismatch: shard has {ptr_shape}, config expects {expected_ptr}")
+                print("     ⚠️  REGENERATE SHARDS with current config!")
+                raise SystemExit(4)
+            print(f"  ✅ ptr shape: {ptr_shape} (matches config)")
+            
+            # Check for R_samp (optional but logged)
+            if "R_samp" in it:
+                print(f"  ℹ️  R_samp present: shape={tuple(it['R_samp'].shape)}")
+            else:
+                print("  ℹ️  R_samp not present (training will use pure R_pred)")
+            
+            # Validate GT values are in expected ranges
+            ptr_np = it["ptr"].numpy() if torch.is_tensor(it["ptr"]) else it["ptr"]
+            K_val = int(it["K"].item() if torch.is_tensor(it["K"]) else it["K"])
+            phi_gt = ptr_np[:cfg.K_MAX][:K_val]
+            theta_gt = ptr_np[cfg.K_MAX:2*cfg.K_MAX][:K_val]
+            r_gt = ptr_np[2*cfg.K_MAX:3*cfg.K_MAX][:K_val]
+            
+            print(f"  GT sample (K={K_val}):")
+            print(f"    phi: [{np.rad2deg(phi_gt.min()):.1f}°, {np.rad2deg(phi_gt.max()):.1f}°]")
+            print(f"    theta: [{np.rad2deg(theta_gt.min()):.1f}°, {np.rad2deg(theta_gt.max()):.1f}°]")
+            print(f"    r: [{r_gt.min():.2f}m, {r_gt.max():.2f}m]")
+            
+            # Check R_true is valid (not all zeros, reasonable eigenvalues)
+            R_true_np = it["R_true"].numpy() if torch.is_tensor(it["R_true"]) else it["R_true"]
+            R_true_c = R_true_np[..., 0] + 1j * R_true_np[..., 1]
+            eigs = np.linalg.eigvalsh(R_true_c)
+            print(f"  R_true eigenvalues: min={eigs.min():.4f}, max={eigs.max():.4f}")
+            if eigs.max() < 1e-6:
+                print("  ❌ R_true appears to be all zeros!")
+                raise SystemExit(4)
+            if eigs.min() < -1e-6:
+                print("  ⚠️  R_true has negative eigenvalues (not PSD)")
+            print("  ✅ R_true is valid")
+            
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"  ❌ Shard check failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise SystemExit(4)
+
+        # 6. Forward pass check
+        print("\n[6/6] Model Forward Pass Check")
+        try:
             from .model import HybridModel
             m = HybridModel()
             m.eval()
+            
+            # Count parameters
+            total_params = sum(p.numel() for p in m.parameters())
+            trainable_params = sum(p.numel() for p in m.parameters() if p.requires_grad)
+            print(f"  Model params: {total_params/1e6:.1f}M total, {trainable_params/1e6:.1f}M trainable")
+            
             B = 1
             y = it["y"].unsqueeze(0) if torch.is_tensor(it["y"]) else torch.from_numpy(it["y"]).unsqueeze(0)
-            H_full = it.get("H_full", None)
-            if H_full is None:
-                raise RuntimeError("Shard is missing 'H_full'. Regenerate shards with store_h_full=True.")
-            H_full = H_full.unsqueeze(0) if torch.is_tensor(H_full) else torch.from_numpy(H_full).unsqueeze(0)
+            H_full = it["H_full"].unsqueeze(0) if torch.is_tensor(it["H_full"]) else torch.from_numpy(it["H_full"]).unsqueeze(0)
             C = it["codes"].unsqueeze(0) if torch.is_tensor(it["codes"]) else torch.from_numpy(it["codes"]).unsqueeze(0)
             snr = it.get("snr", it.get("snr_db", 10.0))
             snr = snr.unsqueeze(0) if torch.is_tensor(snr) else torch.tensor([float(snr)], dtype=torch.float32)
+            
             with torch.no_grad():
                 out = m(y=y.float(), H_full=H_full.float(), codes=C.float(), snr_db=snr)
-            # Structural-fix compatibility: model may output R_pred instead of covariance factors
-            ok = ("phi_theta_r" in out) and (("R_pred" in out) or (("cov_fact_angle" in out) and ("cov_fact_range" in out)))
-            print("[DOCTOR] forward keys:", sorted(out.keys()), "ok=", ok, flush=True)
-            if not ok:
-                raise RuntimeError("Missing expected outputs from model forward")
-            print("[DOCTOR] ✅ OK", flush=True)
+            
+            print(f"  Output keys: {sorted(out.keys())}")
+            
+            # Check structural R mode
+            if "R_pred" in out:
+                R_pred = out["R_pred"]
+                print(f"  R_pred: shape={tuple(R_pred.shape)}, dtype={R_pred.dtype}")
+                if R_pred.shape != (B, cfg.N, cfg.N):
+                    print(f"  ❌ R_pred shape mismatch!")
+                    raise SystemExit(5)
+                # Check R_pred properties
+                R_pred_np = R_pred[0].numpy()
+                eigs_pred = np.linalg.eigvalsh(R_pred_np)
+                print(f"  R_pred eigenvalues: min={eigs_pred.min():.4f}, max={eigs_pred.max():.4f}")
+                print("  ✅ R_pred is valid")
+            elif "cov_fact_angle" in out:
+                print("  Using legacy covariance factors (not structural R)")
+            else:
+                print("  ❌ Neither R_pred nor cov_fact_angle in output!")
+                raise SystemExit(5)
+            
+            # Check aux predictions
+            if "phi_theta_r" in out:
+                ptr_out = out["phi_theta_r"][0].numpy()
+                print(f"  phi_theta_r: shape={tuple(out['phi_theta_r'].shape)}")
+            
+            print("  ✅ Forward pass successful")
+            
+        except SystemExit:
+            raise
         except Exception as e:
-            print(f"[DOCTOR] ❌ forward/dataset check failed: {e}", flush=True)
-            raise SystemExit(3)
+            print(f"  ❌ Forward pass failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise SystemExit(5)
+
+        print("\n" + "=" * 60)
+        print("[DOCTOR] ✅ All checks passed!")
+        print("=" * 60)
 
     else:
         parser.print_help()
