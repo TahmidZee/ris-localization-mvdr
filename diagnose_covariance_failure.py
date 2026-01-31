@@ -163,6 +163,12 @@ def main():
     
     n_samples = min(100, len(ds))
     
+    # Check what keys are available
+    sample0 = ds[0]
+    print(f"   Available keys: {list(sample0.keys())}")
+    has_R_true = "R_true" in sample0
+    print(f"   Has R_true: {has_R_true}")
+    
     for i in range(n_samples):
         sample = ds[i]
         
@@ -172,10 +178,51 @@ def main():
         codes = to_ri(sample["codes"]).unsqueeze(0).to(device)
         snr_db = torch.tensor([sample.get("snr_db", sample.get("snr", 10.0))], device=device)
         
-        R_true_ri = sample["R_true"]
-        if isinstance(R_true_ri, np.ndarray):
-            R_true_ri = torch.from_numpy(R_true_ri)
-        R_true = to_complex(R_true_ri.to(device))
+        # Get or compute R_true
+        if has_R_true:
+            R_true_ri = sample["R_true"]
+            if isinstance(R_true_ri, np.ndarray):
+                R_true_ri = torch.from_numpy(R_true_ri)
+            R_true = to_complex(R_true_ri.to(device))
+        else:
+            # Compute R_true from steering vectors and GT positions
+            # R_true = sum_k p_k * a(phi_k, theta_k, r_k) @ a^H
+            ptr = sample["ptr"]
+            K_true_val = int(sample["K"])
+            phi_gt = ptr[:cfg.K_MAX]
+            theta_gt = ptr[cfg.K_MAX:2*cfg.K_MAX]
+            r_gt = ptr[2*cfg.K_MAX:3*cfg.K_MAX]
+            
+            # Build steering vectors
+            N_H, N_V = cfg.N_H, cfg.N_V
+            d_H, d_V = cfg.d_H, cfg.d_V
+            k0 = cfg.k0
+            N = cfg.N
+            
+            h = np.arange(-(N_H-1)//2, (N_H+1)//2) * d_H
+            v = np.arange(-(N_V-1)//2, (N_V+1)//2) * d_V
+            H_grid, V_grid = np.meshgrid(h, v, indexing='xy')
+            x = H_grid.flatten()[:N]
+            y_coord = V_grid.flatten()[:N]
+            
+            R_true_np = np.zeros((N, N), dtype=np.complex128)
+            for k in range(K_true_val):
+                sin_phi = np.sin(phi_gt[k])
+                cos_theta = np.cos(theta_gt[k])
+                sin_theta = np.sin(theta_gt[k])
+                r_k = max(r_gt[k], 0.1)
+                
+                planar = x * sin_phi * cos_theta + y_coord * sin_theta
+                curvature = (x**2 + y_coord**2) / (2.0 * r_k)
+                phase = k0 * (planar - curvature)
+                a = np.exp(1j * phase) / np.sqrt(N)
+                
+                # Equal power assumption (or use powers if available)
+                R_true_np += np.outer(a, a.conj())
+            
+            # Normalize
+            R_true_np = R_true_np / (np.trace(R_true_np) + 1e-12) * N
+            R_true = torch.from_numpy(R_true_np).to(device).to(torch.complex64)
         
         K_true = int(sample["K"])
         ptr = sample["ptr"]  # [3*K_MAX]: phi, theta, r
