@@ -956,26 +956,9 @@ class Trainer:
         if epoch_dbg:
             print(f"[EPOCH DEBUG] epoch={epoch} iters={iters} len(loader)={len(loader)}", flush=True)
             print(f"[EPOCH DEBUG] entering for loop over loader...", flush=True)
-            import sys; sys.stdout.flush(); sys.stderr.flush()
-
-        # DEBUG: Try to manually get first batch
-        if epoch_dbg:
-            try:
-                print(f"[EPOCH DEBUG] testing manual iter(loader)...", flush=True)
-                test_iter = iter(loader)
-                print(f"[EPOCH DEBUG] iter() succeeded, calling next()...", flush=True)
-                test_batch = next(test_iter)
-                print(f"[EPOCH DEBUG] next() succeeded, got batch with keys: {list(test_batch.keys()) if isinstance(test_batch, dict) else 'not a dict'}", flush=True)
-                del test_iter, test_batch
-            except StopIteration:
-                print(f"[EPOCH DEBUG] StopIteration - loader is EMPTY!", flush=True)
-                return 0.0
-            except Exception as e:
-                print(f"[EPOCH DEBUG] EXCEPTION during manual iter: {type(e).__name__}: {e}", flush=True)
-                import traceback; traceback.print_exc()
-                return 0.0
-            
-            print(f"[EPOCH DEBUG] manual test passed, now doing real for loop...", flush=True)
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
 
         batch_count = 0
         for bi, batch in enumerate(loader):
@@ -1106,86 +1089,70 @@ class Trainer:
                             if torch.isnan(v).any() or torch.isinf(v).any():
                                 print(f"[DEBUG] NaN/Inf detected in labels[{k}] BEFORE loss!")
                 
-                # CRITICAL FIX: Construct blended covariance for loss function
-                # This ensures eigengap loss operates on well-conditioned matrix
+                # Construct training-time covariance used by the loss:
+                # Priority: STRUCTURAL R_pred (geometry-aware) > blended R_blend (if offline R_samp exists) > legacy factors.
                 if not self.train_refiner_only:
-                    # Priority: STRUCTURAL R_pred (geometry-aware) > legacy factors.
                     R_pred = None
-                    if 'R_pred' in preds_fp32 and isinstance(preds_fp32['R_pred'], torch.Tensor):
-                        R_pred = preds_fp32['R_pred']
-                    elif ('cov_fact_angle' in preds_fp32) and ('cov_fact_range' in preds_fp32):
-                        # EXPERT FIX: Build R_pred robustly from factors to prevent shape bugs
-                        def build_R_pred_from_factors(preds, cfg):
-                            B = preds['cov_fact_angle'].size(0)
-                            N = cfg.N_H * cfg.N_V
-                            K_MAX = cfg.K_MAX
-
-                            flat_ang = preds['cov_fact_angle'].contiguous().float()
-                            flat_rng = preds['cov_fact_range'].contiguous().float()
-
-                            assert flat_ang.dim() == 2 and flat_ang.size(0) == B, "bad factor shape"
-                            assert flat_rng.dim() == 2 and flat_rng.size(0) == B, "bad factor shape"
-                            assert flat_ang.size(1) == 2 * N * K_MAX, f"expected {2*N*K_MAX}, got {flat_ang.size(1)}"
-                            assert flat_rng.size(1) == 2 * N * K_MAX, f"expected {2*N*K_MAX}, got {flat_rng.size(1)}"
-
-                            def _vec2c_local(v):
-                                xr, xi = v[:, ::2], v[:, 1::2]
-                                return torch.complex(xr.view(B, N, K_MAX), xi.view(B, N, K_MAX))
-
-                            A_ang = _vec2c_local(flat_ang)
-                            A_rng = _vec2c_local(flat_rng)
-
-                            lam_range = getattr(cfg, 'LAM_RANGE_FACTOR', 0.1)
-                            R_pred = (A_ang @ A_ang.conj().transpose(-2, -1)) + lam_range * (A_rng @ A_rng.conj().transpose(-2, -1))
-                            R_pred = 0.5 * (R_pred + R_pred.conj().transpose(-2, -1))
-                            return R_pred
-
-                        R_pred = build_R_pred_from_factors(preds_fp32, cfg)
-                    else:
-                        R_pred = None
+                    if ("R_pred" in preds_fp32) and isinstance(preds_fp32["R_pred"], torch.Tensor):
+                        R_pred = preds_fp32["R_pred"]  # [B,N,N] complex
+                    elif ("cov_fact_angle" in preds_fp32) and ("cov_fact_range" in preds_fp32):
+                        lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                        R_pred = build_R_pred_from_factor_vecs(
+                            preds_fp32["cov_fact_angle"],
+                            preds_fp32["cov_fact_range"],
+                            N=int(cfg.N),
+                            Kmax=int(cfg.K_MAX),
+                            lam_range=lam_range,
+                        )
 
                     if R_pred is not None:
-                        # Quick sanity before blending:
-                        B, N = R_pred.shape[:2]
-                        assert R_pred.shape == (B, N, N), f"R_pred bad shape: {R_pred.shape}"
-                        
-                        # Build R_blend for loss (optional hybrid blending with R_samp)
+                        Bn, Nn = int(R_pred.shape[0]), int(R_pred.shape[1])
+                        assert R_pred.shape == (Bn, Nn, Nn), f"R_pred bad shape: {tuple(R_pred.shape)}"
+
+                        # Optional hybrid blend if offline R_samp exists (currently typically absent).
                         if R_samp is not None:
                             R_samp_c = _ri_to_c(R_samp.to(torch.float32))
+                            R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
+
                             # Beta schedule
-                            if hasattr(self, 'beta_warmup_epochs') and self.beta_warmup_epochs is not None and epoch <= self.beta_warmup_epochs:
+                            if hasattr(self, "beta_warmup_epochs") and (self.beta_warmup_epochs is not None) and (epoch <= self.beta_warmup_epochs):
                                 beta = self.beta_start + (self.beta_final - self.beta_start) * (epoch / max(1, self.beta_warmup_epochs))
                             else:
                                 beta = self.beta_final
+
                             # Optional jitter
                             if self.model.training and (self.beta_warmup_epochs is None or epoch > self.beta_warmup_epochs):
-                                jitter = getattr(cfg, 'BETA_JITTER_HPO', 0.02) if hasattr(self, '_hpo_loss_weights') and self._hpo_loss_weights else getattr(cfg, 'BETA_JITTER_FULL', 0.05)
+                                jitter = (
+                                    getattr(cfg, "BETA_JITTER_HPO", 0.02)
+                                    if hasattr(self, "_hpo_loss_weights") and self._hpo_loss_weights
+                                    else getattr(cfg, "BETA_JITTER_FULL", 0.05)
+                                )
                                 if jitter > 0.0:
                                     beta = float((beta + jitter * (2.0 * torch.rand((), device=R_pred.device) - 1.0)).clamp(0.0, 0.95))
+
                             if epoch == 1 and bi == 0:
                                 print(f"[Beta] epoch={epoch}, beta={beta:.3f} (offline R_samp)", flush=True)
-                            R_blend = build_effective_cov_torch(
+
+                            preds_fp32["R_blend"] = build_effective_cov_torch(
                                 R_pred,
                                 snr_db=None,
                                 R_samp=R_samp_c.detach(),
                                 beta=float(beta),
                                 diag_load=False,
                                 apply_shrink=False,
-                                target_trace=float(N),
+                                target_trace=float(Nn),
                             )
-                            preds_fp32['R_blend'] = R_blend
                         else:
-                            # No offline R_samp available → use pure R_pred
                             if epoch == 1 and bi == 0:
                                 print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
-                            preds_fp32['R_blend'] = build_effective_cov_torch(
+                            preds_fp32["R_blend"] = build_effective_cov_torch(
                                 R_pred,
                                 snr_db=None,
                                 R_samp=None,
                                 beta=None,
                                 diag_load=False,
                                 apply_shrink=False,
-                                target_trace=float(N),
+                                target_trace=float(Nn),
                             )
         
             # Compute loss in FP32
@@ -1374,7 +1341,9 @@ class Trainer:
                 # DEBUG: Print for EVERY batch, not just epoch 1
                 if _should_log_batch(bi):
                     print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow_hint={overflow_hint}", flush=True)
-                    import sys; sys.stdout.flush(); sys.stderr.flush()
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                 
                 # Initialize stepped flag
                 stepped = False
@@ -1812,7 +1781,7 @@ class Trainer:
                             )
                             # Optional hybrid blend if offline R_samp exists (currently typically absent).
                             R_samp_c = None
-                            beta = 0.0
+                            beta = None
                             if R_samp is not None:
                                 try:
                                     R_samp_c = _ri_to_c(R_samp.float())
@@ -1820,7 +1789,7 @@ class Trainer:
                                     beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
                                 except Exception:
                                     R_samp_c = None
-                                    beta = 0.0
+                                    beta = None
                             R_eff = build_effective_cov_torch(
                                 R_pred,
                                 snr_db=snr,                       # match inference (SNR-aware shrink)
@@ -3171,72 +3140,6 @@ class Trainer:
                                 print(f"     ❌ Hybrid blending ERROR: {e}", flush=True)
                                 import traceback
                                 traceback.print_exc()
-                        
-                        # CLASSICAL MUSIC BASELINE: Optional ceiling check (debug-only).
-                        if bool(getattr(cfg, "MUSIC_DEBUG", False)):
-                            try:
-                                # Get ground truth for first scene
-                                if isinstance(batch_val, dict):
-                                    K_batch = batch_val["K"].to(self.device)
-                                    ptr_batch = batch_val["ptr"].to(self.device)
-                                    R_in_batch = batch_val["R_true"].to(self.device)
-                                else:
-                                    # Unpack tuple (now has 8 elements: y, H, C, ptr, K, R, snr, H_full)
-                                    _, _, _, ptr_batch, K_batch, R_in_batch, _, _ = batch_val
-                                
-                                k_true = int(K_batch[0].item())
-                                ptr_np = ptr_batch[0].detach().cpu().numpy()
-                                phi_gt = np.rad2deg(ptr_np[:k_true])
-                                theta_gt = np.rad2deg(ptr_np[cfg.K_MAX:cfg.K_MAX+k_true])
-                                
-                                # Get ground truth range (if available)
-                                r_gt = None
-                                if len(ptr_np) > 2*cfg.K_MAX:
-                                    r_gt = ptr_np[2*cfg.K_MAX:2*cfg.K_MAX+k_true]  # Ground truth ranges
-                                
-                                print(f"  [DEBUG Classical] k_true={k_true}, phi_gt={phi_gt}, theta_gt={theta_gt}", flush=True)
-                                if r_gt is not None:
-                                    print(f"  [DEBUG Classical] r_gt={r_gt}", flush=True)
-                                
-                                # EXPERT FIX: Use R_true directly from shard (NO LS, NO snapshot math!)
-                                R_true_ri = R_in_batch[0].detach().cpu().numpy()  # [N, N, 2]
-                                R_true = R_true_ri[:, :, 0] + 1j * R_true_ri[:, :, 1]  # [N, N] complex
-                                
-                                # Trace-normalize R_true
-                                N = R_true.shape[0]
-                                trace_R = np.real(np.trace(R_true))
-                                if trace_R > 1e-8:
-                                    R_true = R_true * (N / trace_R)
-                                
-                                print(f"  [DEBUG Classical] R_true: tr={np.real(np.trace(R_true)):.1f}, ||R_true||_F={np.linalg.norm(R_true,'fro'):.1f}", flush=True)
-                                
-                                # MUSIC with near-field steering
-                                phi_music_true, theta_music_true = _classical_music_nearfield(
-                                    R_true, k_true, phi_gt, theta_gt, r_gt, cfg
-                                )
-                                
-                                print(f"  [DEBUG Classical] MUSIC found: phi={phi_music_true}, theta={theta_music_true}", flush=True)
-                                
-                                # Compute errors (simple nearest-neighbor for quick check)
-                                if len(phi_music_true) > 0 and len(phi_gt) > 0:
-                                    errs_phi = []
-                                    errs_theta = []
-                                    for j in range(len(phi_gt)):
-                                        dphi = np.abs(phi_music_true - phi_gt[j])
-                                        dtheta = np.abs(theta_music_true - theta_gt[j])
-                                        idx = np.argmin(dphi + dtheta)
-                                        errs_phi.append(dphi[idx])
-                                        errs_theta.append(dtheta[idx])
-                                    
-                                    med_phi_true = np.median(errs_phi)
-                                    med_theta_true = np.median(errs_theta)
-                                    print(f"  🎯 CLASSICAL MUSIC CEILING (R_true + NF steering, scene 0): φ={med_phi_true:.2f}°, θ={med_theta_true:.2f}°", flush=True)
-                                    if med_phi_true > 5.0:
-                                        print(f"     ⚠️  Classical MUSIC > 5° → check manifold/convention (should be ≪5° with R_true)!", flush=True)
-                                    else:
-                                        print(f"     ✅ Classical MUSIC < 5° → manifold/convention correct!", flush=True)
-                            except Exception as e:
-                                print(f"  ⚠️  Classical MUSIC check failed: {e}", flush=True)
                         
                         self._eigenspectrum_logged = True
 

@@ -112,7 +112,7 @@ def load_model(ckpt_dir=None, ckpt_name="best.pt", map_location="cpu", prefer_sw
         sd = ckpt
     else:
         raise ValueError(f"Unsupported checkpoint type: {type(ckpt)}")
-
+    
     # Try to get architecture from checkpoint first (if ckpt is a dict wrapper)
     arch = ckpt.get("arch") if isinstance(ckpt, dict) else None
     if arch is None:
@@ -609,7 +609,7 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
     # Optional R_samp for hybrid-aware K-head
     R_samp_t = None
     try:
-        # Prefer precomputed R_samp if available
+        # Prefer precomputed R_samp if available; otherwise attempt to build it from snapshots + H_full.
         if sample.get("R_samp") is not None:
             R_samp_raw = sample["R_samp"]
             if torch.is_tensor(R_samp_raw):
@@ -620,7 +620,6 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
             else:
                 R_samp_np = R_samp_raw.astype(np.complex64)
             R_samp_t = torch.from_numpy(R_samp_np).to(torch.complex64).unsqueeze(0).to(device)
-        # Otherwise try building from H_full (not H, which is per-snapshot effective channel)
         elif sample.get("H_full") is not None:
             from .angle_pipeline import build_sample_covariance_from_snapshots
             H_full_raw = sample["H_full"]

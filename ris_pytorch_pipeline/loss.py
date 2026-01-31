@@ -23,8 +23,12 @@ def _wrapped_huber_loss(pred, gt, delta=math.pi/720):  # delta = 0.25° in radia
 
 def _range_huber_loss(pred_r, gt_r, delta=0.2):
     """Huber loss on log-range for better scale handling"""
-    pred_r_pos = torch.clamp(pred_r, min=cfg.RANGE_R[0] * 0.9)
-    gt_r_pos = torch.clamp(gt_r, min=cfg.RANGE_R[0] * 0.9)
+    # Only clamp to a tiny epsilon for log() safety.
+    # Do NOT clamp to RANGE_R[0] (or ~0.9*RANGE_R[0]) because that can zero gradients early
+    # and stall the range head; it also makes permutation matching unstable.
+    eps_m = float(getattr(cfg, "RANGE_EPS_M", 1e-3))
+    pred_r_pos = torch.clamp(pred_r, min=eps_m)
+    gt_r_pos = torch.clamp(gt_r, min=eps_m)
     pr = torch.log(pred_r_pos)
     gr = torch.log(gt_r_pos)
     e = torch.abs(pr - gr)
@@ -70,8 +74,9 @@ def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *
             cphi = torch.where(dphi <= delta_ang, 0.5 * (dphi ** 2) / delta_ang, dphi - 0.5 * delta_ang)
             cth = torch.where(dth <= delta_ang, 0.5 * (dth ** 2) / delta_ang, dth - 0.5 * delta_ang)
 
-            rp_pos = torch.clamp(rp, min=float(cfg.RANGE_R[0]) * 0.9)
-            gt_pos = torch.clamp(gt_r, min=float(cfg.RANGE_R[0]) * 0.9)
+            eps_m = float(getattr(cfg, "RANGE_EPS_M", 1e-3))
+            rp_pos = torch.clamp(rp, min=eps_m)
+            gt_pos = torch.clamp(gt_r, min=eps_m)
             elog = (torch.log(rp_pos) - torch.log(gt_pos)).abs()
             cr = torch.where(elog <= delta_logr, 0.5 * (elog ** 2) / delta_logr, elog - 0.5 * delta_logr)
 
@@ -296,7 +301,7 @@ class UltimateHybridLoss(nn.Module):
         B, N = R_pred.shape[:2]
         device = R_pred.device
         dtype = R_pred.dtype
-
+        
         # ptr_gt may arrive as chunked [B, 3*Kmax]; convert to [B, Kmax, 3] for convenience.
         Kmax = int(getattr(cfg, "K_MAX", 5))
         if isinstance(ptr_gt, torch.Tensor) and ptr_gt.dim() == 2 and ptr_gt.shape[1] >= 3 * Kmax:
@@ -326,7 +331,7 @@ class UltimateHybridLoss(nn.Module):
         if bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)) and (not hasattr(self, "_subspace_align_internal_logged")):
             print(f"[SUBSPACE DEBUG] B={B}, N={N}, ptr_gt.shape={tuple(ptr_gt.shape)}", flush=True)
             self._subspace_align_internal_logged = True
-
+        
         total_loss = torch.tensor(0.0, device=device)
         valid_batches = 0
 
@@ -334,7 +339,7 @@ class UltimateHybridLoss(nn.Module):
             K = int(K_true[b].item())
             if K <= 0 or K >= N:
                 continue
-
+                
             # GT (radians/meters)
             phi_rad = ptr_gt[b, :K, 0].to(torch.float32)
             theta_rad = ptr_gt[b, :K, 1].to(torch.float32)
@@ -343,29 +348,29 @@ class UltimateHybridLoss(nn.Module):
             sin_phi = torch.sin(phi_rad)
             cos_theta = torch.cos(theta_rad)
             sin_theta = torch.sin(theta_rad)
-
+                    
             # phase = k0 * (planar - curvature) where planar=x*sinφ*cosθ + y*sinθ
             planar = (sin_phi * cos_theta).unsqueeze(1) * x.view(1, -1) + sin_theta.unsqueeze(1) * y.view(1, -1)  # [K,N]
             curvature = hv_sq / (2.0 * r_m.unsqueeze(1))  # [K,N]
             phase = k0 * (planar - curvature)  # [K,N]
             A_gt = (torch.exp(1j * phase) / math.sqrt(float(N))).to(dtype)  # [K,N] complex
             A_gt = A_gt.transpose(0, 1).contiguous()  # [N,K]
-
+                
             # Projector onto GT signal subspace
             G = A_gt.conj().transpose(-2, -1) @ A_gt  # [K,K]
             eye_k = torch.eye(K, dtype=dtype, device=device)
             G_reg = G + 1e-4 * eye_k
             P = A_gt @ torch.linalg.solve(G_reg, A_gt.conj().transpose(-2, -1))  # [N,N]
-
+                
             eye_N = torch.eye(N, dtype=dtype, device=device)
             P_perp = eye_N - P
-
+                
             R_b = R_pred[b]
             num = torch.linalg.norm(P_perp @ R_b @ P_perp, ord="fro") ** 2
             den = torch.linalg.norm(R_b, ord="fro") ** 2 + 1e-12
             total_loss = total_loss + (num / den).real
             valid_batches += 1
-
+                
         return (total_loss / valid_batches) if valid_batches > 0 else torch.tensor(0.0, device=device)
     
     def _peak_contrast_loss(self, R_pred, phi_gt, theta_gt, r_gt, K_true):
@@ -442,7 +447,7 @@ class UltimateHybridLoss(nn.Module):
         denom = (A.conj() * X).sum(dim=1).real  # [B,Q]
         denom = denom.clamp_min(1e-12)
         logP = (-torch.log(denom)).reshape(B * Kmax, G)  # larger is better
-
+                    
         # Target is center of the stencil grid
         center_idx = (stencil // 2) * stencil + (stencil // 2)
         target = torch.full((B * Kmax,), int(center_idx), device=device, dtype=torch.long)
