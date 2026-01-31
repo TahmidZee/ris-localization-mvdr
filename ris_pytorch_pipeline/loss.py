@@ -676,8 +676,15 @@ class UltimateHybridLoss(nn.Module):
         # NOTE: QR retraction removed (it was a frequent source of NaN gradients early in training).
         # We rely on the orthogonality penalty directly on A_angle instead.
 
-        # Use R_blend if available (training-inference alignment), otherwise construct R_hat from factors
-        if 'R_blend' in y_pred:
+        # STRUCTURAL FIX: Use R_pred directly if available (geometry-aware covariance)
+        # Priority: R_pred (structural) > R_blend (hybrid) > factors (legacy)
+        if 'R_pred' in y_pred:
+            # NEW: Structural covariance from geometry predictions
+            R_hat = y_pred['R_pred']  # [B, N, N] complex, already trace-normalized
+            if not hasattr(self, '_structural_R_logged'):
+                print(f"[LOSS] Using STRUCTURAL R_pred (geometry-aware covariance)", flush=True)
+                self._structural_R_logged = True
+        elif 'R_blend' in y_pred:
             R_hat = y_pred['R_blend']  # Use blended covariance for training-inference alignment
         else:
             # Fallback: construct R_hat from factors (for backward compatibility)

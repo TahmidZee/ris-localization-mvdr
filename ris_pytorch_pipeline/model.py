@@ -1,8 +1,118 @@
 
 import torch, torch.nn as nn, torch.nn.functional as F
 import numpy as np
+import math
 from .configs import cfg, mdl_cfg
 from .covariance_utils import trace_norm_torch, shrink_torch, build_effective_cov_torch
+
+
+# ==============================================================================
+# STRUCTURAL FIX: Build covariance from predicted geometry (not free factors)
+# ==============================================================================
+
+def build_steering_matrix_batch(phi, theta, r, cfg):
+    """
+    Build near-field steering matrix from predicted angles and ranges.
+    Uses UNIT-NORMALIZED steering vectors (no path loss baked in).
+    Power is handled separately by aux_power.
+    
+    Args:
+        phi:   [B, K] azimuth angles (radians)
+        theta: [B, K] elevation angles (radians)
+        r:     [B, K] ranges (meters)
+        cfg:   config with N, N_H, N_V, d_H, d_V, k0
+    
+    Returns:
+        A: [B, N, K] complex steering matrix (unit-normalized columns)
+    """
+    B, K = phi.shape
+    device = phi.device
+    dtype = phi.dtype
+    
+    # RIS element coordinates (centered UPA, meters)
+    N_H = int(getattr(cfg, "N_H", 16))
+    N_V = int(getattr(cfg, "N_V", 16))
+    N = N_H * N_V
+    d_H = float(getattr(cfg, "d_H", 0.043))
+    d_V = float(getattr(cfg, "d_V", d_H))
+    k0 = float(getattr(cfg, "k0", 2.0 * math.pi / 0.0857))
+    
+    h_idx = torch.arange(-(N_H - 1) // 2, (N_H + 1) // 2, device=device, dtype=dtype) * d_H
+    v_idx = torch.arange(-(N_V - 1) // 2, (N_V + 1) // 2, device=device, dtype=dtype) * d_V
+    x_grid, y_grid = torch.meshgrid(h_idx, v_idx, indexing="xy")
+    x = x_grid.reshape(-1)  # [N]
+    y = y_grid.reshape(-1)  # [N]
+    hv_sq = (x * x + y * y)  # [N]
+    
+    # Expand for broadcasting: [B, K, N]
+    x = x.view(1, 1, N).expand(B, K, -1)
+    y = y.view(1, 1, N).expand(B, K, -1)
+    hv_sq = hv_sq.view(1, 1, N).expand(B, K, -1)
+    
+    # Trig functions: [B, K, 1]
+    sin_phi = torch.sin(phi).unsqueeze(-1)
+    cos_theta = torch.cos(theta).unsqueeze(-1)
+    sin_theta = torch.sin(theta).unsqueeze(-1)
+    r_eff = torch.clamp(r, min=0.1).unsqueeze(-1)  # [B, K, 1]
+    
+    # Near-field phase: phase = k0 * (planar - curvature)
+    # Matches physics.nearfield_vec convention exactly
+    planar = x * sin_phi * cos_theta + y * sin_theta  # [B, K, N]
+    curvature = hv_sq / (2.0 * r_eff)  # [B, K, N]
+    phase = k0 * (planar - curvature)  # [B, K, N]
+    
+    # Unit-normalized steering vectors (no path loss!)
+    A = torch.exp(1j * phase.to(torch.float32)) / math.sqrt(float(N))  # [B, K, N]
+    A = A.permute(0, 2, 1).contiguous()  # [B, N, K]
+    
+    return A.to(torch.complex64)
+
+
+def build_structured_R(phi, theta, r, power, cfg, sigma2=1e-3):
+    """
+    STRUCTURAL FIX: Construct covariance from geometry predictions.
+    
+    R_pred = sum_k power_k * a_k @ a_k^H + sigma2 * I
+    
+    This ensures:
+    - R is low-rank by construction (rank = K)
+    - Eigenvectors are steering vectors (correct subspace guaranteed)
+    - Only geometry + power need to be learned (not 5120 free params)
+    
+    Args:
+        phi:   [B, K] azimuth angles (radians)
+        theta: [B, K] elevation angles (radians)  
+        r:     [B, K] ranges (meters)
+        power: [B, K] per-source power (effective received power, positive)
+        cfg:   config object
+        sigma2: noise floor (small positive value for numerical stability)
+    
+    Returns:
+        R_pred: [B, N, N] complex Hermitian PSD covariance matrix
+    """
+    B, K = phi.shape
+    N = cfg.N
+    device = phi.device
+    
+    # Build steering matrix: [B, N, K]
+    A = build_steering_matrix_batch(phi, theta, r, cfg)
+    
+    # Weight by sqrt(power) so that A_weighted @ A_weighted^H = sum_k power_k * a_k @ a_k^H
+    power_sqrt = torch.sqrt(power.clamp(min=1e-8)).unsqueeze(1)  # [B, 1, K]
+    A_weighted = A * power_sqrt  # [B, N, K]
+    
+    # R = A @ diag(power) @ A^H = A_weighted @ A_weighted^H
+    R_pred = torch.bmm(A_weighted, A_weighted.conj().transpose(-2, -1))  # [B, N, N]
+    
+    # Add noise floor for numerical stability and invertibility
+    eye = torch.eye(N, device=device, dtype=R_pred.dtype).unsqueeze(0)  # [1, N, N]
+    R_pred = R_pred + sigma2 * eye
+    
+    # Trace-normalize to N (consistent with training data)
+    tr = torch.diagonal(R_pred, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)  # [B]
+    R_pred = R_pred * (N / tr).view(-1, 1, 1)
+    
+    return R_pred
 
 class AntiDiagPool(nn.Module):
     """
@@ -207,8 +317,17 @@ class HybridModel(nn.Module):
         self.heads_ln = nn.LayerNorm(D)
 
         # --- covariance factors (angle & range) ---
-        self.cov_fact_angle = nn.Linear(D, cfg.N * cfg.K_MAX * 2)   # real+imag
-        self.cov_fact_range = nn.Linear(D, cfg.N * cfg.K_MAX * 2)   # real+imag
+        # NOTE: When USE_STRUCTURED_R=True, these are unused (R is built from aux predictions).
+        # We keep them for backward compatibility but can optionally skip them.
+        self.use_structured_R = getattr(mdl_cfg, 'USE_STRUCTURED_R', True)
+        if not self.use_structured_R:
+            self.cov_fact_angle = nn.Linear(D, cfg.N * cfg.K_MAX * 2)   # real+imag
+            self.cov_fact_range = nn.Linear(D, cfg.N * cfg.K_MAX * 2)   # real+imag
+        else:
+            # Dummy linear layers (not used, but kept for API compatibility)
+            # This saves 2.6M parameters!
+            self.cov_fact_angle = None
+            self.cov_fact_range = None
         
         # --- AntiDiagPool for enhanced covariance features ---
         self.use_antidiag = getattr(mdl_cfg, 'USE_ANTIDIAG_POOL', True)
@@ -247,6 +366,18 @@ class HybridModel(nn.Module):
         # --- auxiliary φ/θ/r (r via Softplus; loss uses log-range) ---
         self.aux_angles = nn.Linear(D, 2 * cfg.K_MAX)
         self.aux_range  = nn.Sequential(nn.Linear(D, cfg.K_MAX), nn.Softplus())
+        
+        # --- STRUCTURAL FIX: aux_power for per-source power prediction ---
+        # This replaces the free-form covariance factors with geometry-aware construction.
+        # Power represents "effective received power" (path loss + transmit power combined).
+        # Using Softplus to ensure positive power values.
+        if self.use_structured_R:
+            self.aux_power = nn.Sequential(
+                nn.Linear(D, cfg.K_MAX),
+                nn.Softplus(),  # Ensure positive
+            )
+        else:
+            self.aux_power = None
 
     def set_dropout(self, p):
         """Update dropout probability for annealing"""
@@ -411,14 +542,19 @@ class HybridModel(nn.Module):
 
         # --- factor heads (simplified - disable PSD parameterization for AMP compatibility) ---
         feats_cov = self.cov_ln(feats)
-        cf_ang = self.cov_fact_angle(feats_cov)                          # [B, N*K*2]
-        cf_rng = self.cov_fact_range(feats_cov)                          # [B, N*K*2]
+        if self.cov_fact_angle is not None and self.cov_fact_range is not None:
+            cf_ang = self.cov_fact_angle(feats_cov)                          # [B, N*K*2]
+            cf_rng = self.cov_fact_range(feats_cov)                          # [B, N*K*2]
+        else:
+            # Structural R mode: dummy factors (not used)
+            cf_ang = None
+            cf_rng = None
         
         # Note: PSD parameterization re-enabled in spectral branch under autocast(False)
         # The main factor heads use direct linear layers for speed, while K-head uses PSD covariance
         
         # --- AntiDiagPool features from learned covariance (if enabled) ---
-        if self.use_antidiag:
+        if self.use_antidiag and cf_ang is not None:
             # Build covariance from angle factors for anti-diagonal extraction
             def _vec2c(v):
                 v = v.float()
@@ -442,6 +578,18 @@ class HybridModel(nn.Module):
             # Extract anti-diagonal features and enhance main features
             antidiag_feat = self.antidiag_pool(R_whitened)  # [B, antidiag_dim]
             feats_enhanced = F.gelu(self.fusion_with_antidiag(torch.cat([feats, antidiag_feat], dim=1)))  # [B, D]
+        elif self.use_antidiag and self.use_structured_R:
+            # Structural R mode: build R from geometry for antidiag features
+            # (will be recomputed later, but we need it for enhanced features)
+            aux_angles_tmp = self.aux_angles(self.heads_ln(feats))  # [B, 2K]
+            aux_range_tmp = self.aux_range(self.heads_ln(feats))    # [B, K]
+            aux_power_tmp = self.aux_power(self.heads_ln(feats))    # [B, K]
+            aux_phi_tmp = aux_angles_tmp[:, :cfg.K_MAX]
+            aux_theta_tmp = aux_angles_tmp[:, cfg.K_MAX:]
+            R_learned = build_structured_R(aux_phi_tmp, aux_theta_tmp, aux_range_tmp, aux_power_tmp, cfg)
+            R_whitened = self._whiten_covariance(R_learned)
+            antidiag_feat = self.antidiag_pool(R_whitened)
+            feats_enhanced = F.gelu(self.fusion_with_antidiag(torch.cat([feats, antidiag_feat], dim=1)))
         else:
             feats_enhanced = feats  # Use original features when AntiDiagPool is disabled
 
@@ -483,13 +631,34 @@ class HybridModel(nn.Module):
         # NOTE: K-head removed - using MVDR peak detection instead (K-free localization)
         # The number of sources is determined by peak detection on MVDR spectrum
 
-        return {
-            "cov_fact_angle": cf_ang,
-            "cov_fact_range": cf_rng,
-            "phi_theta_r":    aux_ptr,
-            "phi_soft":       phi_soft,
-            "theta_soft":     theta_soft,
-        }
+        # --- STRUCTURAL FIX: Build R from aux predictions (not free factors) ---
+        if self.use_structured_R:
+            # Extract phi, theta, r from aux predictions
+            aux_phi = aux_angles[:, :cfg.K_MAX]           # [B, K] radians
+            aux_theta = aux_angles[:, cfg.K_MAX:]         # [B, K] radians
+            aux_r = aux_range                              # [B, K] meters (already positive from Softplus)
+            aux_power_out = self.aux_power(feats_final)    # [B, K] (positive from Softplus)
+            
+            # Build structured covariance: R = sum_k p_k * a_k @ a_k^H + sigma2 * I
+            R_pred = build_structured_R(aux_phi, aux_theta, aux_r, aux_power_out, cfg)
+            
+            # Return with R_pred (no legacy factors - saves 2.6M params)
+            return {
+                "R_pred": R_pred,          # Structured covariance [B, N, N] complex
+                "phi_theta_r":    aux_ptr,
+                "phi_soft":       phi_soft,
+                "theta_soft":     theta_soft,
+                "aux_power":      aux_power_out,  # Per-source power [B, K]
+            }
+        else:
+            # Legacy path: use free-form covariance factors
+            return {
+                "cov_fact_angle": cf_ang,
+                "cov_fact_range": cf_rng,
+                "phi_theta_r":    aux_ptr,
+                "phi_soft":       phi_soft,
+                "theta_soft":     theta_soft,
+            }
 
 
 # =============================================================================

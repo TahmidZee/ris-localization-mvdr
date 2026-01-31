@@ -510,6 +510,17 @@ class ModelConfig:
         # Saves 8.3M params (99% of H_proj)
         self.USE_CONV_HPROJ = True
         
+        # STRUCTURAL FIX: Build R from aux predictions instead of free factors
+        # This is the key fix for the covariance learning failure diagnosed on 2026-01-30.
+        # When True:
+        #   - R_pred = sum_k power_k * a(phi_k, theta_k, r_k) @ a^H + sigma2*I
+        #   - Eigenvectors are steering vectors by construction (subspace overlap ~100%)
+        #   - Only need to learn 20 params (geometry + power) instead of 5120 (free factors)
+        # When False:
+        #   - Legacy: R = A_angle @ A_angle^H + lambda * A_range @ A_range^H
+        #   - Disconnected from aux predictions, prone to subspace collapse
+        self.USE_STRUCTURED_R = True
+        
         # --- θ loss emphasis (C12) ---
         self.THETA_LOSS_SCALE = 1.5  # Multiply θ loss by this factor for better elevation
 
