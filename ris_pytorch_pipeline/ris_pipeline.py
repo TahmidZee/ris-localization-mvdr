@@ -440,7 +440,8 @@ def main():
             snr = snr.unsqueeze(0) if torch.is_tensor(snr) else torch.tensor([float(snr)], dtype=torch.float32)
             with torch.no_grad():
                 out = m(y=y.float(), H_full=H_full.float(), codes=C.float(), snr_db=snr)
-            ok = all(k in out for k in ("cov_fact_angle", "cov_fact_range", "phi_theta_r"))
+            # Structural-fix compatibility: model may output R_pred instead of covariance factors
+            ok = ("phi_theta_r" in out) and (("R_pred" in out) or (("cov_fact_angle" in out) and ("cov_fact_range" in out)))
             print("[DOCTOR] forward keys:", sorted(out.keys()), "ok=", ok, flush=True)
             if not ok:
                 raise RuntimeError("Missing expected outputs from model forward")

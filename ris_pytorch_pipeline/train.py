@@ -1108,59 +1108,49 @@ class Trainer:
                 
                 # CRITICAL FIX: Construct blended covariance for loss function
                 # This ensures eigengap loss operates on well-conditioned matrix
-                if (not self.train_refiner_only) and ('cov_fact_angle' in preds_fp32 and 'cov_fact_range' in preds_fp32):
-                    # Extract factors from network output
-                    A_angle = preds_fp32['cov_fact_angle']  # [B, N, K_MAX]
-                    A_range = preds_fp32['cov_fact_range']  # [B, N, K_MAX]
-                    
-                    # Define N for normalization
-                    N = cfg.N_H * cfg.N_V
-                    
-                    # Get batch size for assertions
-                    B = preds_fp32['cov_fact_angle'].size(0)
-                    
-                    # Hard assertions to catch future shape regressions fast:
-                    # Avoid hard-coding 12x12 (144). Production code should respect cfg.N.
-                    assert cfg.N_H * cfg.N_V == cfg.N, f"config mismatch: N_H*N_V={cfg.N_H*cfg.N_V} != cfg.N={cfg.N}"
-                    assert preds_fp32['cov_fact_angle'].numel() % (B * cfg.N) == 0
-                    assert preds_fp32['cov_fact_range'].numel() % (B * cfg.N) == 0
-                    
-                    # EXPERT FIX: Build R_pred robustly to prevent shape bugs
-                    def build_R_pred_from_factors(preds, cfg):
-                        B = preds['cov_fact_angle'].size(0)
-                        N = cfg.N_H * cfg.N_V
-                        K_MAX = cfg.K_MAX
+                if not self.train_refiner_only:
+                    # Priority: STRUCTURAL R_pred (geometry-aware) > legacy factors.
+                    R_pred = None
+                    if 'R_pred' in preds_fp32 and isinstance(preds_fp32['R_pred'], torch.Tensor):
+                        R_pred = preds_fp32['R_pred']
+                    elif ('cov_fact_angle' in preds_fp32) and ('cov_fact_range' in preds_fp32):
+                        # EXPERT FIX: Build R_pred robustly from factors to prevent shape bugs
+                        def build_R_pred_from_factors(preds, cfg):
+                            B = preds['cov_fact_angle'].size(0)
+                            N = cfg.N_H * cfg.N_V
+                            K_MAX = cfg.K_MAX
 
-                        # cov_fact_angle/range are [B, 2*N*K_MAX] with interleaved real/imag
-                        # Convert to complex [B, N, K_MAX]
-                        flat_ang = preds['cov_fact_angle'].contiguous().float()
-                        flat_rng = preds['cov_fact_range'].contiguous().float()
+                            flat_ang = preds['cov_fact_angle'].contiguous().float()
+                            flat_rng = preds['cov_fact_range'].contiguous().float()
 
-                        assert flat_ang.dim() == 2 and flat_ang.size(0) == B, "bad factor shape"
-                        assert flat_rng.dim() == 2 and flat_rng.size(0) == B, "bad factor shape"
-                        assert flat_ang.size(1) == 2 * N * K_MAX, f"expected {2*N*K_MAX}, got {flat_ang.size(1)}"
-                        assert flat_rng.size(1) == 2 * N * K_MAX, f"expected {2*N*K_MAX}, got {flat_rng.size(1)}"
+                            assert flat_ang.dim() == 2 and flat_ang.size(0) == B, "bad factor shape"
+                            assert flat_rng.dim() == 2 and flat_rng.size(0) == B, "bad factor shape"
+                            assert flat_ang.size(1) == 2 * N * K_MAX, f"expected {2*N*K_MAX}, got {flat_ang.size(1)}"
+                            assert flat_rng.size(1) == 2 * N * K_MAX, f"expected {2*N*K_MAX}, got {flat_rng.size(1)}"
 
-                        # Convert interleaved real/imag to complex: [B, 2*N*K] -> [B, N, K] complex
-                        def _vec2c_local(v):
-                            xr, xi = v[:, ::2], v[:, 1::2]  # [B, N*K] each
-                            return torch.complex(xr.view(B, N, K_MAX), xi.view(B, N, K_MAX))
+                            def _vec2c_local(v):
+                                xr, xi = v[:, ::2], v[:, 1::2]
+                                return torch.complex(xr.view(B, N, K_MAX), xi.view(B, N, K_MAX))
 
-                        A_ang = _vec2c_local(flat_ang)  # [B, N, K_MAX] complex
-                        A_rng = _vec2c_local(flat_rng)  # [B, N, K_MAX] complex
+                            A_ang = _vec2c_local(flat_ang)
+                            A_rng = _vec2c_local(flat_rng)
 
-                        # Build R_pred = A_ang @ A_ang^H + lam * A_rng @ A_rng^H
-                        lam_range = getattr(cfg, 'LAM_RANGE_FACTOR', 0.1)
-                        R_pred = (A_ang @ A_ang.conj().transpose(-2, -1)) + lam_range * (A_rng @ A_rng.conj().transpose(-2, -1))
-                        # Hermitize (should already be Hermitian, but for numerical stability)
-                        R_pred = 0.5 * (R_pred + R_pred.conj().transpose(-2, -1))
-                        return R_pred
+                            lam_range = getattr(cfg, 'LAM_RANGE_FACTOR', 0.1)
+                            R_pred = (A_ang @ A_ang.conj().transpose(-2, -1)) + lam_range * (A_rng @ A_rng.conj().transpose(-2, -1))
+                            R_pred = 0.5 * (R_pred + R_pred.conj().transpose(-2, -1))
+                            return R_pred
 
-                    R_pred = build_R_pred_from_factors(preds_fp32, cfg)
+                        R_pred = build_R_pred_from_factors(preds_fp32, cfg)
+                    else:
+                        R_pred = None
+
+                    if R_pred is not None:
+                        # Quick sanity before blending:
+                        Bn, Nn = R_pred.shape[:2]
+                        assert R_pred.shape == (Bn, Nn, Nn), f"R_pred bad shape: {R_pred.shape}"
                     
                     # Quick sanity before blending:
-                    B, N = R_pred.shape[:2]
-                    assert R_pred.shape == (B, N, N), f"R_pred bad shape: {R_pred.shape}"
+                        B, N = R_pred.shape[:2]
                     
                     # CRITICAL FIX: Don't normalize R_pred to N (it's rank-deficient)
                     # Only normalize the final R_blend to N after blending
@@ -1169,8 +1159,8 @@ class Trainer:
                     # This must match the inference pipeline exactly
                     # OPTIMIZED: Use more efficient computation to avoid hanging
                     # Prefer offline precomputed R_samp; avoid online LS in hot path
-                    B, N = R_pred.shape[:2]
-                    if R_samp is not None:
+                        B, N = R_pred.shape[:2]
+                        if R_samp is not None:
                         R_samp_c = _ri_to_c(R_samp.to(torch.float32))
                         # Beta schedule
                         if hasattr(self, 'beta_warmup_epochs') and self.beta_warmup_epochs is not None and epoch <= self.beta_warmup_epochs:
@@ -1206,22 +1196,20 @@ class Trainer:
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
                             print(f"[TIMING] build_effective_cov_torch: done in {time.perf_counter()-t0:.3f}s", flush=True)
-                        preds_fp32['R_blend'] = R_blend
-                    else:
-                        # No offline R_samp available → use pure R_pred
-                        if epoch == 1 and bi == 0 and getattr(cfg, "HYBRID_COV_BLEND", True) and getattr(cfg, "HYBRID_COV_BETA", 0.0) > 0.0:
-                            print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
-                        # IMPORTANT: Even without R_samp, keep the covariance scale sane.
-                        # Do NOT apply shrink/diag-load here (loss applies those consistently via build_effective_cov_torch).
-                        preds_fp32['R_blend'] = build_effective_cov_torch(
-                            R_pred,
-                            snr_db=None,
-                            R_samp=None,
-                            beta=None,
-                            diag_load=False,
-                            apply_shrink=False,
-                            target_trace=float(N),
-                        )
+                            preds_fp32['R_blend'] = R_blend
+                        else:
+                            # No offline R_samp available → use pure R_pred
+                            if epoch == 1 and bi == 0 and getattr(cfg, "HYBRID_COV_BLEND", True) and getattr(cfg, "HYBRID_COV_BETA", 0.0) > 0.0:
+                                print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
+                            preds_fp32['R_blend'] = build_effective_cov_torch(
+                                R_pred,
+                                snr_db=None,
+                                R_samp=None,
+                                beta=None,
+                                diag_load=False,
+                                apply_shrink=False,
+                                target_trace=float(N),
+                            )
         
             # Compute loss in FP32
             import os, time
@@ -1248,12 +1236,16 @@ class Trainer:
                 
                 # Unit-test the gradient path from R_blend to any head parameter
                 try:
-                    any_head = next(p for n,p in self.model.named_parameters() if "cov_fact_angle" in n and p.requires_grad)
+                    # Structural R mode: gradients flow through aux heads (aux_angles/aux_range/aux_power)
+                    any_head = next(
+                        p for n, p in self.model.named_parameters()
+                        if (("aux_angles" in n) or ("aux_range" in n) or ("aux_power" in n)) and p.requires_grad
+                    )
                     s = preds_fp32['R_blend'].real.mean()  # cheap scalar depending on R_pred
                     g = torch.autograd.grad(s, any_head, retain_graph=True, allow_unused=True)[0]
-                    print(f"[GRADPATH] d<R_blend>/d(cov_fact_angle) = {0.0 if g is None else g.norm().item():.3e}", flush=True)
+                    print(f"[GRADPATH] d<R_blend>/d(aux_head) = {0.0 if g is None else g.norm().item():.3e}", flush=True)
                 except StopIteration:
-                    print(f"[GRADPATH] No cov_fact_angle parameter found!", flush=True)
+                    print(f"[GRADPATH] No aux_head parameter found!", flush=True)
             
             # DEBUG: Check if loss itself is NaN (first batch only)
             if epoch == 1 and bi == 0:

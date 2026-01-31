@@ -242,13 +242,19 @@ def main():
         with torch.no_grad():
             out = model(y, H_full, codes, snr_db=snr_db)
         
-        # Build R_pred from factors
-        A_angle = _vec2c(out["cov_fact_angle"]).to(device)
-        A_range = _vec2c(out["cov_fact_range"]).to(device)
-        lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
-        
-        R_pred = A_angle @ A_angle.conj().transpose(-2, -1) + lam_range * (A_range @ A_range.conj().transpose(-2, -1))
-        R_pred = 0.5 * (R_pred + R_pred.conj().transpose(-2, -1))
+        # Build R_pred
+        if "R_pred" in out:
+            # Structural mode
+            R_pred = out["R_pred"].to(device)
+            if R_pred.dim() == 4 and R_pred.shape[-1] == 2:
+                R_pred = to_complex(R_pred)
+        else:
+            # Legacy mode: build from factors
+            A_angle = _vec2c(out["cov_fact_angle"]).to(device)
+            A_range = _vec2c(out["cov_fact_range"]).to(device)
+            lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+            R_pred = A_angle @ A_angle.conj().transpose(-2, -1) + lam_range * (A_range @ A_range.conj().transpose(-2, -1))
+            R_pred = 0.5 * (R_pred + R_pred.conj().transpose(-2, -1))
         
         # Normalize
         tr_pred = torch.diagonal(R_pred, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)

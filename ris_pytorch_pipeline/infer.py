@@ -318,7 +318,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     with torch.no_grad():
         pred = model(y=_to_ri_t(y_t), H_full=_to_ri_t(H_full_t), codes=_to_ri_t(C_t), snr_db=snr_db, R_samp=None)
 
-    # --- build R_pred from factors (match loss.py fallback) ---
+    # --- get R_pred (STRUCTURAL) or build from factors (legacy) ---
     def _vec2c_flat(v_flat: np.ndarray) -> np.ndarray:
         v_flat = v_flat.astype(np.float32)
         xr, xi = v_flat[::2], v_flat[1::2]
@@ -336,10 +336,21 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             A = (A / col).astype(np.complex64)
         return A
 
-    A_ang = _vec2c_flat(_to_numpy(pred["cov_fact_angle"][0]))
-    A_rng = _vec2c_flat(_to_numpy(pred["cov_fact_range"][0]))
-    lam_range_factor = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
-    R_pred = (A_ang @ A_ang.conj().T) + lam_range_factor * (A_rng @ A_rng.conj().T)
+    if "R_pred" in pred:
+        # NEW: Structural covariance from geometry predictions
+        R_pred = _to_numpy(pred["R_pred"][0])
+        if torch.is_tensor(R_pred):
+            R_pred = R_pred.detach().cpu().numpy()
+        if not np.iscomplexobj(R_pred):
+            # shouldn't happen; keep robust
+            R_pred = R_pred.astype(np.complex64)
+        A_ang, A_rng, lam_range_factor = None, None, None
+    else:
+        # Legacy: build from factors
+        A_ang = _vec2c_flat(_to_numpy(pred["cov_fact_angle"][0]))
+        A_rng = _vec2c_flat(_to_numpy(pred["cov_fact_range"][0]))
+        lam_range_factor = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+        R_pred = (A_ang @ A_ang.conj().T) + lam_range_factor * (A_rng @ A_rng.conj().T)
 
     # --- optional R_samp (hybrid blending) ---
     R_samp = None
@@ -371,6 +382,9 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     use_refiner_cfg = bool(getattr(cfg, "USE_SPECTRUM_REFINER_IN_INFER", True))
     has_refiner = hasattr(model, "_spectrum_refiner") and (getattr(model, "_spectrum_refiner", None) is not None)
     allow_fallback = bool(getattr(cfg, "REFINER_GUARD_FALLBACK_TO_MVDR", True))
+    # Structural mode: refiner path currently relies on low-rank factors; force MVDR fallback.
+    if (A_ang is None) or (A_rng is None):
+        use_refiner_cfg = False
 
     # Helper: raw MVDR fallback path (K-free, uses robust thresholding).
     def _mvdr_fallback():
@@ -444,6 +458,9 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
         r_planes = getattr(cfg, "REFINER_R_PLANES", None) or est.default_r_planes_mvdr
 
         # Build low-rank factors F = [A_ang, sqrt(lam)*A_rng]
+        if (A_ang is None) or (A_rng is None):
+            # Should not reach here because we force use_refiner_cfg=False above.
+            return _mvdr_fallback()
         F_b = np.concatenate([A_ang, np.sqrt(lam_range_factor) * A_rng], axis=1).astype(np.complex64)
         F_t = torch.as_tensor(F_b, device=est.device, dtype=torch.complex64)
 
@@ -629,10 +646,12 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
     else:
         # Fallback to MDL on R_blend/sample covariance
         try:
-            if 'R_blend' in pred:
+            if 'R_pred' in pred:
+                R_est = pred['R_pred'][0].detach().cpu().numpy()
+            elif 'R_blend' in pred:
                 R_est = pred['R_blend'][0].detach().cpu().numpy()
             else:
-                # Build from factors
+                # Legacy: Build from factors
                 cf_ang = pred["cov_fact_angle"][0].detach().cpu().numpy()
                 cf_cplx = (cf_ang[::2] + 1j*cf_ang[1::2]).reshape(cfg.N, cfg.K_MAX)
                 R_est = cf_cplx @ cf_cplx.conj().T
@@ -644,29 +663,58 @@ def hybrid_estimate_raw(model, sample, force_K=None, prefer_logits=True, angle_s
 
     KMAX = int(cfg.K_MAX)
     
-    # SOTA FIX: Always use unified angle pipeline (ignore angle_source)
-    # This ensures train==eval==infer consistency
+    # Structural mode: use MVDR detection directly from R_pred.
+    if 'R_pred' in pred:
+        from .covariance_utils import build_effective_cov_np
+        from .music_gpu import mvdr_detect_sources, get_gpu_estimator
+        R_pred_np = pred['R_pred'][0].detach().cpu().numpy()
+        snr_db = float(sample.get("snr_db", sample.get("snr", 10.0)))
+        R_eff = build_effective_cov_np(
+            R_pred_np,
+            R_samp=None,
+            beta=0.0,
+            diag_load=True,
+            apply_shrink=True,
+            snr_db=snr_db,
+            target_trace=float(cfg.N),
+        )
+        est = get_gpu_estimator(cfg, device=("cuda" if torch.cuda.is_available() else "cpu"))
+        sources, _ = mvdr_detect_sources(
+            R_eff, cfg,
+            device=("cuda" if torch.cuda.is_available() else "cpu"),
+            grid_phi=int(getattr(cfg, "MVDR_GRID_PHI", 361)),
+            grid_theta=int(getattr(cfg, "MVDR_GRID_THETA", 181)),
+            r_planes=getattr(cfg, "REFINER_R_PLANES", None) or est.default_r_planes_mvdr,
+            delta_scale=float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2)),
+            threshold_db=float(getattr(cfg, "MVDR_THRESH_DB", 12.0)),
+            threshold_mode=str(getattr(cfg, "MVDR_THRESH_MODE", "mad")),
+            cfar_z=float(getattr(cfg, "MVDR_CFAR_Z", 5.0)),
+            max_sources=int(force_K) if force_K is not None else int(cfg.K_MAX),
+            force_k=(int(force_K) if force_K is not None else None),
+            do_refinement=bool(getattr(cfg, "MVDR_DO_REFINEMENT", True)),
+        )
+        if len(sources) == 0:
+            return [], [], []
+        phi = [float(np.deg2rad(s[0])) for s in sources[:K_hat]]
+        th = [float(np.deg2rad(s[1])) for s in sources[:K_hat]]
+        rr = [float(s[2]) for s in sources[:K_hat]]
+        return phi, th, rr
+
+    # Legacy mode: use factors + angle pipeline (kept for backward compatibility)
     from .angle_pipeline import angle_pipeline
-    
-    # Get covariance factor
-    cf_ang = pred["cov_fact_angle"][0].detach().cpu().numpy()  # [N*2, K_MAX] real
-    cf_cplx = (cf_ang[::2] + 1j*cf_ang[1::2]).reshape(cfg.N, cfg.K_MAX)  # [N, K_MAX] complex
-    
-    # Run unified angle pipeline
+    cf_ang = pred["cov_fact_angle"][0].detach().cpu().numpy()
+    cf_cplx = (cf_ang[::2] + 1j * cf_ang[1::2]).reshape(cfg.N, cfg.K_MAX)
     phi_est, theta_est, _ = angle_pipeline(
         cf_cplx, K_hat, cfg,
         use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
         use_adaptive_shrink=True,
         use_parabolic=getattr(cfg, "MUSIC_PEAK_REFINE", True),
         use_newton=getattr(cfg, "USE_NEWTON_REFINE", True),
-        device="cpu"
+        device="cpu",
     )
-    
-    # Range from auxiliary head (still useful for range estimation)
     aux_ptr = pred["phi_theta_r"][0].detach().cpu().numpy()
-    r_all = aux_ptr[2*KMAX:3*KMAX]
+    r_all = aux_ptr[2 * KMAX:3 * KMAX]
     r_est = r_all[:K_hat]
-
     return list(map(float, phi_est)), list(map(float, theta_est)), list(map(float, r_est))
 
 
