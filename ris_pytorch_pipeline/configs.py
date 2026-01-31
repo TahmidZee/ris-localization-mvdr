@@ -413,11 +413,12 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                "lam_cov": 0.1,
-                "lam_subspace_align": 2.0,
-                "lam_aux": 1.0,
-                # Small peak-contrast for MVDR-usability (stable tau=0.5).
-                "lam_peak_contrast": 0.02,
+                "lam_cov": 0.5,              # INCREASED: Main NMSE objective
+                "lam_subspace_align": 2.0,   # Keep strong subspace alignment
+                "lam_aux": 0.5,              # REDUCED: Was dominating, causing aux-only learning
+                # CRITICAL FIX: Peak contrast directly optimizes MVDR peak quality!
+                # Was 0.02 (negligible) -> 1.0 (primary objective for MVDR-usability)
+                "lam_peak_contrast": 1.0,
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
             "refiner": {
@@ -500,6 +501,14 @@ class ModelConfig:
         
         # --- AntiDiagPool feature extraction ---
         self.USE_ANTIDIAG_POOL = True  # enable anti-diagonal pooling for covariance features
+        
+        # --- Model slimming options (reduce ~29M → ~12M params) ---
+        # Option A: Factored soft-argmax - separate φ/θ grids instead of joint 2D
+        # Saves 9.2M params (97% of logits_gg)
+        self.USE_FACTORED_SOFTARGMAX = True
+        # Option C: Conv-based H_proj instead of giant linear
+        # Saves 8.3M params (99% of H_proj)
+        self.USE_CONV_HPROJ = True
         
         # --- θ loss emphasis (C12) ---
         self.THETA_LOSS_SCALE = 1.5  # Multiply θ loss by this factor for better elevation

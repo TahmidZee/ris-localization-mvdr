@@ -168,7 +168,27 @@ class HybridModel(nn.Module):
         # --- H_full path (true BS→RIS channel [M, N]) ---
         # CRITICAL FIX: Use the FULL channel matrix, not the collapsed H_eff = H @ c.
         # This gives the network the actual sensing operator it needs to recover RIS-domain covariance.
-        self.H_proj    = nn.Linear(cfg.M * cfg.N * 2, D // 2)  # M*N (H_full stored as [M,N,2])
+        #
+        # SLIMMING (Option C): Use Conv2d stack instead of giant linear layer.
+        # Old: Linear(M*N*2 → D/2) = 8.4M params
+        # New: Conv2d stack + adaptive pool = ~0.1M params (saves 8.3M!)
+        self.use_conv_hproj = getattr(mdl_cfg, 'USE_CONV_HPROJ', True)
+        if self.use_conv_hproj:
+            # Treat H_full as [B, 2, M, N] image (real/imag as channels)
+            self.H_conv = nn.Sequential(
+                nn.Conv2d(2, 32, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),  # Downsample
+                nn.GELU(),
+                nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),  # Downsample more
+                nn.GELU(),
+                nn.AdaptiveAvgPool2d((4, 4)),  # Fixed output size
+            )
+            self.H_proj = nn.Linear(64 * 4 * 4, D // 2)  # 1K → D/2
+        else:
+            # Legacy: giant linear (8.4M params)
+            self.H_conv = None
+            self.H_proj = nn.Linear(cfg.M * cfg.N * 2, D // 2)
 
         # --- SNR embedding (lets the backbone adapt features to noise regime) ---
         # NOTE: This changes the model architecture and invalidates old checkpoints (expected).
@@ -206,8 +226,23 @@ class HybridModel(nn.Module):
         # Asymmetric FOV: φ ±60° (120° total), θ ±30° (60° total)
         phi_grid   = np.linspace(-cfg.ANGLE_RANGE_PHI, cfg.ANGLE_RANGE_PHI, G).astype('float32')     # ±60°
         theta_grid = np.linspace(-cfg.ANGLE_RANGE_THETA, cfg.ANGLE_RANGE_THETA, G).astype('float32') # ±30°
-        self.logits_gg   = nn.Linear(D, cfg.K_MAX * G * G)
+        
+        # SLIMMING (Option A): Factored soft-argmax - separate φ and θ grids
+        # Old: logits_gg = Linear(D → K*G*G) = 9.5M params
+        # New: phi_logits + theta_logits = Linear(D → K*G) × 2 = 0.3M params (saves 9.2M!)
+        self.use_factored_softargmax = getattr(mdl_cfg, 'USE_FACTORED_SOFTARGMAX', True)
+        if self.use_factored_softargmax:
+            self.phi_logits = nn.Linear(D, cfg.K_MAX * G)    # [B, K*G]
+            self.theta_logits = nn.Linear(D, cfg.K_MAX * G)  # [B, K*G]
+            self.logits_gg = None  # Not used
+        else:
+            # Legacy: joint 2D grid (9.5M params)
+            self.phi_logits = None
+            self.theta_logits = None
+            self.logits_gg = nn.Linear(D, cfg.K_MAX * G * G)
+        
         self.soft_argmax = SoftArgmax2D(phi_grid, theta_grid, tau=getattr(mdl_cfg, 'SOFTMAX_TAU', 0.15))
+        self._G = G  # Store for forward pass
 
         # --- auxiliary φ/θ/r (r via Softplus; loss uses log-range) ---
         self.aux_angles = nn.Linear(D, 2 * cfg.K_MAX)
@@ -250,6 +285,7 @@ class HybridModel(nn.Module):
                 getattr(self, "codes_conv_tok", None),
                 getattr(self, "joint_tok_proj", None),
                 getattr(self, "transformer", None),
+                getattr(self, "H_conv", None),  # Conv path for H_full (slimmed)
                 getattr(self, "H_proj", None),
                 getattr(self, "fusion", None),
                 getattr(self, "fusion_with_antidiag", None),
@@ -271,7 +307,9 @@ class HybridModel(nn.Module):
         # Aux heads
         aux_modules = [
             m for m in [
-                getattr(self, "logits_gg", None),
+                getattr(self, "logits_gg", None),      # Legacy joint grid
+                getattr(self, "phi_logits", None),     # Factored: φ grid
+                getattr(self, "theta_logits", None),   # Factored: θ grid
                 getattr(self, "aux_angles", None),
                 getattr(self, "aux_range", None),
             ] if m is not None
@@ -348,7 +386,15 @@ class HybridModel(nn.Module):
         # The full channel matrix [M, N] provides the actual sensing operator.
         B, Mh, Nh, Ch = H_full.shape
         assert (Mh, Nh, Ch) == (cfg.M, cfg.N, 2), f"Expected H_full[B,{cfg.M},{cfg.N},2], got {H_full.shape}"
-        H_feat = F.gelu(self.H_proj(H_full.reshape(B, -1)))               # [B, D/2]
+        
+        if self.use_conv_hproj and self.H_conv is not None:
+            # Conv path: treat as [B, 2, M, N] image
+            H_img = H_full.permute(0, 3, 1, 2).contiguous()  # [B, 2, M, N]
+            H_conv_out = self.H_conv(H_img)  # [B, 64, 4, 4]
+            H_feat = F.gelu(self.H_proj(H_conv_out.reshape(B, -1)))  # [B, D/2]
+        else:
+            # Legacy: flatten and project
+            H_feat = F.gelu(self.H_proj(H_full.reshape(B, -1)))  # [B, D/2]
 
         # --- fuse ---
         # Provide SNR to the backbone as a learnable conditioning feature.
@@ -402,14 +448,32 @@ class HybridModel(nn.Module):
         feats_final = self.heads_ln(feats_enhanced)
 
         # --- soft-argmax grid head (angles) with enhanced features ---
-        G = getattr(mdl_cfg, 'INFERENCE_GRID_SIZE_COARSE', 61)
-        logits = self.logits_gg(feats_final).view(B, cfg.K_MAX, G, G)      # [B, K, G, G]
-        phi_list, theta_list = [], []
-        for k in range(cfg.K_MAX):
-            phi_k, theta_k = self.soft_argmax(logits[:, k])
-            phi_list.append(phi_k); theta_list.append(theta_k)
-        phi_soft   = torch.stack(phi_list,   dim=1)                        # [B, K]
-        theta_soft = torch.stack(theta_list, dim=1)                        # [B, K]
+        G = self._G
+        
+        if self.use_factored_softargmax and self.phi_logits is not None:
+            # Factored: separate 1D softmax for φ and θ
+            phi_logits_raw = self.phi_logits(feats_final).view(B, cfg.K_MAX, G)    # [B, K, G]
+            theta_logits_raw = self.theta_logits(feats_final).view(B, cfg.K_MAX, G)  # [B, K, G]
+            
+            # Soft-argmax over 1D grids
+            phi_grid = self.soft_argmax.grid_phi  # [G]
+            theta_grid = self.soft_argmax.grid_theta  # [G]
+            tau = max(self.soft_argmax.tau, 1e-2)
+            
+            phi_weights = F.softmax(phi_logits_raw / tau, dim=-1)  # [B, K, G]
+            theta_weights = F.softmax(theta_logits_raw / tau, dim=-1)  # [B, K, G]
+            
+            phi_soft = (phi_weights * phi_grid.view(1, 1, G)).sum(-1)  # [B, K]
+            theta_soft = (theta_weights * theta_grid.view(1, 1, G)).sum(-1)  # [B, K]
+        else:
+            # Legacy: joint 2D grid
+            logits = self.logits_gg(feats_final).view(B, cfg.K_MAX, G, G)  # [B, K, G, G]
+            phi_list, theta_list = [], []
+            for k in range(cfg.K_MAX):
+                phi_k, theta_k = self.soft_argmax(logits[:, k])
+                phi_list.append(phi_k); theta_list.append(theta_k)
+            phi_soft = torch.stack(phi_list, dim=1)  # [B, K]
+            theta_soft = torch.stack(theta_list, dim=1)  # [B, K]
 
         # --- auxiliary ptr (angles + positive range) with enhanced features ---
         aux_angles = self.aux_angles(feats_final)                          # [B, 2K]
