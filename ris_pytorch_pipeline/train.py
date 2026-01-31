@@ -2678,10 +2678,102 @@ class Trainer:
         best_score = float("-inf") if val_primary == "surrogate" else float("inf")
         best_path = Path(cfg.CKPT_DIR) / "best.pt"
         last_path = Path(cfg.CKPT_DIR) / "last.pt"
+        # Full training-state checkpoint (for true resume)
+        train_state_path = Path(cfg.CKPT_DIR) / "train_state.pt"
         patience_counter = 0
 
-        print(f"[Training] Starting {epochs} epochs (train batches={len(tr_loader)}, val batches={len(va_loader)})...", flush=True)
-        for ep in range(epochs):
+        # ----------------------------
+        # Auto-resume (model + optimizer + scaler + EMA/SWA + bookkeeping)
+        # ----------------------------
+        start_ep = 0
+        auto_resume = bool(getattr(cfg, "AUTO_RESUME_TRAINING", True))
+        resume_weights_only = bool(getattr(cfg, "AUTO_RESUME_WEIGHTS_ONLY", True))
+        if auto_resume and train_state_path.exists():
+            try:
+                rs = torch.load(str(train_state_path), map_location="cpu", weights_only=False)
+                if isinstance(rs, dict) and ("model" in rs):
+                    # Restore model/refiner weights
+                    self.model.load_state_dict(rs.get("model", {}), strict=False)
+                    if self.train_refiner_only and (self.refiner is not None) and ("refiner" in rs):
+                        try:
+                            self.refiner.load_state_dict(rs.get("refiner", {}), strict=False)
+                        except Exception:
+                            pass
+
+                    # Restore optimizer + AMP scaler
+                    if "opt" in rs and rs["opt"] is not None:
+                        try:
+                            self.opt.load_state_dict(rs["opt"])
+                        except Exception as e:
+                            print(f"⚠️ Resume: failed to load optimizer state ({e}); continuing with fresh optimizer state.", flush=True)
+                    if hasattr(self, "scaler") and (self.scaler is not None) and ("scaler" in rs) and (rs["scaler"] is not None):
+                        try:
+                            self.scaler.load_state_dict(rs["scaler"])
+                        except Exception:
+                            pass
+
+                    # Restore EMA / SWA state (best-effort; safe to skip if mismatched)
+                    if bool(rs.get("use_ema", False)) and hasattr(self, "ema_shadow") and ("ema_shadow" in rs) and isinstance(rs["ema_shadow"], dict):
+                        try:
+                            # Keep only floating-point tensors
+                            self.ema_shadow = {k: v for k, v in rs["ema_shadow"].items() if hasattr(v, "dtype") and v.dtype.is_floating_point}
+                        except Exception:
+                            pass
+                    if bool(rs.get("use_swa", False)) and hasattr(self, "swa_model") and (self.swa_model is not None):
+                        try:
+                            self.swa_started = bool(rs.get("swa_started", False))
+                            swa_sd = rs.get("swa_model", None)
+                            if isinstance(swa_sd, dict):
+                                self.swa_model.load_state_dict(swa_sd, strict=False)
+                        except Exception:
+                            pass
+
+                    # Restore bookkeeping
+                    saved_ep = int(rs.get("epoch", -1))
+                    if saved_ep >= 0:
+                        start_ep = min(saved_ep + 1, int(epochs))
+                    best_val = float(rs.get("best_val", best_val))
+                    best_score = float(rs.get("best_score", best_score))
+                    patience_counter = int(rs.get("patience_counter", patience_counter))
+
+                    # Restore scheduler epoch counter (LambdaLR uses last_epoch as the step index)
+                    try:
+                        # If we already finished `saved_ep+1` epochs, next epoch is start_ep; scheduler should match that.
+                        self.sched.last_epoch = max(0, start_ep - 1)
+                    except Exception:
+                        pass
+
+                    print(f"🔁 Auto-resume: loaded train_state.pt at epoch={saved_ep+1} → starting from epoch={start_ep+1}", flush=True)
+                else:
+                    print(f"⚠️ Auto-resume: train_state.pt format unsupported; ignoring.", flush=True)
+            except Exception as e:
+                print(f"⚠️ Auto-resume: failed to load train_state.pt ({e}); ignoring.", flush=True)
+        elif (not train_state_path.exists()) and resume_weights_only and last_path.exists():
+            # Backward compatible fallback: weights-only resume
+            try:
+                sd = torch.load(str(last_path), map_location="cpu", weights_only=False)
+                if isinstance(sd, dict) and ("backbone" in sd or "refiner" in sd):
+                    bb = sd.get("backbone", sd.get("model", {}))
+                    self.model.load_state_dict(bb, strict=False)
+                    if self.train_refiner_only and (self.refiner is not None) and ("refiner" in sd):
+                        try:
+                            self.refiner.load_state_dict(sd.get("refiner", {}), strict=False)
+                        except Exception:
+                            pass
+                elif isinstance(sd, dict) and "model" in sd:
+                    self.model.load_state_dict(sd["model"], strict=False)
+                elif isinstance(sd, dict):
+                    self.model.load_state_dict(sd, strict=False)
+                print(f"🔁 Auto-resume (weights-only): loaded {last_path} (optimizer/scheduler state NOT resumed).", flush=True)
+            except Exception as e:
+                print(f"⚠️ Auto-resume (weights-only) failed: {e}", flush=True)
+
+        if start_ep >= int(epochs):
+            print(f"[Training] Nothing to do: start_ep={start_ep} >= epochs={epochs}.", flush=True)
+            return float(best_val) if val_primary != "surrogate" else float(best_score)
+
+        print(f"[Training] Starting {epochs} epochs at ep={start_ep+1} (train batches={len(tr_loader)}, val batches={len(va_loader)})...", flush=True)
+        for ep in range(start_ep, epochs):
             # 3-phase schedule (if enabled)
             if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', True):
                 phase = 0 if ep < max(1, epochs // 3) else (1 if ep < max(2, 2 * epochs // 3) else 2)
@@ -2865,6 +2957,32 @@ class Trainer:
                 torch.save({"backbone": self.model.state_dict(), "refiner": self.refiner.state_dict()}, last_path)
             else:
                 torch.save(self.model.state_dict(), last_path)
+
+            # Save full training-state for true resume
+            try:
+                train_state = {
+                    "epoch": int(ep),
+                    "epochs": int(epochs),
+                    "val_primary": str(val_primary),
+                    "best_val": float(best_val),
+                    "best_score": float(best_score),
+                    "patience_counter": int(patience_counter),
+                    "model": self.model.state_dict(),
+                    "opt": self.opt.state_dict() if hasattr(self, "opt") and (self.opt is not None) else None,
+                    "scaler": self.scaler.state_dict() if hasattr(self, "scaler") and (self.scaler is not None) else None,
+                    "use_ema": bool(getattr(self, "use_ema", False)),
+                    "ema_shadow": getattr(self, "ema_shadow", None),
+                    "use_swa": bool(getattr(self, "use_swa", False)),
+                    "swa_started": bool(getattr(self, "swa_started", False)),
+                    "swa_model": (self.swa_model.state_dict() if (hasattr(self, "swa_model") and self.swa_model is not None) else None),
+                    # Note: scheduler state is reconstructed from epoch index; we keep last_epoch for debugging.
+                    "sched_last_epoch": int(getattr(self.sched, "last_epoch", 0)) if (self.sched is not None) else 0,
+                }
+                if self.train_refiner_only and (self.refiner is not None):
+                    train_state["refiner"] = self.refiner.state_dict()
+                torch.save(train_state, train_state_path)
+            except Exception as e:
+                print(f"⚠️ Failed to save train_state.pt: {e}", flush=True)
 
             phase_str = f"phase={phase}" if phase >= 0 else "no-curriculum"
             print(

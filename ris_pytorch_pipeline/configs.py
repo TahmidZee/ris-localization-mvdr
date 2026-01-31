@@ -394,6 +394,15 @@ class SysConfig:
         self.FREEZE_AUX_IN_K_PHASE = False
         # Optional warm-start checkpoint path (weights-only). If empty, no warm-start is applied.
         self.INIT_CKPT = ""
+
+        # === Training resume ===
+        # If True, `train.py` will automatically resume from `cfg.CKPT_DIR/train_state.pt` when present.
+        # This restores model + optimizer + AMP scaler + EMA/SWA state + early-stop bookkeeping.
+        # Set False (or delete train_state.pt) to force a fresh run.
+        self.AUTO_RESUME_TRAINING = True
+        # Back-compat convenience: if no train_state.pt exists but last.pt exists, load weights-only.
+        # (Optimizer/scheduler state will NOT resume in this fallback.)
+        self.AUTO_RESUME_WEIGHTS_ONLY = True
         # Recommended loss weights per phase (used by Trainer when present)
         self.PHASE_LOSS = {
             # NOTE: K-head removed - using MVDR peak detection instead

@@ -158,16 +158,20 @@ We will select the **Indoor Office** model family (TR 38.901) and parameterize:
 
 Rather than storing `H[k]` for every tone (huge: `[F, M, N, 2]`), we store the **tap-domain representation**:
 
+**IMPORTANT IMPLEMENTATION NOTE**: Do **not** store Python dicts inside `.npz` (it forces pickling and is slow/brittle).
+Instead store fixed-shape arrays + a mask:
+
 ```
-H_taps = {
-    "n_paths": int,                    # number of multipath components
-    "alphas": [n_paths, 2],            # complex path gains (real, imag)
-    "taus": [n_paths],                 # path delays in seconds
-    "aod_az": [n_paths],               # AoD azimuth (BS side)
-    "aod_el": [n_paths],               # AoD elevation (BS side)
-    "aoa_az": [n_paths],               # AoA azimuth (RIS side)
-    "aoa_el": [n_paths],               # AoA elevation (RIS side)
-}
+# Stored inside NPZ (no pickling):
+P_MAX: int                         # e.g., 24 (clusters×rays cap)
+n_paths: int                       # <= P_MAX
+alphas: [P_MAX, 2]                 # complex gains (Re, Im), padded
+taus_s: [P_MAX]                    # delays (seconds), padded
+aod_az: [P_MAX]                    # BS-side azimuth (radians), padded
+aod_el: [P_MAX]                    # BS-side elevation (radians), padded
+aoa_az: [P_MAX]                    # RIS-side azimuth (radians), padded
+aoa_el: [P_MAX]                    # RIS-side elevation (radians), padded
+path_mask: [P_MAX] bool            # True for valid paths
 ```
 
 **On-the-fly H[k] computation** (in DataLoader or model forward):
@@ -187,23 +191,74 @@ For controlled ablation, we can assume \(H[k] \approx H\) across 50 MHz (frequen
 - This is not strictly realistic indoors, but can be used for a controlled ablation.
 - **Paper caveat**: If we use this, we must state it explicitly and treat it as an ablation, not the final "TR 38.901 wideband" result.
 
+### 5.4 CRITICAL consistency decision: what channel(s) get TR 38.901 multipath?
+
+Our current learning target \(R_{\text{true}}\in\mathbb{C}^{N\times N}\) is **low-rank** (built from a small number of sources via near-field steering vectors):
+\[
+R_{\text{true}} = \sum_{k=1}^{K} p_k \, a(\phi_k, \theta_k, r_k) \, a(\phi_k, \theta_k, r_k)^H
+\]
+This has rank \(\le K\) (typically \(\le 5\)).
+
+If we apply full TR 38.901 multipath on the **UE→RIS link** (source field), then the induced RIS covariance becomes a sum over **all multipath rays** (potentially 20+), making it **high-rank**. Our covariance head outputs:
+\[
+R_{\text{pred}} = A_{\angle} A_{\angle}^H + \lambda A_r A_r^H
+\]
+with \(A_{\angle}, A_r \in \mathbb{C}^{N \times K_{\max}}\), giving **rank \(\le 2 K_{\max} = 10\)**. This is a hard capacity limit—the model literally cannot represent a rank-20+ target.
+
+#### Why LOS-dominant UE→RIS is realistic (not a simplification)
+
+| Factor | TR 38.901 Indoor Office reality |
+|--------|--------------------------------|
+| **Range** | 2–10 m (our scenario) |
+| **LOS probability** | 60–90% at these distances |
+| **Rician K-factor (LOS)** | 7–13 dB, meaning LOS path dominates |
+
+Even "by the book," TR 38.901 says short-range indoor UE→RIS is **LOS-dominant**.
+
+#### Why LOS-dominant UE→RIS is necessary for our objective
+
+Our **localization goal** is to estimate **where the UE is**, not where every scatterer is. The RIS-domain covariance \(R_{\text{true}}\) encodes the **spatial signature of the sources**—the directions/ranges we want to localize.
+
+If we flood the UE→RIS link with 20 scattered paths, then \(R_{\text{true}}\) becomes a sum of 20+ steering outer products, most corresponding to **scatterer positions, not UE positions**. The model would be trying to recover a "scatterer covariance" instead of a "source covariance."
+
+#### Recommended approach (Option C1)
+
+| Channel | Model | Rationale |
+|---------|-------|-----------|
+| **BS→RIS** (sensing operator \(H[k]\)) | TR 38.901 multipath (full realism) | This is the "observation model"—realism here is good and doesn't change the learning target |
+| **UE→RIS** (source field \(x\)) | LOS-dominant (Rician K ≥ 7 dB, or pure LOS for ablation) | This defines \(R_{\text{true}}\); keeping it low-rank matches our architecture and the localization goal |
+
+#### Alternative (Option C2, future extension)
+
+Apply TR 38.901 multipath to UE→RIS too, but then we must change the model target (e.g., predict a higher-rank covariance, or predict per-source parameters + a small multipath expansion). This is a research extension, not required for a strong paper.
+
+#### Paper sentence (ready to use)
+
+> "We model the UE–RIS link as LOS-dominant (Rician with K ≥ 7 dB), consistent with TR 38.901 Indoor Office at 2–10 m range, and aligned with our localization objective of estimating UE position rather than scatterer positions. The BS–RIS sensing channel is generated with full TR 38.901 clustered multipath to capture realistic frequency selectivity."
+
+We will explicitly state which option is used in results.
+
 ---
 
 ## 6) Measurement equation (OFDM pilot observation model)
 
-For each RIS configuration \(\ell\) and pilot tone \(k\):
+We model an uplink pilot burst where the RIS changes its phase profile once per pilot symbol.
+For each RIS configuration \(\ell\) (pilot symbol index) and pilot tone \(k\):
 
 1) RIS applies phase code \(c_\ell \in \mathbb{C}^{N}\) (unit-modulus with quantization if modeled).
-2) Effective per-tone sensing matrix:
+2) Per-tone BS→RIS sensing matrix \(H_{\text{BS→RIS}}[k]\in\mathbb{C}^{M\times N}\) (frequency-selective via taps).
+3) Effective per-tone sensing matrix:
 \[
 G_{\ell,k} = H[k] \,\mathrm{diag}(c_\ell)
 \]
-3) BS measurement:
+4) BS measurement:
 \[
 y[\ell,k] = G_{\ell,k}\,x[\ell,k] + n[\ell,k]
 \]
 
-Where \(x[\ell,k]\) represents the RIS-element domain excitation induced by the sources for that tone (depends on source symbols, geometry, and possibly frequency).
+Where \(x[\ell,k]\in\mathbb{C}^{N}\) is the RIS-element-domain incident field induced by the sources at tone \(k\).
+In Phase A we can treat \(x[\ell,k]\) as “nuisance source symbols + geometry” and keep our target as the RIS-domain covariance \(R=\mathbb{E}[x x^H]\).
+In Phase B we will allow explicit frequency dependence (see §10.2).
 
 **Per-tone effective channel** (useful for model input):
 \[
@@ -247,14 +302,15 @@ We will not claim SOTA unless we match the information budget (aperture/transmis
 | `y` | `[L, M, 2]` | `[L, F, M, 2]` | F is new frequency axis |
 | `codes` | `[L, N, 2]` | `[L, N, 2]` | Unchanged |
 | `H_full` | `[M, N, 2]` | Deprecated | Use `H_taps` instead |
-| `H_taps` | N/A | dict (see §5.2) | Compact tap-domain |
+| `H_taps` | N/A | arrays + mask (see §5.2) | Compact tap-domain (no pickling) |
 | `R_true` | `[N, N, 2]` | `[N, N, 2]` | Unchanged |
 
 ### 9.2 How the model consumes wideband data (Phase A)
 
-**Option 1 (Recommended): Pool over F before transformer**
+**Option 1 (Recommended): Pool over F before transformer — but NOT with naive mean pooling**
 - Per snapshot ℓ: compute `y_pooled[ℓ] = pool_k(y[ℓ, k, :])` 
-- Pooling can be: mean, learned 1D conv, or attention over k
+- Pooling should be **learned** (1D conv / attention over k) so it can retain frequency-dependent phase-slope cues.
+- **Avoid** plain mean pooling over k of complex samples; it can cancel phase and throw away the wideband signal.
 - Transformer sees L tokens as before
 - Output: single covariance `R_pred ∈ ℂ^{N×N}`
 
@@ -274,7 +330,9 @@ Output: R_pred[N, N, 2]
 - Much more compute, but fully utilizes frequency information
 - Output: single covariance `R_pred ∈ ℂ^{N×N}`
 
-**Recommendation**: Start with Option 1 (pool over F). If performance is insufficient, try Option 2.
+**Recommendation**:
+- Phase A1: start with Option 1 using a small learned pooler (cheap and stable).
+- If Phase A stalls (no improvement vs narrowband), move to Option 2 (L×F tokens) or a hierarchical encoder (freq-encoder per ℓ, then time-encoder).
 
 ### 9.3 R_samp construction for wideband
 
@@ -294,12 +352,13 @@ where \(\hat{x}[\ell,k]\) is the pseudo-inverse recovery of the RIS-domain signa
 
 | Representation | Shape | When to use |
 |----------------|-------|-------------|
-| `H_eff` | `[L, M, 2]` | **Deprecated** — collapses information |
+| `H_eff` | `[L, M, 2]` (narrowband) / `[L, F, M, 2]` (wideband) | **Never sufficient alone** (collapses RIS dimension), but can be used as an **aux feature** alongside the full operator |
 | `H_full` | `[M, N, 2]` | Narrowband only (frequency-flat) |
 | `H_taps` | dict | Wideband (recommended) |
 | `H[k]` | `[F, M, N, 2]` | Computed on-the-fly from `H_taps` |
 
-**Key insight**: For wideband, the model needs access to per-tone channel information. Storing `H_taps` and computing `H[k]` on-the-fly is most efficient.
+**Key insight**: For wideband, the model must have access to the **full operator** \(H_{\text{BS→RIS}}[k]\) (directly or implicitly via `H_taps`) and the codes \(c_\ell\).
+`H_eff = H[k]c_\ell` can be appended as a convenience feature, but if you only feed `H_eff` you recreate the earlier identifiability bug.
 
 ---
 
@@ -322,7 +381,8 @@ where \(\hat{x}[\ell,k]\) is the pseudo-inverse recovery of the RIS-domain signa
 4. Update `train.py` and `infer.py` to handle new shapes
 5. Run R_samp vs R_true diagnostic under wideband
 
-**Paper claim**: "Wideband improves covariance estimation quality."
+**Paper claim** (Phase A): "Wideband provides additional measurement diversity (L×F snapshots), improving covariance recovery quality."
+We will **not** over-claim “delay-based ranging” in Phase A unless we explicitly preserve per-tone structure (via learned pooling or per-tone outputs).
 
 ### 10.2 Phase B: "True wideband beamforming"
 
@@ -340,6 +400,11 @@ P(\phi,\theta,r) = \sum_{k \in \mathcal{K}} w_k \, P_{\text{MVDR}}^{(k)}(\phi,\t
 1. Modify model to output per-tone factors (optional)
 2. Modify MVDR to loop over tones and combine spectra
 3. Use noncoherent combining (sum power spectra)
+
+**Key realism knobs to explicitly ignore/hold fixed in Phase B (state in paper)**:
+- CFO / common phase error across subcarriers (assume compensated)
+- sampling-time offset (assume corrected)
+- per-RF-chain phase offsets (assume calibrated or absorbed as static bias)
 
 **Paper claim**: "Wideband improves both estimation AND beamforming."
 
@@ -514,7 +579,11 @@ This isolates whether the bottleneck is **physics**, **classical estimation**, o
 > **RIS coding over pilot symbols.** We apply **\(L\)** RIS phase configurations across **\(L\)** pilot OFDM symbols within a coherence interval (TDD uplink pilots). For RIS configuration \(\ell\) and pilot tone \(k\), the BS collects frequency-domain measurements \(y[\ell,k,m]\) across antennas \(m=1..M\). We store measurements as \(y\in\mathbb{C}^{L\times F\times M}\), RIS codes as \(c\in\mathbb{C}^{L\times N}\), and use a tap-domain channel representation to compute per-tone sensing matrices \(G_{\ell,k}=H[k]\mathrm{diag}(c_\ell)\).
 
 ### 15.4 Channel model (TR 38.901 Indoor Office)
-> **Channel model.** The BS–RIS and RIS–UE channels are generated using a **3GPP TR 38.901 Indoor Office** clustered multipath model with realistic delay and angular spreads. To capture frequency selectivity over 50–100 MHz, we generate multipath taps and compute per-tone frequency responses via the standard phase rotation \(\exp(-j2\pi f_k \tau)\) (TR 38.901). A frequency-flat channel assumption, when used, is treated as an ablation and is explicitly labeled as such.
+> **Channel model.** The BS–RIS sensing channel is generated using a **3GPP TR 38.901 Indoor Office** clustered multipath model with realistic delay and angular spreads. To capture frequency selectivity over 50–100 MHz, we generate multipath taps and compute per-tone frequency responses via the standard phase rotation \(\exp(-j2\pi f_k \tau)\) (TR 38.901).
+>
+> We model the UE–RIS link as **LOS-dominant** (Rician with K ≥ 7 dB), consistent with TR 38.901 Indoor Office at 2–10 m range, and aligned with our localization objective of estimating UE position rather than scatterer positions. This ensures the RIS-domain spatial covariance \(R\) remains low-rank (≤ number of sources), matching our model architecture.
+>
+> A frequency-flat channel assumption, when used, is treated as an ablation and is explicitly labeled as such.
 
 ### 15.5 Model realism knobs (RIS non-idealities)
 > **RIS non-idealities.** To avoid idealized assumptions, we optionally include RIS phase quantization (e.g., 2–3 bits), reflection magnitude \(<1\), and static per-element phase offsets. These settings are reported alongside results.
@@ -541,8 +610,8 @@ This isolates whether the bottleneck is **physics**, **classical estimation**, o
 | File | Changes |
 |------|---------|
 | `configs.py` | Add CARRIER_HZ, F, BW_HZ, SCS_HZ; update M, N, WAVEL |
-| `pregen.py` | Generate `y[L,F,M,2]`, store `H_taps` dict |
-| `dataset.py` | Load `H_taps`, compute `H[k]` on-the-fly |
+| `pregen.py` | Generate `y[L,F,M,2]`, store tap arrays + mask (no dict/pickle) |
+| `dataset.py` | Load tap arrays + mask, compute `H[k]` on-the-fly |
 | `collate_fn.py` | Handle new `y` shape |
 | `model.py` | Add freq pooling layer, update input projection |
 | `train.py` | Pass new tensors to model |

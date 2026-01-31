@@ -151,11 +151,15 @@ cfg.PILOT_FREQS_OFFSET = np.linspace(-cfg.BW_HZ/2, cfg.BW_HZ/2, cfg.F)
   {
       "y": np.array([L, F, M, 2], dtype=float32),
       "codes": np.array([L, N, 2], dtype=float32),
-      "H_taps": {
-          "alphas": np.array([n_paths, 2], dtype=float32),
-          "taus": np.array([n_paths], dtype=float32),
-          # ... other tap parameters
-      },
+      # IMPORTANT: do NOT store dicts inside NPZ (pickling). Store fixed-shape arrays + mask:
+      "n_paths": int,
+      "alphas": np.array([P_MAX, 2], dtype=float32),
+      "taus_s": np.array([P_MAX], dtype=float32),
+      "aod_az": np.array([P_MAX], dtype=float32),
+      "aod_el": np.array([P_MAX], dtype=float32),
+      "aoa_az": np.array([P_MAX], dtype=float32),
+      "aoa_el": np.array([P_MAX], dtype=float32),
+      "path_mask": np.array([P_MAX], dtype=bool),
       "R_true": np.array([N, N, 2], dtype=float32),
       # ... other fields
   }
@@ -180,17 +184,15 @@ cfg.PILOT_FREQS_OFFSET = np.linspace(-cfg.BW_HZ/2, cfg.BW_HZ/2, cfg.F)
 ### Step A1.5: Update model.py - Add frequency pooling
 ```python
 # In HybridModel.__init__:
-self.freq_pool = nn.Sequential(
-    nn.Conv1d(cfg.F, cfg.F // 2, kernel_size=3, padding=1),
-    nn.GELU(),
-    nn.Conv1d(cfg.F // 2, 1, kernel_size=1),  # pool to single channel
-)
-# OR simpler: just use mean pooling
-# self.freq_pool = lambda x: x.mean(dim=2)  # [B, L, F, M, 2] -> [B, L, M, 2]
+# IMPORTANT: avoid naive mean pooling over frequency of complex samples (it can cancel phase and
+# destroy wideband cues). Prefer a small learned pooler:
+#
+# Option A (simple): treat real/imag as channels and apply a 1D conv over k to produce pooled features.
+# Option B (slightly heavier): attention over k.
 
 # In forward():
 # y: [B, L, F, M, 2]
-y_pooled = y.mean(dim=2)  # [B, L, M, 2] — simple mean pooling
+# y_pooled = learned_pool(y)  # [B, L, M, 2] or [B, L, D] depending on design
 # ... rest of processing unchanged
 ```
 
