@@ -582,10 +582,13 @@ class HybridModel(nn.Module):
             # Structural R mode: build R from geometry for antidiag features
             # (will be recomputed later, but we need it for enhanced features)
             aux_angles_tmp = self.aux_angles(self.heads_ln(feats))  # [B, 2K]
-            aux_range_tmp = self.aux_range(self.heads_ln(feats))    # [B, K]
+            aux_range_raw_tmp = self.aux_range(self.heads_ln(feats))  # [B, K]
             aux_power_tmp = self.aux_power(self.heads_ln(feats))    # [B, K]
-            aux_phi_tmp = aux_angles_tmp[:, :cfg.K_MAX]
-            aux_theta_tmp = aux_angles_tmp[:, cfg.K_MAX:]
+            # Apply same tanh/scale as main path
+            PHI_SCALE = 0.7; THETA_SCALE = 0.35; R_MIN = 1.0; R_SCALE = 3.0
+            aux_phi_tmp = torch.tanh(aux_angles_tmp[:, :cfg.K_MAX]) * PHI_SCALE
+            aux_theta_tmp = torch.tanh(aux_angles_tmp[:, cfg.K_MAX:]) * THETA_SCALE
+            aux_range_tmp = R_MIN + R_SCALE * aux_range_raw_tmp
             R_learned = build_structured_R(aux_phi_tmp, aux_theta_tmp, aux_range_tmp, aux_power_tmp, cfg)
             R_whitened = self._whiten_covariance(R_learned)
             antidiag_feat = self.antidiag_pool(R_whitened)
@@ -624,19 +627,38 @@ class HybridModel(nn.Module):
             theta_soft = torch.stack(theta_list, dim=1)  # [B, K]
 
         # --- auxiliary ptr (angles + positive range) with enhanced features ---
-        aux_angles = self.aux_angles(feats_final)                          # [B, 2K]
-        aux_range  = self.aux_range(feats_final)                           # [B, K]  (positive)
-        aux_ptr    = torch.cat([aux_angles, aux_range], dim=1)             # [B, 3K]
+        aux_angles_raw = self.aux_angles(feats_final)                      # [B, 2K] raw
+        
+        # CRITICAL: Scale angle outputs to expected range using tanh
+        # This prevents huge errors that saturate Huber loss and give constant gradients
+        # GT phi ≈ ±30° (0.52 rad), theta ≈ ±15° (0.26 rad)
+        aux_phi_raw = aux_angles_raw[:, :cfg.K_MAX]      # [B, K]
+        aux_theta_raw = aux_angles_raw[:, cfg.K_MAX:]    # [B, K]
+        
+        # Bound to expected ranges with some headroom
+        PHI_SCALE = 0.7    # ±40° in radians (allows ±0.7 rad)
+        THETA_SCALE = 0.35  # ±20° in radians (allows ±0.35 rad)
+        aux_phi = torch.tanh(aux_phi_raw) * PHI_SCALE      # [B, K] bounded
+        aux_theta = torch.tanh(aux_theta_raw) * THETA_SCALE  # [B, K] bounded
+        
+        # Recombine for aux_ptr (used by loss)
+        aux_angles = torch.cat([aux_phi, aux_theta], dim=1)  # [B, 2K]
+        aux_range_raw = self.aux_range(feats_final)           # [B, K] (positive from Softplus, ~0.5-1.5)
+        # Scale range to match GT: Softplus gives ~0.7 at zero input
+        # GT range is 1-5m, so we want predictions to start around 2-3m
+        # Use: 1.0 + 3.0 * normalized_value
+        R_MIN, R_SCALE = 1.0, 3.0
+        aux_range = R_MIN + R_SCALE * aux_range_raw           # [B, K] in ~1-5m range
+        aux_ptr    = torch.cat([aux_angles, aux_range], dim=1)  # [B, 3K]
 
         # NOTE: K-head removed - using MVDR peak detection instead (K-free localization)
         # The number of sources is determined by peak detection on MVDR spectrum
 
         # --- STRUCTURAL FIX: Build R from aux predictions (not free factors) ---
         if self.use_structured_R:
-            # Extract phi, theta, r from aux predictions
-            aux_phi = aux_angles[:, :cfg.K_MAX]           # [B, K] radians
-            aux_theta = aux_angles[:, cfg.K_MAX:]         # [B, K] radians
-            aux_r = aux_range                              # [B, K] meters (already positive from Softplus)
+            # aux_phi and aux_theta are already bounded from tanh above
+            # aux_range is already scaled to 1-5m range above
+            aux_r = aux_range                              # [B, K] meters (scaled)
             aux_power_out = self.aux_power(feats_final)    # [B, K] (positive from Softplus)
             
             # Build structured covariance: R = sum_k p_k * a_k @ a_k^H + sigma2 * I
