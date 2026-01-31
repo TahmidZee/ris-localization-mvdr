@@ -413,12 +413,15 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                "lam_cov": 0.5,              # INCREASED: Main NMSE objective
-                "lam_subspace_align": 2.0,   # Keep strong subspace alignment
-                "lam_aux": 0.5,              # REDUCED: Was dominating, causing aux-only learning
-                # CRITICAL FIX: Peak contrast directly optimizes MVDR peak quality!
-                # Was 0.02 (negligible) -> 1.0 (primary objective for MVDR-usability)
-                "lam_peak_contrast": 1.0,
+                # STRUCTURAL FIX (2026-01-30): With geometry-aware R, the loss priorities change:
+                # - lam_aux is now PRIMARY (geometry must be correct for R to be correct)
+                # - lam_cov is secondary (R follows from geometry by construction)
+                # - lam_subspace_align is REDUNDANT (subspace is steering vectors by construction)
+                # - lam_peak_contrast is REDUNDANT (peaks sharp if geometry is right)
+                "lam_cov": 0.3,              # Secondary: R follows from geometry
+                "lam_subspace_align": 0.0,   # DISABLED: redundant with structural R
+                "lam_aux": 1.5,              # PRIMARY: geometry must be accurate
+                "lam_peak_contrast": 0.0,    # DISABLED: redundant with structural R
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
             "refiner": {
