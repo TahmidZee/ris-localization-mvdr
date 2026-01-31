@@ -652,6 +652,41 @@ With the corrected loss:
 
 If aux RMSE remains flat after 3 epochs with this fix, the issue is in data/labels, not the training code.
 
+### 16.6 Additional Fix: Bounded Aux Outputs for Structural R (2026-01-31)
+
+**Problem**: After the range clamp fix, training with `USE_STRUCTURED_R=True` still showed flat aux RMSE.
+
+**Root Cause**: The structural model uses aux outputs (φ, θ, r) for TWO purposes:
+1. Direct aux_l2 loss (Huber)
+2. Building R_pred via `build_structured_R()` → cov_nmse loss
+
+At random init, unbounded aux outputs caused:
+- `phi_pred`: -94° to +68° (expected: ±30°)
+- `theta_pred`: -94° to +50° (expected: ±15°)
+- `r_pred`: 0.3-1.6m (expected: 1-5m)
+
+With such large errors, Huber loss was in its **linear zone** (constant gradient). Additionally, very wrong angles → wrong steering vectors → unstable/conflicting gradients from cov_nmse.
+
+**In the old free-form model** (before structural fix), this wasn't an issue because aux heads only fed into aux_l2, not into R_pred construction.
+
+**Fix Applied in `model.py`**:
+
+```python
+# Angle outputs: bound with tanh to expected range
+aux_phi = torch.tanh(aux_phi_raw) * 0.7      # ±40° (0.7 rad)
+aux_theta = torch.tanh(aux_theta_raw) * 0.35  # ±20° (0.35 rad)
+
+# Range outputs: offset + scale to expected range
+R_MIN, R_SCALE = 1.0, 3.0
+aux_range = R_MIN + R_SCALE * Softplus(raw)   # 1-5m range
+```
+
+**Additional fixes**:
+1. Added `aux_power`, `phi_logits`, `theta_logits` to `HEAD_KEYS` in `train.py` for 4× higher LR
+2. LR schedule: Start at 0.8× (was 0.5×), warmup in 1-2 epochs (was 3), floor at 0.2× (was 0.1×)
+
+**Result**: Outputs now start in reasonable ranges, errors are in Huber quadratic zone, gradients are proportional to error magnitude → faster learning.
+
 ---
 
 ## 17) Appendix: Quick Reference Tables

@@ -1,12 +1,49 @@
 # Wideband OFDM Implementation Checklist
-Date: 2026-01-31 (Updated with training fix)  
+Date: 2026-01-31 (Updated with structural R fixes)  
 Reference: `OFDM_TR38901_INDOOR_PLAN.md`
 
 This is a **step-by-step implementation checklist** for upgrading the pipeline from narrowband to wideband OFDM.
 
 ---
 
-## CRITICAL FIX APPLIED (2026-01-31)
+## CRITICAL FIX #2 APPLIED (2026-01-31): Bounded Aux Outputs for Structural R
+
+### Issue: Structural R Model Had Flat Aux RMSE Despite Gradients Flowing
+
+With `USE_STRUCTURED_R=True`, the aux heads (φ, θ, r) feed into `build_structured_R()` to construct R_pred. At random init, unbounded outputs caused:
+- `phi_pred`: -94° to +68° (expected: ±30°)
+- `theta_pred`: -94° to +50° (expected: ±15°)
+- `r_pred`: 0.3-1.6m (expected: 1-5m)
+
+**Problem**: With errors of 60-90°, Huber loss was in its **linear zone** (constant gradient). The model got the same gradient whether error was 10° or 90°—very slow learning!
+
+**Root Cause**: In the old free-form model, aux heads only fed into aux_l2 loss. In structural R mode, aux heads feed into BOTH aux_l2 AND steering vector construction. Very wrong angles → wrong steering vectors → unstable gradients from cov_nmse that fight against aux_l2 gradients.
+
+### Fix Applied in `model.py`:
+```python
+# Angle outputs: bound with tanh
+aux_phi = torch.tanh(aux_phi_raw) * 0.7      # ±40° (0.7 rad)
+aux_theta = torch.tanh(aux_theta_raw) * 0.35  # ±20° (0.35 rad)
+
+# Range outputs: offset + scale
+R_MIN, R_SCALE = 1.0, 3.0
+aux_range = R_MIN + R_SCALE * Softplus(raw)   # 1-5m range
+```
+
+### Additional Fixes:
+1. **HEAD_KEYS updated** in `train.py`: Added `aux_power`, `phi_logits`, `theta_logits` to head group for 4× higher LR
+2. **LR schedule**: Start at 0.8× (was 0.5×), warmup in 1-2 epochs (was 3), floor at 0.2× (was 0.1×)
+
+### Result After Fix:
+- `phi_pred`: ±26° at random init ✓
+- `theta_pred`: ±15° at random init ✓
+- `r_pred`: 2.5-4.5m at random init ✓
+
+Errors now in Huber **quadratic zone** → gradients proportional to error → faster learning.
+
+---
+
+## CRITICAL FIX #1 APPLIED (2026-01-31): Range Loss Clamp
 
 Before running any training, verify the range loss fix is in place:
 
