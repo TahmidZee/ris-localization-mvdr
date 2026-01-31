@@ -2588,19 +2588,19 @@ class Trainer:
 
 
         # scheduler (cosine with warmup for stability)
-        train_iters = len(tr_loader) if max_train_batches is None else min(len(tr_loader), max_train_batches)
-        total_steps = max(1, epochs * max(1, train_iters))
-        warmup_steps = min(10, total_steps // 50)  # Expert fix: Much shorter warmup for overfit tests
+        # NOTE: Scheduler is stepped once per EPOCH, so use epoch-based counting
+        total_epochs = max(1, epochs)
+        warmup_epochs = max(1, min(3, total_epochs // 10))  # 1-3 epochs warmup
         
-        # Create warmup + cosine scheduler
-        def lr_lambda(step):
-            if step < warmup_steps:
-                # Expert fix: Much higher floor for overfit tests (was 0.1, now 0.5)
-                return max(0.5, step / warmup_steps)
+        # Create warmup + cosine scheduler (epoch-based, NOT batch-based)
+        def lr_lambda(epoch_step):
+            if epoch_step < warmup_epochs:
+                # Linear warmup from 0.5 to 1.0 over warmup_epochs
+                return 0.5 + 0.5 * (epoch_step / max(1, warmup_epochs))
             else:
-                # Cosine annealing after warmup
-                progress = (step - warmup_steps) / (total_steps - warmup_steps)
-                return 0.5 * (1 + np.cos(np.pi * progress))
+                # Cosine annealing after warmup: 1.0 → 0.1 (don't decay to 0)
+                progress = (epoch_step - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+                return 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * progress))
         
         self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lr_lambda)
         # CRITICAL: Initialize scheduler step counter to avoid warning
