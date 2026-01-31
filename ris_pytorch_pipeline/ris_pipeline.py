@@ -522,10 +522,11 @@ def main():
             print(f"  ✅ ptr shape: {ptr_shape} (matches config)")
             
             # Check for R_samp (optional but logged)
-            if "R_samp" in it:
-                print(f"  ℹ️  R_samp present: shape={tuple(it['R_samp'].shape)}")
+            R_samp_data = it.get("R_samp", None)
+            if R_samp_data is not None and hasattr(R_samp_data, 'shape'):
+                print(f"  ℹ️  R_samp present: shape={tuple(R_samp_data.shape)}")
             else:
-                print("  ℹ️  R_samp not present (training will use pure R_pred)")
+                print("  ℹ️  R_samp not present or None (training will use pure R_pred)")
             
             # Validate GT values are in expected ranges
             ptr_np = it["ptr"].numpy() if torch.is_tensor(it["ptr"]) else it["ptr"]
