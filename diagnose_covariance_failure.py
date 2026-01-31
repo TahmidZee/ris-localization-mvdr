@@ -187,11 +187,15 @@ def main():
         else:
             # Compute R_true from steering vectors and GT positions
             # R_true = sum_k p_k * a(phi_k, theta_k, r_k) @ a^H
-            ptr = sample["ptr"]
+            ptr_raw = sample["ptr"]
+            if isinstance(ptr_raw, torch.Tensor):
+                ptr_np = ptr_raw.cpu().numpy()
+            else:
+                ptr_np = np.array(ptr_raw)
             K_true_val = int(sample["K"])
-            phi_gt = ptr[:cfg.K_MAX]
-            theta_gt = ptr[cfg.K_MAX:2*cfg.K_MAX]
-            r_gt = ptr[2*cfg.K_MAX:3*cfg.K_MAX]
+            phi_gt_np = ptr_np[:cfg.K_MAX].astype(np.float64)
+            theta_gt_np = ptr_np[cfg.K_MAX:2*cfg.K_MAX].astype(np.float64)
+            r_gt_np = ptr_np[2*cfg.K_MAX:3*cfg.K_MAX].astype(np.float64)
             
             # Build steering vectors
             N_H, N_V = cfg.N_H, cfg.N_V
@@ -207,10 +211,10 @@ def main():
             
             R_true_np = np.zeros((N, N), dtype=np.complex128)
             for k in range(K_true_val):
-                sin_phi = np.sin(phi_gt[k])
-                cos_theta = np.cos(theta_gt[k])
-                sin_theta = np.sin(theta_gt[k])
-                r_k = max(r_gt[k], 0.1)
+                sin_phi = np.sin(phi_gt_np[k])
+                cos_theta = np.cos(theta_gt_np[k])
+                sin_theta = np.sin(theta_gt_np[k])
+                r_k = max(float(r_gt_np[k]), 0.1)
                 
                 planar = x * sin_phi * cos_theta + y_coord * sin_theta
                 curvature = (x**2 + y_coord**2) / (2.0 * r_k)
