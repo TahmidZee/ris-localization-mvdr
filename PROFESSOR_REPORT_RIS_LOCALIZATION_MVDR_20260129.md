@@ -196,24 +196,75 @@ Interpretation (important):
 - \(R_{\text{samp}}\) contains useful information but its spectrum is often **cluttered**; forcing exactly K peaks (Oracle-K) can pick weak/spurious peaks.
 - This shows that in our current regime, “perfect covariance → perfect MVDR,” but “covariance estimated from limited measurements” is a major bottleneck.
 
-### 8.5 Current status
-We are running a short “reality check” training run (30 epochs) **with the corrected \(H_{\text{full}}\) input**. The goal is to determine whether the H_full fix alone changes learning dynamics and MVDR-end outcomes.
+### 8.5 Covariance failure diagnostic (decisive evidence of architectural flaw)
+We ran a detailed covariance diagnostic on a 10-epoch checkpoint (with \(H_{\text{full}}\) input) comparing \(R_{\text{pred}}\) to \(R_{\text{true}}\):
+
+| Metric | \(R_{\text{pred}}\) | \(R_{\text{true}}\) | Problem |
+|--------|---------------------|---------------------|---------|
+| NMSE | 1.32 | 0 | Very high — R_pred not matching R_true |
+| Top-K energy concentration | 77% | 100% | Too diffuse — energy leaks to noise eigenvectors |
+| Subspace overlap (top-K eigenvectors) | 29% | 100% | **Critical**: eigenvector directions are wrong |
+| MDL K estimation accuracy | 24% | 100% | Model-order estimation failing |
+| MVDR at GT location | 0.59 (higher baseline) | 0.33 (sharp peak) | Smooth spectrum, no sharp peaks |
+
+**Root cause identified**: The covariance head (`cov_fact_angle`, `cov_fact_range`) was predicting ~5,120 free parameters disconnected from the geometry predictions (aux heads). Even though aux heads were learning well (angles/range improving), the covariance factors were drifting to near-identity-like matrices that erase MVDR peaks.
+
+### 8.6 Current status: implementing structural fix
+We identified that **loss weight tuning alone has ~60% confidence** of fixing this, whereas a **structural fix has ~90% confidence**.
+
+The structural fix changes the architecture so that covariance is **constructed from geometry predictions** rather than predicted as free factors:
+
+\[
+R_{\text{pred}} = \sum_{k=1}^{K_{\max}} p_k \, a(\phi_k, \theta_k, r_k) \, a(\phi_k, \theta_k, r_k)^H + \sigma^2 I
+\]
+
+where \((\phi_k, \theta_k, r_k, p_k)\) are predicted by the network, and \(a(\cdot)\) is the near-field steering vector.
+
+**Why this solves the diagnosed issues:**
+| Audit finding | How structural fix solves it |
+|---------------|------------------------------|
+| Subspace overlap 29% | **By construction**: eigenvectors are steering vectors at predicted (φ,θ,r) |
+| Top-K energy 77% vs 100% | **Guaranteed**: R is rank-K by construction |
+| MDL accuracy 24% | **Follows automatically**: clean eigenvalue gap from low-rank structure |
+| Cov head disconnected from aux | **Eliminated**: R is built *from* aux predictions |
+
+This reduces the effective output dimensionality from \(O(N^2)\) free parameters to \(O(K)\) geometry parameters.
 
 ---
 
-## 9) Immediate next steps
-1. Finish the short 30-epoch run with the corrected \(H_{\text{full}}\) interface.
-2. Run Hybrid-only MVDR-end evaluation on the resulting checkpoint:
-   - `suite --bench B1 --limit 1000 --no-baselines`
-   - `suite --bench B2 --limit 1000 --no-baselines`
-3. Decision gate:
-   - If MVDR-end improves clearly relative to prior baselines, proceed to full training + SpectrumRefiner.
-   - If not, we should **pivot the formulation** rather than only tuning loss weights:
-     - either add measurement diversity (recommended): few-tone wideband (8–16 tones over 20–100 MHz) in an indoor sub-6 scenario
-     - or change the learning target: direct set prediction of \((\phi,\theta,r)\) rather than full covariance recovery
-4. Align simulator assumptions with a defensible deployment:
-   - For “2–10 m indoor localization,” a sub-6 carrier (e.g., 3.5 GHz) with larger aperture (e.g., RIS 16×16 and BS 32–64 antennas) is a coherent scenario.
-   - For “28 GHz near-field at 10 m,” the RIS must be much larger (tens of elements per side) to be physically consistent.
+## 9) Paper narrative (geometry-aware covariance prediction)
+
+> We propose a geometry-aware covariance prediction architecture where the neural network predicts source locations \((\phi_k, \theta_k, r_k)\) and powers \(p_k\), and the covariance is constructed analytically from near-field steering vectors. This design enforces the correct signal subspace structure by construction, ensuring MVDR compatibility without requiring explicit subspace alignment losses. The approach reduces the effective output dimensionality from \(O(N^2)\) to \(O(K)\), dramatically simplifying the learning problem while matching the physical forward model. By leveraging the known steering manifold, the network focuses on the well-posed geometry estimation task rather than the ill-posed high-dimensional covariance recovery problem.
+
+---
+
+## 10) Phased plan forward
+
+### Phase A: Structured R for LOS-dominant UE→RIS (current narrowband + future wideband)
+- Predict geometry \((\phi, \theta, r)\) + per-source power \(p\) from backbone
+- Construct \(R\) analytically using near-field steering vectors
+- Works for current narrowband M64/N256/L64 setup
+- Extends directly to wideband Phase A (OFDM with LOS-dominant UE→RIS)
+
+### Phase B: Controlled multipath extension (future wideband with TR 38.901)
+- If multipath on UE→RIS is needed, extend to multi-subpath per source:
+  - Predict \(P\) subpaths per source: \((\phi_{k,p}, \theta_{k,p}, r_{k,p}, p_{k,p})\)
+  - Rank increases from \(K\) to \(K \cdot P\), still structured and MVDR-compatible
+- Alternative: structured + residual hybrid for non-idealities
+
+---
+
+## 11) Immediate next steps
+1. **Implement the structural fix** (geometry-aware covariance construction):
+   - Add `aux_power_head` to predict per-source power/confidence
+   - Replace free-form covariance factors with `build_structured_R()` function
+   - Remove disconnected `cov_angle_head` and `cov_range_head`
+2. **Run 10-epoch validation** on current M64/N256/L64 shards
+3. **Run diagnostic** — expect subspace overlap > 0.8 immediately (by construction)
+4. **Run B1 benchmark** — expect F1 > 0, RMSPE approaching R_samp baseline (~0.4m)
+5. **Decision gate for wideband**:
+   - If narrowband works well → document results, move to OFDM Phase A
+   - If still struggling → analyze residual errors before adding wideband complexity
 
 ---
 
