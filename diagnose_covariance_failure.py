@@ -229,10 +229,14 @@ def main():
             R_true = torch.from_numpy(R_true_np).to(device).to(torch.complex64)
         
         K_true = int(sample["K"])
-        ptr = sample["ptr"]  # [3*K_MAX]: phi, theta, r
-        phi_gt = ptr[:cfg.K_MAX]
-        theta_gt = ptr[cfg.K_MAX:2*cfg.K_MAX]
-        r_gt = ptr[2*cfg.K_MAX:3*cfg.K_MAX]
+        ptr_raw2 = sample["ptr"]  # [3*K_MAX]: phi, theta, r
+        if isinstance(ptr_raw2, torch.Tensor):
+            ptr_np2 = ptr_raw2.cpu().numpy()
+        else:
+            ptr_np2 = np.array(ptr_raw2)
+        phi_gt = ptr_np2[:cfg.K_MAX].astype(np.float64)
+        theta_gt = ptr_np2[cfg.K_MAX:2*cfg.K_MAX].astype(np.float64)
+        r_gt = ptr_np2[2*cfg.K_MAX:3*cfg.K_MAX].astype(np.float64)
         
         # Forward pass
         with torch.no_grad():
