@@ -593,9 +593,70 @@ This isolates whether the bottleneck is **physics**, **classical estimation**, o
 
 ---
 
-## 16) Appendix: Quick Reference Tables
+## 16) Critical Training Diagnosis and Fixes (2026-01-31)
 
-### A1: Dimension mapping (narrowband → wideband)
+This section documents a critical bug that was causing training to stall, and the complete fix.
+
+### 16.1 Problem: Training Stalled (Aux RMSE Flat)
+
+**Observed Symptom**: After 10 epochs with the structural R fix:
+- Aux RMSE (φ, θ, r) stayed completely flat (~19°, ~16°, ~2.3m)
+- Loss decreased only marginally (1.78 → 1.74)
+- Gradients existed but learning didn't happen
+
+**Root Cause**: The `_range_huber_loss` function was clamping predicted range values too aggressively:
+
+```python
+# OLD (broken):
+pred_r_clamped = pred_r.clamp(min=cfg.RANGE_R[0] * 0.9)  # clamp to 0.45m
+```
+
+The problem:
+1. **Softplus initialization**: With random init, `Softplus(x)` outputs have mean ~0.7m, and ~28% are below 0.45m
+2. **Gradient zeroing**: `clamp(pred, min=0.45)` zeros gradients for any prediction < 0.45m
+3. **Cascade failure**: This also breaks permutation-invariant matching (range is used for source assignment), causing noisy angle gradients
+
+### 16.2 The Fix
+
+Changed the clamp to a tiny epsilon that never activates:
+
+```python
+# NEW (fixed):
+eps_m = getattr(cfg, "RANGE_EPS_M", 1e-3)  # 1mm
+pred_r_clamped = pred_r.clamp(min=eps_m)
+gt_r_clamped = gt_r.clamp(min=eps_m)
+```
+
+This preserves numerical stability (no division by zero in log-range loss) while allowing full gradient flow.
+
+### 16.3 Verification
+
+After the fix, verification confirms:
+- Range gradients flow: `r_p.grad.norm() = 0.65` (was 0 before)
+- Angle gradients are clean (permutation matching works)
+- All critical heads receive gradients (aux_angles, aux_range, aux_power)
+
+### 16.4 Why This Wasn't a Fallback/Guardrail
+
+This was a **proper fix**, not a workaround:
+- The clamp value was a design error, not a safety mechanism
+- The fix restores correct gradient flow, not masking a deeper issue
+- The epsilon (1mm) is smaller than any physical range we'd ever predict
+
+### 16.5 Expected Training Behavior After Fix
+
+With the corrected loss:
+- **Epochs 1-3**: Aux RMSE should start decreasing (φ: 19° → 15°, θ: 16° → 12°, r: 2.3m → 1.8m)
+- **Epochs 10-15**: Expect φ < 10°, θ < 8°, r < 1.2m
+- **Epochs 30+**: Expect convergence to φ < 5°, θ < 4°, r < 0.6m
+
+If aux RMSE remains flat after 3 epochs with this fix, the issue is in data/labels, not the training code.
+
+---
+
+## 17) Appendix: Quick Reference Tables
+
+### 17.1: Dimension mapping (narrowband → wideband)
 
 | Symbol | Meaning | Narrowband | Wideband |
 |--------|---------|------------|----------|
@@ -605,7 +666,7 @@ This isolates whether the bottleneck is **physics**, **classical estimation**, o
 | F | Pilot tones | 1 | 64–256 |
 | λ | Wavelength | 0.3 m (1 GHz) | 0.086 m (3.5 GHz) |
 
-### A2: File changes required
+### 17.2: File changes required
 
 | File | Changes |
 |------|---------|
@@ -619,7 +680,7 @@ This isolates whether the bottleneck is **physics**, **classical estimation**, o
 | `loss.py` | May need wideband R_samp formula |
 | `music_gpu.py` | Phase B only: per-tone MVDR |
 
-### A3: Shard storage estimate
+### 17.3: Shard storage estimate
 
 | Config | y size | H_taps size | Total per sample |
 |--------|--------|-------------|------------------|

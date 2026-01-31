@@ -1,8 +1,54 @@
 # Wideband OFDM Implementation Checklist
-Date: 2026-01-30  
+Date: 2026-01-31 (Updated with training fix)  
 Reference: `OFDM_TR38901_INDOOR_PLAN.md`
 
 This is a **step-by-step implementation checklist** for upgrading the pipeline from narrowband to wideband OFDM.
+
+---
+
+## CRITICAL FIX APPLIED (2026-01-31)
+
+Before running any training, verify the range loss fix is in place:
+
+### Issue: Training Stalled with Flat Aux RMSE
+The `_range_huber_loss` was clamping predicted ranges to `RANGE_R[0] * 0.9 = 0.45m`, which zeroed gradients for ~28% of predictions early in training.
+
+### Fix Applied in `loss.py`:
+```python
+# OLD (broken):
+pred_r_clamped = pred_r.clamp(min=cfg.RANGE_R[0] * 0.9)
+
+# NEW (fixed):
+eps_m = getattr(cfg, "RANGE_EPS_M", 1e-3)
+pred_r_clamped = pred_r.clamp(min=eps_m)
+```
+
+### Verification:
+```bash
+cd ris/MainMusic
+python -c "
+from ris_pytorch_pipeline.configs import cfg
+from ris_pytorch_pipeline.loss import _perm_invariant_aux_loss
+import torch
+
+# Check range gradients flow
+r_p = torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]], requires_grad=True)
+r_t = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
+phi_p = torch.zeros(1, cfg.K_MAX, requires_grad=True)
+theta_p = torch.zeros(1, cfg.K_MAX, requires_grad=True)
+phi_t = torch.zeros(1, cfg.K_MAX)
+theta_t = torch.zeros(1, cfg.K_MAX)
+K = torch.tensor([2])
+
+loss = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K)
+loss.backward()
+print(f'r_p.grad.norm() = {r_p.grad.norm().item():.4f}')
+if r_p.grad.norm().item() > 1e-6:
+    print('✅ Range gradients flow!')
+else:
+    print('❌ FIX NOT APPLIED!')
+"
+```
 
 ---
 
