@@ -584,8 +584,13 @@ class HybridModel(nn.Module):
             aux_angles_tmp = self.aux_angles(self.heads_ln(feats))  # [B, 2K]
             aux_range_raw_tmp = self.aux_range(self.heads_ln(feats))  # [B, K]
             aux_power_tmp = self.aux_power(self.heads_ln(feats))    # [B, K]
-            # Apply same tanh/scale as main path
-            PHI_SCALE = 0.7; THETA_SCALE = 0.35; R_MIN = 1.0; R_SCALE = 3.0
+            # Apply same tanh/scale as main path.
+            # IMPORTANT: Use config FOV (φ ±60°, θ ±30° by default). If these scales are too small,
+            # the aux head is physically incapable of matching GT, and RMSE will appear "stuck".
+            PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))
+            THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))
+            R_MIN = 1.0
+            R_SCALE = 3.0
             aux_phi_tmp = torch.tanh(aux_angles_tmp[:, :cfg.K_MAX]) * PHI_SCALE
             aux_theta_tmp = torch.tanh(aux_angles_tmp[:, cfg.K_MAX:]) * THETA_SCALE
             aux_range_tmp = R_MIN + R_SCALE * aux_range_raw_tmp
@@ -635,11 +640,12 @@ class HybridModel(nn.Module):
         aux_phi_raw = aux_angles_raw[:, :cfg.K_MAX]      # [B, K]
         aux_theta_raw = aux_angles_raw[:, cfg.K_MAX:]    # [B, K]
         
-        # Bound to expected ranges with some headroom
-        PHI_SCALE = 0.7    # ±40° in radians (allows ±0.7 rad)
-        THETA_SCALE = 0.35  # ±20° in radians (allows ±0.35 rad)
-        aux_phi = torch.tanh(aux_phi_raw) * PHI_SCALE      # [B, K] bounded
-        aux_theta = torch.tanh(aux_theta_raw) * THETA_SCALE  # [B, K] bounded
+        # Bound to expected ranges (match config FOV).
+        # CRITICAL: if these are narrower than the dataset label distribution, the model cannot fit.
+        PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))      # default ±60°
+        THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))  # default ±30°
+        aux_phi = torch.tanh(aux_phi_raw) * PHI_SCALE          # [B, K] bounded
+        aux_theta = torch.tanh(aux_theta_raw) * THETA_SCALE    # [B, K] bounded
         
         # Recombine for aux_ptr (used by loss)
         aux_angles = torch.cat([aux_phi, aux_theta], dim=1)  # [B, 2K]
