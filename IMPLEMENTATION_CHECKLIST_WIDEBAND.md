@@ -6,6 +6,35 @@ This is a **step-by-step implementation checklist** for upgrading the pipeline f
 
 ---
 
+## CRITICAL FIX #3 APPLIED (2026-02-01): Huber Delta Too Small
+
+### Issue: Loss in Linear Regime (Constant Gradient)
+The Huber loss delta for angles was `π/720 = 0.25°` which is **40× too small**. With initial errors of ~19°, ALL samples were in the linear regime (constant gradient regardless of error magnitude).
+
+### Symptoms:
+- aux_φ_rmse stuck at ~19°
+- aux_θ_rmse stuck at ~16°
+- aux_r_rmse stuck at ~2.4m
+- Loss decreasing very slowly (1.754 → 1.737 over 27 epochs)
+
+### Fix Applied in `loss.py`:
+```python
+# OLD (broken):
+delta_ang = math.pi/720  # 0.25° = 0.0044 rad
+
+# NEW (fixed):
+delta_ang = 0.175  # 10° in radians
+delta_logr = 0.5   # (was 0.2)
+```
+
+### Why This Matters:
+- Huber loss: quadratic for |error| < delta, linear for |error| > delta
+- With delta = 0.25°, any error > 0.25° gets constant gradient = 1
+- With delta = 10°, errors < 10° get quadratic (proportional) gradients
+- This provides meaningful learning signal early in training
+
+---
+
 ## CRITICAL FIX #2 APPLIED (2026-01-31): Bounded Aux Outputs for Structural R
 
 ### Issue: Structural R Model Had Flat Aux RMSE Despite Gradients Flowing
