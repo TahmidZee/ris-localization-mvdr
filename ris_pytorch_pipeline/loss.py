@@ -13,8 +13,14 @@ def _wrap_angle(x):
     """Wrap angles to [-π, π]"""
     return ((x + math.pi) % (2 * math.pi)) - math.pi
 
-def _wrapped_huber_loss(pred, gt, delta=math.pi/720):  # delta = 0.25° in radians
-    """Huber loss that respects angular wrap-around"""
+def _wrapped_huber_loss(pred, gt, delta=0.175):  # delta = 10° in radians (not 0.25°!)
+    """
+    Huber loss that respects angular wrap-around.
+    
+    CRITICAL FIX: delta was π/720 = 0.25° which is way too small!
+    With initial errors of ~19°, everything was in linear regime (constant gradient).
+    Changed to 10° so that errors < 10° get quadratic (proportional) gradients.
+    """
     d = _wrap_angle(pred - gt)
     abs_d = torch.abs(d)
     return torch.where(abs_d <= delta, 
@@ -34,7 +40,7 @@ def _range_huber_loss(pred_r, gt_r, delta=0.2):
     e = torch.abs(pr - gr)
     return torch.where(e < delta, 0.5 * (e ** 2) / delta, e - 0.5 * delta)
 
-def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *, delta_ang=math.pi/720, delta_logr=0.2):
+def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *, delta_ang=0.175, delta_logr=0.5):
     """
     Permutation-invariant aux loss for unordered multi-source scenes.
     Matches predicted slots (size K_MAX) to GT slots (size k<=K_MAX) via brute-force
