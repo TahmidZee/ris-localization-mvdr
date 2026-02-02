@@ -528,6 +528,13 @@ class ModelConfig:
         #   - Disconnected from aux predictions, prone to subspace collapse
         self.USE_STRUCTURED_R = True
         
+        # CAPACITY FIX (2026-02-02): Aux head hidden dimension
+        # When we removed cov_fact_angle/range (2.6M params), the aux heads became the ONLY
+        # path to geometry prediction. Single linear layers (~10K params) have no capacity!
+        # Set this to D//2 (256) for ~400K params in aux heads, or higher for more capacity.
+        # Set to 0 to use single linear layers (NOT recommended for structural R).
+        self.AUX_HEAD_HIDDEN_DIM = 256  # D // 2
+        
         # --- θ loss emphasis (C12) ---
         self.THETA_LOSS_SCALE = 1.5  # Multiply θ loss by this factor for better elevation
 

@@ -1,49 +1,97 @@
 # Wideband OFDM Implementation Checklist
-Date: 2026-01-31 (Updated with structural R fixes)  
+Date: 2026-02-02 (Updated with capacity fix diagnosis)  
 Reference: `OFDM_TR38901_INDOOR_PLAN.md`
 
 This is a **step-by-step implementation checklist** for upgrading the pipeline from narrowband to wideband OFDM.
 
 ---
 
-## CRITICAL FIX #4 APPLIED (2026-02-01): Physics Mismatch - cov_nmse vs aux_l2
+## CRITICAL FIX #5 APPLIED (2026-02-02): Head Capacity Collapse
 
-### Issue: Gradient Conflict Between Loss Terms
-The **ROOT CAUSE** of flat aux RMSE was a fundamental physics mismatch:
+### ROOT CAUSE: Model Has No Capacity to Learn Geometry!
+
+**Comparison of working vs broken runs:**
+
+| Metric | Working (2026-01-30) | Broken (2026-02-01) |
+|--------|---------------------|---------------------|
+| Total params | **28.9M** | **8.9M** (3× smaller) |
+| Backbone | 16.7M | 8.6M (2× smaller) |
+| **Head** | **12.18M** | **0.32M** (40× smaller!) |
+| aux_φ_rmse | 19.38° → 16.40° ✅ | ~18° (FLAT) ❌ |
+| aux_θ_rmse | 16.90° → 12.60° ✅ | ~17° (FLAT) ❌ |
+
+**What happened:**
+When we implemented structural R, we removed the covariance factor heads (2.6M params) because R is now built from aux predictions. We also "slimmed" the model:
+- `USE_FACTORED_SOFTARGMAX=True` → saved 9.2M params
+- `USE_CONV_HPROJ=True` → saved 8.3M params
+
+But this left the aux heads as **TINY single linear layers**:
+```python
+# BROKEN: These have NO CAPACITY!
+self.aux_angles = nn.Linear(512, 10)   # 5K params
+self.aux_range = nn.Linear(512, 5)     # 2.5K params  
+self.aux_power = nn.Linear(512, 5)     # 2.5K params
+# Total: ~10K params for ALL geometry prediction!
+```
+
+A single linear layer cannot learn the complex features → geometry mapping!
+
+### Fix Applied in `model.py`:
+```python
+# FIXED: MLP with hidden layer gives real capacity
+aux_hidden = mdl_cfg.AUX_HEAD_HIDDEN_DIM  # default 256
+
+self.aux_angles = nn.Sequential(
+    nn.Linear(D, aux_hidden),     # 512 → 256
+    nn.GELU(),
+    nn.Dropout(0.1),
+    nn.Linear(aux_hidden, 10),    # 256 → 10
+)  # ~131K params per head (13× more capacity)
+
+# Same pattern for aux_range and aux_power
+```
+
+**New parameter count:**
+- aux_angles: ~134K params (up from 5K)
+- aux_range: ~133K params (up from 2.5K)
+- aux_power: ~133K params (up from 2.5K)
+- Total head: ~0.7M (up from 0.32M)
+
+### Config option added:
+```python
+# In ModelConfig:
+self.AUX_HEAD_HIDDEN_DIM = 256  # Set to 0 for single linear (not recommended)
+```
+
+### If still not learning:
+Consider reverting more capacity:
+1. `USE_FACTORED_SOFTARGMAX = False` → adds back 9.2M params
+2. `USE_CONV_HPROJ = False` → adds back 8.3M params
+
+---
+
+## CRITICAL FIX #4 (Revised): Physics Mismatch - Handled by aux_power
+
+### Note: cov_nmse CAN work with structural R
 
 **R_true (generated in shards):**
 ```python
-A0 = sqrt(pW * (λ²) / (4πr)²) * nearfield_vec(...)  # PATH LOSS INCLUDED!
-R_true = A0 @ diag(p_src) @ A0^H
+A0 = sqrt(path_loss(r) * p_src) * unit_steer_vec(...)
+R_true = A0 @ A0^H
 ```
 
 **R_pred (structural model):**
 ```python
-A = exp(1j * phase) / sqrt(N)  # UNIT-NORMALIZED, NO PATH LOSS!
-R_pred = A @ diag(power) @ A^H + sigma2 * I
+A = unit_steer_vec(...) / sqrt(N)
+R_pred = A @ diag(aux_power) @ A^H + sigma2 * I
 ```
 
-**The Problem:**
-- Even with PERFECT geometry (φ, θ, r = GT), R_pred ≠ R_true because steering vector magnitudes differ
-- `cov_nmse` tries to minimize `||R_pred - R_true||` which is **impossible** to make zero
-- `cov_nmse` gradient pushes `aux_power` to compensate for path loss mismatch
-- This CONFLICTS with `aux_l2` gradient which wants correct geometry
-- Result: model is stuck, aux RMSE flat
+If `aux_power` learns `effective_received_power = path_loss(r) * p_src`, then R_pred CAN match R_true!
 
-### Fix Applied in `configs.py`:
-```python
-"joint": {
-    "lam_cov": 0.0,   # DISABLED: physics mismatch with structural R
-    "lam_aux": 2.0,   # PRIMARY: ONLY loss for geometry (increased)
-    ...
-}
-```
-
-### Why This Works:
-- With `lam_cov=0.0`, only `aux_l2` drives training
-- No conflicting gradients → clean learning signal
-- Geometry improves → R_pred subspace is correct by construction
-- At inference, R_pred can still be used for MVDR (subspace matters, not magnitude)
+**Current config (lam_cov=0.3 with warmup):**
+- `lam_cov` warms up from 0 → 0.3 over 5 epochs
+- This lets geometry stabilize first before cov_nmse kicks in
+- The physics mismatch is NOT fundamental - aux_power absorbs it
 
 ---
 

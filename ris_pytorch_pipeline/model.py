@@ -364,8 +364,31 @@ class HybridModel(nn.Module):
         self._G = G  # Store for forward pass
 
         # --- auxiliary φ/θ/r (r via Softplus; loss uses log-range) ---
-        self.aux_angles = nn.Linear(D, 2 * cfg.K_MAX)
-        self.aux_range  = nn.Sequential(nn.Linear(D, cfg.K_MAX), nn.Softplus())
+        # CRITICAL FIX (2026-02-02): The aux heads need REAL CAPACITY!
+        # When we removed cov_fact_angle/range (2.6M params) for structural R, the aux heads
+        # became the ONLY path to geometry prediction. But single linear layers (~10K params)
+        # cannot learn the complex features → geometry mapping.
+        # 
+        # Old (broken): Linear(D → 2K) = 5K params - NO CAPACITY!
+        # New (fixed): MLP with hidden layer = ~131K params per head
+        #
+        # This is still much smaller than the 12M head we had before, but gives the
+        # geometry prediction path real expressive power.
+        aux_hidden = getattr(mdl_cfg, 'AUX_HEAD_HIDDEN_DIM', D // 2)  # default 256
+        
+        self.aux_angles = nn.Sequential(
+            nn.Linear(D, aux_hidden),
+            nn.GELU(),
+            nn.Dropout(mdl_cfg.DROPOUT * 0.5),  # Light dropout for regularization
+            nn.Linear(aux_hidden, 2 * cfg.K_MAX),
+        )
+        self.aux_range = nn.Sequential(
+            nn.Linear(D, aux_hidden),
+            nn.GELU(),
+            nn.Dropout(mdl_cfg.DROPOUT * 0.5),
+            nn.Linear(aux_hidden, cfg.K_MAX),
+            nn.Softplus(),
+        )
         
         # --- STRUCTURAL FIX: aux_power for per-source power prediction ---
         # This replaces the free-form covariance factors with geometry-aware construction.
@@ -373,7 +396,10 @@ class HybridModel(nn.Module):
         # Using Softplus to ensure positive power values.
         if self.use_structured_R:
             self.aux_power = nn.Sequential(
-                nn.Linear(D, cfg.K_MAX),
+                nn.Linear(D, aux_hidden),
+                nn.GELU(),
+                nn.Dropout(mdl_cfg.DROPOUT * 0.5),
+                nn.Linear(aux_hidden, cfg.K_MAX),
                 nn.Softplus(),  # Ensure positive
             )
         else:
