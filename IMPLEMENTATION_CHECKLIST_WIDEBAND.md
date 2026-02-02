@@ -1,8 +1,73 @@
 # Wideband OFDM Implementation Checklist
-Date: 2026-02-02 (Updated with capacity fix diagnosis)  
+Date: 2026-02-02 (Updated with cov-loss alignment fix)  
 Reference: `OFDM_TR38901_INDOOR_PLAN.md`
 
 This is a **step-by-step implementation checklist** for upgrading the pipeline from narrowband to wideband OFDM.
+
+---
+
+## CRITICAL FIX #8 APPLIED (2026-02-02): Cov-Loss Target Alignment
+
+### Problem: Train/Infer Covariance Preprocessing Mismatch
+
+The covariance loss was comparing **asymmetrically preprocessed** matrices:
+
+| Matrix | Preprocessing applied |
+|--------|----------------------|
+| `R_eff_pred` | hermitize → trace-norm → **diag-load** → trace-norm → shrink |
+| `R_true` (old) | hermitize → trace-norm → shrink (**NO diag-load!**) |
+
+This creates an **irreducible NMSE floor** because the diagonal loading term in `R_eff_pred` can never match the non-diag-loaded `R_true`.
+
+### Fix Applied in `loss.py` (commit `e47c9c0`):
+
+Both covariances now go through the same `build_effective_cov_torch` pipeline:
+
+```python
+# NEW: Apply same preprocessing to R_true as we do to R_pred
+R_eff_true = build_effective_cov_torch(
+    R_true,
+    snr_db=y_true.get("snr_db", None),
+    R_samp=None,
+    beta=None,
+    diag_load=True,        # ← KEY: now matches R_eff_pred
+    apply_shrink=("snr_db" in y_true),
+    target_trace=float(cfg.N),
+)
+loss_nmse = self._nmse_cov(R_eff_pred, R_eff_true).mean()
+```
+
+### Why this matters for MVDR:
+
+MVDR inference uses `build_effective_cov_np(R_pred, diag_load=True, ...)`. Training should optimize for "what does the covariance look like at inference time", not the raw signal covariance. This fix ensures **train ≈ inference preprocessing**.
+
+---
+
+## CRITICAL FIX #7 APPLIED (2026-02-02): Stronger Mask Supervision + Slow Cov Warmup
+
+### Problem: Mask supervision was too weak + lam_cov warmup too fast
+
+**Mask issue**: The count-based mask loss (weight 0.1) was easily satisfied by spreading masks evenly (e.g., `[0.4, 0.4, 0.4, 0.4, 0.4]` when K=2), which doesn't tell the model *which* slots to activate.
+
+**Warmup issue**: `lam_cov` ramped from 0→0.3 over 5 epochs, but geometry was still at ~35° RMSE. This caused total loss to **increase** even as geometry improved.
+
+### Fixes Applied (commits `9bce270`, `75927df`):
+
+1. **Slower cov warmup**: `STRUCTURED_COV_WARMUP_EPOCHS = 15` (was 5)
+
+2. **Much stronger mask supervision**:
+   | Config | Before | After |
+   |--------|--------|-------|
+   | `LAM_AUX_MASK` | 0.1 | 0.5 |
+   | `LAM_AUX_MASK_BIN` | 0.0 | 0.2 |
+   | `LAM_AUX_MASK_BCE` | — | 0.3 (NEW) |
+
+3. **Permutation-aware mask BCE**: After aux loss finds the best slot→GT matching, it also supervises masks:
+   - Matched slots → target = 1
+   - Unmatched slots → target = 0
+   - BCE loss applied per-slot
+
+4. **Sparse mask initialization**: Slot head biases initialized so `mask ≈ 0.1` and `power ≈ 0.1` at init (reduces early phantom sources).
 
 ---
 
