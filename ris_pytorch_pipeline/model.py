@@ -579,25 +579,30 @@ class HybridModel(nn.Module):
             antidiag_feat = self.antidiag_pool(R_whitened)  # [B, antidiag_dim]
             feats_enhanced = F.gelu(self.fusion_with_antidiag(torch.cat([feats, antidiag_feat], dim=1)))  # [B, D]
         elif self.use_antidiag and self.use_structured_R:
-            # Structural R mode: build R from geometry for antidiag features
-            # (will be recomputed later, but we need it for enhanced features)
-            aux_angles_tmp = self.aux_angles(self.heads_ln(feats))  # [B, 2K]
-            aux_range_raw_tmp = self.aux_range(self.heads_ln(feats))  # [B, K]
-            aux_power_tmp = self.aux_power(self.heads_ln(feats))    # [B, K]
-            # Apply same tanh/scale as main path.
-            # IMPORTANT: Use config FOV (φ ±60°, θ ±30° by default). If these scales are too small,
-            # the aux head is physically incapable of matching GT, and RMSE will appear "stuck".
-            PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))
-            THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))
-            R_MIN = 1.0
-            R_SCALE = 3.0
-            aux_phi_tmp = torch.tanh(aux_angles_tmp[:, :cfg.K_MAX]) * PHI_SCALE
-            aux_theta_tmp = torch.tanh(aux_angles_tmp[:, cfg.K_MAX:]) * THETA_SCALE
-            aux_range_tmp = R_MIN + R_SCALE * aux_range_raw_tmp
-            R_learned = build_structured_R(aux_phi_tmp, aux_theta_tmp, aux_range_tmp, aux_power_tmp, cfg)
-            R_whitened = self._whiten_covariance(R_learned)
-            antidiag_feat = self.antidiag_pool(R_whitened)
-            feats_enhanced = F.gelu(self.fusion_with_antidiag(torch.cat([feats, antidiag_feat], dim=1)))
+            # IMPORTANT (2026-02-02):
+            # In structural-R mode, AntiDiagPool creates a feedback loop:
+            #   feats -> aux (random early) -> R_learned -> antidiag_feat -> feats_enhanced -> aux
+            # This can stall learning (aux RMSE flat) because early random aux yields garbage
+            # covariance features that pollute the backbone representation.
+            #
+            # Default: DISABLE antidiag features in structured-R mode unless explicitly enabled.
+            if bool(getattr(mdl_cfg, "USE_ANTIDIAG_POOL_STRUCTURED", False)):
+                aux_angles_tmp = self.aux_angles(self.heads_ln(feats))  # [B, 2K]
+                aux_range_raw_tmp = self.aux_range(self.heads_ln(feats))  # [B, K]
+                aux_power_tmp = self.aux_power(self.heads_ln(feats))    # [B, K]
+                PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))
+                THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))
+                R_MIN = 1.0
+                R_SCALE = 3.0
+                aux_phi_tmp = torch.tanh(aux_angles_tmp[:, :cfg.K_MAX]) * PHI_SCALE
+                aux_theta_tmp = torch.tanh(aux_angles_tmp[:, cfg.K_MAX:]) * THETA_SCALE
+                aux_range_tmp = R_MIN + R_SCALE * aux_range_raw_tmp
+                R_learned = build_structured_R(aux_phi_tmp, aux_theta_tmp, aux_range_tmp, aux_power_tmp, cfg)
+                R_whitened = self._whiten_covariance(R_learned)
+                antidiag_feat = self.antidiag_pool(R_whitened)
+                feats_enhanced = F.gelu(self.fusion_with_antidiag(torch.cat([feats, antidiag_feat], dim=1)))
+            else:
+                feats_enhanced = feats
         else:
             feats_enhanced = feats  # Use original features when AntiDiagPool is disabled
 
