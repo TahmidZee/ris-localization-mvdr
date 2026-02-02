@@ -455,7 +455,8 @@ class ModelConfig:
 
     # --- Structural-R training stability ---
     # Warm up covariance loss so aux geometry learns first; then cov_nmse ramps in to improve MVDR readiness.
-    STRUCTURED_COV_WARMUP_EPOCHS = 5
+    # CRITICAL: 5 epochs was too fast; geometry needs ~10-15 epochs to stabilize before cov pressure helps.
+    STRUCTURED_COV_WARMUP_EPOCHS = 15
     DH, DV = 3, 3
 
     def __init__(self):
@@ -535,10 +536,13 @@ class ModelConfig:
         self.USE_SLOT_HEAD = True
         self.SLOT_HEAD_HIDDEN_DIM = 256  # hidden width for per-slot MLP
 
-        # Presence/mask supervision (permutation-safe): encourage sum(mask) ~= K_true
-        self.LAM_AUX_MASK = 0.10
-        # Optional: encourage binarization of mask probabilities (very small)
-        self.LAM_AUX_MASK_BIN = 0.00
+        # Presence/mask supervision: STRENGTHENED for early learning
+        # - LAM_AUX_MASK: count-based loss weight (was 0.1, too weak)
+        # - LAM_AUX_MASK_BIN: binarization penalty to push masks toward {0,1}
+        # - LAM_AUX_MASK_BCE: permutation-aware BCE (strongest, added in loss.py)
+        self.LAM_AUX_MASK = 0.5        # 5× stronger count loss
+        self.LAM_AUX_MASK_BIN = 0.2    # Push masks toward 0 or 1
+        self.LAM_AUX_MASK_BCE = 0.3    # NEW: permutation-aware BCE (applied after aux matching)
 
         # Legacy aux MLP capacity knob (unused when USE_SLOT_HEAD=True; kept for ablations)
         self.AUX_HEAD_HIDDEN_DIM = 256

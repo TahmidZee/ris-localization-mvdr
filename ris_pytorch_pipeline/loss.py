@@ -40,16 +40,23 @@ def _range_huber_loss(pred_r, gt_r, delta=0.2):
     e = torch.abs(pr - gr)
     return torch.where(e < delta, 0.5 * (e ** 2) / delta, e - 0.5 * delta)
 
-def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *, delta_ang=0.175, delta_logr=0.5):
+def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *,
+                             delta_ang=0.175, delta_logr=0.5, mask_p=None):
     """
     Permutation-invariant aux loss for unordered multi-source scenes.
     Matches predicted slots (size K_MAX) to GT slots (size k<=K_MAX) via brute-force
     (K_MAX<=5 => at most 120 perms), then computes wrapped Huber on angles and Huber on log-range.
     Selection is done under no_grad for stability; gradients flow through the chosen pairing.
+    
+    If mask_p is provided [B, Kmax], also computes BCE on masks using the assignment:
+      - matched slots → target = 1
+      - unmatched slots → target = 0
+    Returns (geom_loss, mask_bce_loss) if mask_p is provided, else just geom_loss.
     """
     device = phi_p.device
     B, Kmax = phi_p.shape
     losses = []
+    mask_bce_losses = [] if mask_p is not None else None
 
     # Precompute permutations of indices for each k in [1..Kmax]
     perms_by_k = {}
@@ -104,9 +111,24 @@ def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *
         rng_huber = _range_huber_loss(rp, gt_r, delta=delta_logr).mean()
         losses.append(phi_huber + theta_huber + rng_huber)
 
+        # ======== PERMUTATION-AWARE MASK BCE ========
+        # Matched slots (best_perm indices) should have mask=1, others should have mask=0
+        if mask_p is not None:
+            mask_target = torch.zeros(Kmax, device=device)
+            mask_target[best_perm] = 1.0
+            m = mask_p[b].clamp(min=1e-6, max=1.0 - 1e-6)  # for numerical stability in BCE
+            bce = -(mask_target * torch.log(m) + (1.0 - mask_target) * torch.log(1.0 - m))
+            mask_bce_losses.append(bce.mean())
+
     if not losses:
-        return torch.tensor(0.0, device=device)
-    return torch.stack(losses).mean()
+        zero = torch.tensor(0.0, device=device)
+        return (zero, zero) if mask_p is not None else zero
+    
+    geom_loss = torch.stack(losses).mean()
+    if mask_p is not None:
+        mask_bce = torch.stack(mask_bce_losses).mean() if mask_bce_losses else torch.tensor(0.0, device=device)
+        return geom_loss, mask_bce
+    return geom_loss
 
 def _vec2c(v):
     v = v.float()
@@ -818,8 +840,28 @@ class UltimateHybridLoss(nn.Module):
         # NOTE: K-loss removed - using MVDR peak detection instead (K-free localization)
 
         # Aux: wrapped Huber on angles + Huber on log-range
+        # Also compute permutation-aware mask BCE if masks are available
+        loss_mask_bce = torch.tensor(0.0, device=device)
+        lam_mask_bce = float(getattr(mdl_cfg, "LAM_AUX_MASK_BCE", 0.0))
+        
         if bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
-            aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true)
+            # Get mask predictions if available (for permutation-aware BCE)
+            mask_for_perm = None
+            if lam_mask_bce > 0.0 and ("aux_mask" in y_pred or "aux_mask_logit" in y_pred):
+                if "aux_mask" in y_pred:
+                    mask_for_perm = y_pred["aux_mask"].to(device).float()
+                else:
+                    mask_for_perm = torch.sigmoid(y_pred["aux_mask_logit"].to(device).float())
+            
+            if mask_for_perm is not None:
+                aux_l2, loss_mask_bce = _perm_invariant_aux_loss(
+                    phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, mask_p=mask_for_perm
+                )
+                if not hasattr(self, "_mask_bce_logged"):
+                    print(f"[LOSS DEBUG] Permutation-aware mask BCE: enabled @ weight={lam_mask_bce}", flush=True)
+                    self._mask_bce_logged = True
+            else:
+                aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true)
         else:
             phi_huber = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
             theta_huber = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
@@ -948,7 +990,8 @@ class UltimateHybridLoss(nn.Module):
             + self.lam_subspace_align * loss_subspace_align  # Subspace alignment loss
             + self.lam_peak_contrast * loss_peak_contrast     # Peak contrast loss
             + self.lam_heatmap * loss_heatmap                 # SpectrumRefiner supervision
-            + lam_mask * loss_mask                             # Slot presence/mask supervision
+            + lam_mask * loss_mask                             # Slot presence/mask count supervision
+            + lam_mask_bce * loss_mask_bce                     # Permutation-aware mask BCE (strongest)
         )
         
         # Log loss breakdown (once per run)
