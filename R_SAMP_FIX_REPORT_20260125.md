@@ -93,6 +93,18 @@ python -m ris_pytorch_pipeline.ris_pipeline pregen-split \
 python -m ris_pytorch_pipeline.regression_tests r_samp --n 16 --seed 0
 ```
 
+### 2026-02-02 Update: Do NOT store `R_samp` in shards for M64/N256/L64 GPU-cache training
+With `TRAIN_USE_GPU_CACHE=True`, the loader can stage ~100k samples to GPU (already ~79 GB in the Feb-01 run logs).
+
+Storing `R_samp` per sample adds an additional tensor of size \(N\times N\) complex:
+- \(256\times256\times2\) float32 ≈ **0.5 MB/sample**
+- 100k samples ⇒ **~50 GB extra** CPU+GPU transfer (often OOM)
+
+**Recommendation for current structural-R + slot-head training:**
+- Keep `HYBRID_COV_BETA=0.0`
+- Do **not** include `--with-rsamp` in pregen for large GPU-cache runs
+- If you want to compare against `R_samp`, compute it only on a **small held-out subset** (CPU), and run MVDR diagnostics offline.
+
 ### Current Verification (local)
 - `r_samp` regression test: **PASS**
 - `mvdr_lowrank` regression test: **PASS**

@@ -12,6 +12,31 @@
 
 ---
 
+## Addendum (2026-02-02): Structural-R + Slot Head changes the loss story
+
+We implemented a structural-R model that **constructs** covariance from predicted geometry:
+\[
+R_{pred}=\sum_k p_k\,a(\phi_k,\theta_k,r_k)a^H + \sigma^2 I
+\]
+
+And we replaced the “pool-to-one-vector then regress \(K\) slots” head with a **DETR-style slot head**
+(K learned queries cross-attend into per-snapshot tokens).
+
+**Implication:** the earlier recommendation to increase `lam_subspace_align` / enable `lam_peak_contrast`
+was aimed at the *free-form covariance factor* model where the covariance head could drift away from
+the geometry subspace.
+
+With structural-R, the subspace is already correct **by construction** (it is spanned by steering vectors at the predicted geometry). Therefore:
+- `lam_subspace_align` is typically **redundant** with `lam_aux` (both push geometry).
+- `lam_peak_contrast` is typically **redundant** once geometry is correct.
+
+Current recommended structural-R objective is:
+- **aux geometry loss** (primary),
+- **cov NMSE** (secondary, warmed-up),
+- **presence/mask count loss** (to suppress phantom slots).
+
+---
+
 ## 1) Key diagnostic results (what we know now)
 
 ### 1.1 Oracle upper bound: MVDR on `R_true` works

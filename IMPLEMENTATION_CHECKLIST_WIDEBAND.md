@@ -6,6 +6,46 @@ This is a **step-by-step implementation checklist** for upgrading the pipeline f
 
 ---
 
+## CRITICAL FIX #6 APPLIED (2026-02-02): Slot Head + Presence Mask (Best Structural-R Head)
+
+### Why the previous head was structurally wrong (even with more MLP capacity)
+Structural-R makes the aux path the *entire* geometry/covariance path. Predicting \(K\) unordered sources from a **single pooled scene vector** is a poor inductive bias for:
+- multi-source set prediction,
+- permutation invariance,
+- variable \(K\),
+- suppressing unused slots (phantom sources).
+
+### Fix: DETR-style learned queries (slot head)
+We replaced “pool-to-one-vector then regress \(K\) slots” with:
+- **K learned query vectors** \([K_{max}, D]\)
+- **cross-attention** into the backbone’s **snapshot token sequence** \([B, L, D]\)
+- output **K slot embeddings** \([B, K_{max}, D]\)
+- per-slot prediction of: \((\phi, \theta, r, p, m)\) where \(m\in(0,1)\) is a presence probability.
+
+This makes the backbone capacity **actually usable**: each predicted source is produced by attending to the right evidence in the per-snapshot token sequence, rather than forcing a tiny MLP to “decode the whole scene” from a single vector.
+
+### Presence/mask head (phantom source fix)
+We gate the structured covariance contribution:
+\[
+  p^{eff}_k = p_k \cdot m_k \quad,\quad
+  R_{pred}=\sum_k p^{eff}_k\,a_k a_k^H + \sigma^2 I
+\]
+This makes unused slots naturally vanish.
+
+### Permutation-safe supervision for mask
+Slots are unordered, so we **do not** use per-slot BCE targets. Instead we supervise the **count**:
+\[
+  \left(\sum_k m_k - K_{true}\right)^2
+\]
+This is stable, cheap, and avoids assignment complexity.
+
+### New parameter count (with slot head)
+- **Total trainable**: **10.53M**
+- **Slot head** (cross-attn + per-slot MLP + queries): **1.61M**
+- Transformer backbone: **6.31M**
+
+---
+
 ## CRITICAL FIX #5 APPLIED (2026-02-02): Head Capacity Collapse
 
 ### ROOT CAUSE: Model Has No Capacity to Learn Geometry!

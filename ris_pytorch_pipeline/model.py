@@ -465,6 +465,13 @@ class HybridModel(nn.Module):
         # Aux heads
         aux_modules = [
             m for m in [
+                # Slot head modules (recommended path for structural R)
+                getattr(self, "slot_attn", None),
+                getattr(self, "slot_ln", None),
+                getattr(self, "slot_fusion", None),
+                getattr(self, "slot_heads_ln", None),
+                getattr(self, "slot_head", None),
+                # NOTE: slot_queries is a Parameter, not a Module; handled below.
                 getattr(self, "logits_gg", None),      # Legacy joint grid
                 getattr(self, "phi_logits", None),     # Factored: φ grid
                 getattr(self, "theta_logits", None),   # Factored: θ grid
@@ -476,6 +483,10 @@ class HybridModel(nn.Module):
         _set(backbone_modules, freeze_backbone)
         _set(factor_modules, freeze_cov)
         _set(aux_modules, freeze_aux)
+
+        # Slot queries are a raw Parameter, so freeze/unfreeze explicitly.
+        if getattr(self, "slot_queries", None) is not None:
+            self.slot_queries.requires_grad = (not freeze_aux)
     
     def _hermitize_trace_norm(self, R):
         """Hermitize and trace-normalize covariance matrix"""
