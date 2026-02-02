@@ -413,14 +413,20 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                # STRUCTURAL FIX (2026-01-30): With geometry-aware R, the loss priorities change:
-                # - lam_aux is now PRIMARY (geometry must be correct for R to be correct)
-                # - lam_cov is secondary (R follows from geometry by construction)
-                # - lam_subspace_align is REDUNDANT (subspace is steering vectors by construction)
-                # - lam_peak_contrast is REDUNDANT (peaks sharp if geometry is right)
-                "lam_cov": 0.3,              # Secondary: R follows from geometry
+                # STRUCTURAL FIX (2026-02-01): CRITICAL - cov_nmse DISABLED for structural R!
+                # 
+                # ROOT CAUSE OF FLAT AUX RMSE:
+                # - R_true (in shards) has PATH LOSS baked into steering vectors: A0 ∝ 1/r²
+                # - R_pred (structural) uses UNIT-NORMALIZED steering vectors (no path loss)
+                # - Even with PERFECT geometry, R_pred ≠ R_true due to magnitude mismatch
+                # - cov_nmse tries to minimize this irreducible gap by pushing aux_power
+                # - This creates CONFLICTING gradients with aux_l2, stalling learning
+                #
+                # FIX: Disable cov_nmse, rely ONLY on aux_l2 for geometry learning.
+                # Once geometry is good, R_pred subspace will be correct by construction.
+                "lam_cov": 0.0,              # DISABLED: physics mismatch with structural R
                 "lam_subspace_align": 0.0,   # DISABLED: redundant with structural R
-                "lam_aux": 1.5,              # PRIMARY: geometry must be accurate
+                "lam_aux": 2.0,              # PRIMARY: ONLY loss for geometry (increased weight)
                 "lam_peak_contrast": 0.0,    # DISABLED: redundant with structural R
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only

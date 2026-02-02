@@ -563,6 +563,14 @@ class Trainer:
         # Eigengap/margin disabled globally (ignore any config values).
         self.loss_fn.lam_gap = 0.0
         self.loss_fn.lam_margin = 0.0
+        
+        # CRITICAL WARNING: lam_cov > 0 with structural R causes gradient conflict!
+        use_structured_R = getattr(mdl_cfg, 'USE_STRUCTURED_R', True)
+        if use_structured_R and self.loss_fn.lam_cov > 0.0:
+            print(f"⚠️  WARNING: lam_cov={self.loss_fn.lam_cov:.3f} with USE_STRUCTURED_R=True!")
+            print(f"⚠️  This causes gradient conflict (R_true has path loss, R_pred doesn't).")
+            print(f"⚠️  Recommend setting lam_cov=0.0 for structural R training.")
+        
         print(f"🎯 Applied phase '{phase}' loss weights: "
               f"lam_cov={self.loss_fn.lam_cov:.3f}, "
               f"lam_subspace_align={self.loss_fn.lam_subspace_align:.3f}, "
