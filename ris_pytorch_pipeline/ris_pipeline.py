@@ -409,6 +409,11 @@ def main():
         # 2. Model config check
         print("\n[2/6] Model Configuration Check")
         print(f"  USE_STRUCTURED_R = {getattr(mdl_cfg, 'USE_STRUCTURED_R', False)}")
+        print(f"  USE_SLOT_HEAD = {getattr(mdl_cfg, 'USE_SLOT_HEAD', False)}")
+        if bool(getattr(mdl_cfg, 'USE_SLOT_HEAD', False)):
+            print(f"  SLOT_HEAD_HIDDEN_DIM = {getattr(mdl_cfg, 'SLOT_HEAD_HIDDEN_DIM', 'N/A')}")
+            print(f"  LAM_AUX_MASK = {getattr(mdl_cfg, 'LAM_AUX_MASK', 0.0)}")
+            print(f"  LAM_AUX_MASK_BIN = {getattr(mdl_cfg, 'LAM_AUX_MASK_BIN', 0.0)}")
         print(f"  USE_FACTORED_SOFTARGMAX = {getattr(mdl_cfg, 'USE_FACTORED_SOFTARGMAX', False)}")
         print(f"  USE_CONV_HPROJ = {getattr(mdl_cfg, 'USE_CONV_HPROJ', False)}")
         
