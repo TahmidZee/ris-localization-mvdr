@@ -691,10 +691,22 @@ class UltimateHybridLoss(nn.Module):
             print(f"[SELFTEST] nmse(R_true,R_true)={z_eq:.3e} (expect ~0), nmse(0,R_true)={z_0:.3e} (expect ~1)", flush=True)
             self._nmse_selftest_done = True
         
-        # Apply SNR-aware shrinkage to R_true (torch-native, per-sample) on trace=N convention
-        if "snr_db" in y_true:
-            R_true = trace_norm_torch(R_true, target_trace=float(cfg.N))
-            R_true = shrink_torch(R_true, y_true["snr_db"])
+        # IMPORTANT (train/infer alignment):
+        # Inference consumes an *effective* covariance with:
+        #   trace-norm → diag-load → (optional) SNR-aware shrink (and trace-norm after diag-load)
+        # Previously we applied this pipeline only to R_pred but not to R_true, which
+        # creates a systematic NMSE floor and pushes R_pred toward a different target.
+        #
+        # Build R_eff_true using the same helper used for R_eff_pred.
+        R_eff_true = build_effective_cov_torch(
+            R_true,
+            snr_db=y_true.get("snr_db", None),
+            R_samp=None,
+            beta=None,
+            diag_load=True,
+            apply_shrink=("snr_db" in y_true),
+            target_trace=float(cfg.N),
+        )
 
         # predicted cov factors
         if "cov_fact_angle" in y_pred:
@@ -778,9 +790,9 @@ class UltimateHybridLoss(nn.Module):
         # Main NMSE loss on effective covariances (train==eval==infer alignment)
         # DEBUG: Check shapes before NMSE
         if not hasattr(self, "_shape_debug_done"):
-            print(f"[LOSS DEBUG] R_eff_pred.shape={R_eff_pred.shape}, R_true.shape={R_true.shape}", flush=True)
+            print(f"[LOSS DEBUG] R_eff_pred.shape={R_eff_pred.shape}, R_eff_true.shape={R_eff_true.shape}", flush=True)
             self._shape_debug_done = True
-        loss_nmse = self._nmse_cov(R_eff_pred, R_true).mean()
+        loss_nmse = self._nmse_cov(R_eff_pred, R_eff_true).mean()
         
         # NEW: small auxiliary NMSE on R_pred (constructed from factors) to prevent hiding
         # Only compute when factor heads are present AND not in pure overfit mode
@@ -798,7 +810,7 @@ class UltimateHybridLoss(nn.Module):
                 apply_shrink=("snr_db" in y_true),
                 target_trace=float(cfg.N),
             )
-            loss_nmse_pred = self._nmse_cov(R_pred_aux, R_true).mean()
+            loss_nmse_pred = self._nmse_cov(R_pred_aux, R_eff_true).mean()
         
         # Debug logging (once per run)
         if not hasattr(self, '_loss_debug_printed'):
