@@ -316,6 +316,43 @@ class HybridModel(nn.Module):
         self.cov_ln = nn.LayerNorm(D)
         self.heads_ln = nn.LayerNorm(D)
 
+        # ------------------------------------------------------------------
+        # DETR-style slot head (BEST OPTION for structural-R multi-source)
+        # ------------------------------------------------------------------
+        # Instead of collapsing snapshot tokens to a single vector and asking a tiny MLP
+        # to emit K unordered sources, we use K learned queries and cross-attention into
+        # the snapshot token sequence. This produces K "slot embeddings" with a strong
+        # inductive bias for set prediction.
+        #
+        # Output per slot: (phi, theta, r, power, mask_logit)
+        # Mask is used to gate power so unused slots don't create phantom sources.
+        self.use_slot_head = bool(getattr(mdl_cfg, "USE_SLOT_HEAD", True))
+        if self.use_slot_head:
+            self.slot_queries = nn.Parameter(torch.randn(cfg.K_MAX, D) * 0.02)  # [K,D]
+            self.slot_attn = nn.MultiheadAttention(
+                embed_dim=D,
+                num_heads=self._choose_heads(D, getattr(mdl_cfg, 'NUM_HEADS', 6)),
+                dropout=float(getattr(mdl_cfg, 'DROPOUT', 0.1)) * 0.5,
+                batch_first=True,
+            )
+            self.slot_ln = nn.LayerNorm(D)
+            self.slot_fusion = nn.Linear(D + (D // 2) + self.snr_dim, D)
+            self.slot_heads_ln = nn.LayerNorm(D)
+            slot_hidden = int(getattr(mdl_cfg, "SLOT_HEAD_HIDDEN_DIM", D // 2))
+            self.slot_head = nn.Sequential(
+                nn.Linear(D, slot_hidden),
+                nn.GELU(),
+                nn.Dropout(float(getattr(mdl_cfg, 'DROPOUT', 0.1)) * 0.5),
+                nn.Linear(slot_hidden, 5),  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
+            )
+        else:
+            self.slot_queries = None
+            self.slot_attn = None
+            self.slot_ln = None
+            self.slot_fusion = None
+            self.slot_heads_ln = None
+            self.slot_head = None
+
         # --- covariance factors (angle & range) ---
         # NOTE: When USE_STRUCTURED_R=True, these are unused (R is built from aux predictions).
         # We keep them for backward compatibility but can optionally skip them.
@@ -363,47 +400,11 @@ class HybridModel(nn.Module):
         self.soft_argmax = SoftArgmax2D(phi_grid, theta_grid, tau=getattr(mdl_cfg, 'SOFTMAX_TAU', 0.15))
         self._G = G  # Store for forward pass
 
-        # --- auxiliary φ/θ/r (r via Softplus; loss uses log-range) ---
-        # CRITICAL FIX (2026-02-02): The aux heads need REAL CAPACITY!
-        # When we removed cov_fact_angle/range (2.6M params) for structural R, the aux heads
-        # became the ONLY path to geometry prediction. But single linear layers (~10K params)
-        # cannot learn the complex features → geometry mapping.
-        # 
-        # Old (broken): Linear(D → 2K) = 5K params - NO CAPACITY!
-        # New (fixed): MLP with hidden layer = ~131K params per head
-        #
-        # This is still much smaller than the 12M head we had before, but gives the
-        # geometry prediction path real expressive power.
-        aux_hidden = getattr(mdl_cfg, 'AUX_HEAD_HIDDEN_DIM', D // 2)  # default 256
-        
-        self.aux_angles = nn.Sequential(
-            nn.Linear(D, aux_hidden),
-            nn.GELU(),
-            nn.Dropout(mdl_cfg.DROPOUT * 0.5),  # Light dropout for regularization
-            nn.Linear(aux_hidden, 2 * cfg.K_MAX),
-        )
-        self.aux_range = nn.Sequential(
-            nn.Linear(D, aux_hidden),
-            nn.GELU(),
-            nn.Dropout(mdl_cfg.DROPOUT * 0.5),
-            nn.Linear(aux_hidden, cfg.K_MAX),
-            nn.Softplus(),
-        )
-        
-        # --- STRUCTURAL FIX: aux_power for per-source power prediction ---
-        # This replaces the free-form covariance factors with geometry-aware construction.
-        # Power represents "effective received power" (path loss + transmit power combined).
-        # Using Softplus to ensure positive power values.
-        if self.use_structured_R:
-            self.aux_power = nn.Sequential(
-                nn.Linear(D, aux_hidden),
-                nn.GELU(),
-                nn.Dropout(mdl_cfg.DROPOUT * 0.5),
-                nn.Linear(aux_hidden, cfg.K_MAX),
-                nn.Softplus(),  # Ensure positive
-            )
-        else:
-            self.aux_power = None
+        # Legacy aux heads are kept ONLY for backward-compatibility / ablations.
+        # In the recommended structural-R path, we use the slot head instead.
+        self.aux_angles = None
+        self.aux_range = None
+        self.aux_power = None
 
     def set_dropout(self, p):
         """Update dropout probability for annealing"""
@@ -537,7 +538,8 @@ class HybridModel(nn.Module):
         tok = torch.cat([y_tok, c_tok], dim=1)                            # [B, D, L]
         tok = F.gelu(self.joint_tok_proj(tok))                            # [B, D, L]
         tok = tok.permute(0, 2, 1)                                        # [B, L, D]
-        x = self.transformer(tok).mean(1)                                 # [B, D]
+        tok_out = self.transformer(tok)                                   # [B, L, D]
+        x = tok_out.mean(1)                                               # [B, D] global token pool (still used for soft-argmax)
 
         # --- H_full features ---
         # The full channel matrix [M, N] provides the actual sensing operator.
@@ -606,29 +608,11 @@ class HybridModel(nn.Module):
             feats_enhanced = F.gelu(self.fusion_with_antidiag(torch.cat([feats, antidiag_feat], dim=1)))  # [B, D]
         elif self.use_antidiag and self.use_structured_R:
             # IMPORTANT (2026-02-02):
-            # In structural-R mode, AntiDiagPool creates a feedback loop:
-            #   feats -> aux (random early) -> R_learned -> antidiag_feat -> feats_enhanced -> aux
-            # This can stall learning (aux RMSE flat) because early random aux yields garbage
-            # covariance features that pollute the backbone representation.
-            #
-            # Default: DISABLE antidiag features in structured-R mode unless explicitly enabled.
-            if bool(getattr(mdl_cfg, "USE_ANTIDIAG_POOL_STRUCTURED", False)):
-                aux_angles_tmp = self.aux_angles(self.heads_ln(feats))  # [B, 2K]
-                aux_range_raw_tmp = self.aux_range(self.heads_ln(feats))  # [B, K]
-                aux_power_tmp = self.aux_power(self.heads_ln(feats))    # [B, K]
-                PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))
-                THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))
-                R_MIN = 1.0
-                R_SCALE = 3.0
-                aux_phi_tmp = torch.tanh(aux_angles_tmp[:, :cfg.K_MAX]) * PHI_SCALE
-                aux_theta_tmp = torch.tanh(aux_angles_tmp[:, cfg.K_MAX:]) * THETA_SCALE
-                aux_range_tmp = R_MIN + R_SCALE * aux_range_raw_tmp
-                R_learned = build_structured_R(aux_phi_tmp, aux_theta_tmp, aux_range_tmp, aux_power_tmp, cfg)
-                R_whitened = self._whiten_covariance(R_learned)
-                antidiag_feat = self.antidiag_pool(R_whitened)
-                feats_enhanced = F.gelu(self.fusion_with_antidiag(torch.cat([feats, antidiag_feat], dim=1)))
-            else:
-                feats_enhanced = feats
+            # In structural-R mode with slot head, AntiDiagPool is DISABLED by default because:
+            #   1. Legacy aux heads (aux_angles etc.) are removed when USE_SLOT_HEAD=True
+            #   2. Using early slot outputs would create a feedback loop that stalls learning
+            # We skip this entirely for simplicity and stability.
+            feats_enhanced = feats
         else:
             feats_enhanced = feats  # Use original features when AntiDiagPool is disabled
 
@@ -662,52 +646,72 @@ class HybridModel(nn.Module):
             phi_soft = torch.stack(phi_list, dim=1)  # [B, K]
             theta_soft = torch.stack(theta_list, dim=1)  # [B, K]
 
-        # --- auxiliary ptr (angles + positive range) with enhanced features ---
-        aux_angles_raw = self.aux_angles(feats_final)                      # [B, 2K] raw
-        
-        # CRITICAL: Scale angle outputs to expected range using tanh
-        # This prevents huge errors that saturate Huber loss and give constant gradients
-        # GT phi ≈ ±30° (0.52 rad), theta ≈ ±15° (0.26 rad)
-        aux_phi_raw = aux_angles_raw[:, :cfg.K_MAX]      # [B, K]
-        aux_theta_raw = aux_angles_raw[:, cfg.K_MAX:]    # [B, K]
-        
-        # Bound to expected ranges (match config FOV).
-        # CRITICAL: if these are narrower than the dataset label distribution, the model cannot fit.
-        PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))      # default ±60°
-        THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))  # default ±30°
-        aux_phi = torch.tanh(aux_phi_raw) * PHI_SCALE          # [B, K] bounded
-        aux_theta = torch.tanh(aux_theta_raw) * THETA_SCALE    # [B, K] bounded
-        
-        # Recombine for aux_ptr (used by loss)
-        aux_angles = torch.cat([aux_phi, aux_theta], dim=1)  # [B, 2K]
-        aux_range_raw = self.aux_range(feats_final)           # [B, K] (positive from Softplus, ~0.5-1.5)
-        # Scale range to match GT: Softplus gives ~0.7 at zero input
-        # GT range is 1-5m, so we want predictions to start around 2-3m
-        # Use: 1.0 + 3.0 * normalized_value
-        R_MIN, R_SCALE = 1.0, 3.0
-        aux_range = R_MIN + R_SCALE * aux_range_raw           # [B, K] in ~1-5m range
-        aux_ptr    = torch.cat([aux_angles, aux_range], dim=1)  # [B, 3K]
+        # ------------------------------------------------------------
+        # Slot head: per-source (phi, theta, r, power, mask) prediction
+        # ------------------------------------------------------------
+        if self.use_slot_head and self.slot_attn is not None:
+            Kmax = int(getattr(cfg, "K_MAX", 5))
+            q = self.slot_queries.unsqueeze(0).expand(B, Kmax, -1)  # [B,K,D]
+            slot, _ = self.slot_attn(q, tok_out, tok_out, need_weights=False)  # [B,K,D]
+            slot = self.slot_ln(slot + q)
+
+            # Fuse global H_full + snr conditioning per slot
+            H_b = H_feat.unsqueeze(1).expand(B, Kmax, -1)      # [B,K,D/2]
+            snr_b = snr_feat.unsqueeze(1).expand(B, Kmax, -1)  # [B,K,snr_dim]
+            slot = F.gelu(self.slot_fusion(torch.cat([slot, H_b, snr_b], dim=-1)))  # [B,K,D]
+            slot = self.slot_heads_ln(slot)
+
+            out = self.slot_head(slot)  # [B,K,5]
+            phi_raw = out[..., 0]
+            theta_raw = out[..., 1]
+            r_raw = out[..., 2]
+            p_raw = out[..., 3]
+            mask_logit = out[..., 4]
+
+            PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))      # ±60°
+            THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))  # ±30°
+            aux_phi = torch.tanh(phi_raw) * PHI_SCALE
+            aux_theta = torch.tanh(theta_raw) * THETA_SCALE
+
+            # Range: positive + scaled to training regime
+            R_MIN = float(getattr(cfg, "RANGE_R", (0.5, 10.0))[0])
+            R_MAX = float(getattr(cfg, "RANGE_R", (0.5, 10.0))[1])
+            # Map softplus output into [R_MIN, R_MAX] with a simple affine scale.
+            # (Keep it smooth/monotone and avoid hard clipping in the forward path.)
+            r_pos = F.softplus(r_raw)
+            r_norm = r_pos / (1.0 + r_pos)  # (0,1)
+            aux_r = R_MIN + (R_MAX - R_MIN) * r_norm
+
+            aux_power = F.softplus(p_raw)
+            aux_mask_logit = mask_logit
+            aux_mask = torch.sigmoid(aux_mask_logit)  # [B,K] in (0,1)
+
+            # Pack aux ptr for loss (matches existing convention: [phi(K), theta(K), r(K)])
+            aux_ptr = torch.cat([aux_phi, aux_theta, aux_r], dim=1)  # [B, 3K]
+        else:
+            raise RuntimeError("USE_SLOT_HEAD is disabled but legacy aux heads were removed. Set mdl_cfg.USE_SLOT_HEAD=True.")
 
         # NOTE: K-head removed - using MVDR peak detection instead (K-free localization)
         # The number of sources is determined by peak detection on MVDR spectrum
 
         # --- STRUCTURAL FIX: Build R from aux predictions (not free factors) ---
         if self.use_structured_R:
-            # aux_phi and aux_theta are already bounded from tanh above
-            # aux_range is already scaled to 1-5m range above
-            aux_r = aux_range                              # [B, K] meters (scaled)
-            aux_power_out = self.aux_power(feats_final)    # [B, K] (positive from Softplus)
+            # Presence/mask head: gate powers so unused slots do not create phantom sources.
+            power_eff = aux_power * aux_mask
             
-            # Build structured covariance: R = sum_k p_k * a_k @ a_k^H + sigma2 * I
-            R_pred = build_structured_R(aux_phi, aux_theta, aux_r, aux_power_out, cfg)
-            
+            # Build structured covariance: R = sum_k power_k * a_k @ a_k^H + sigma2 * I
+            R_pred = build_structured_R(aux_phi, aux_theta, aux_r, power_eff, cfg)
+
             # Return with R_pred (no legacy factors - saves 2.6M params)
             return {
                 "R_pred": R_pred,          # Structured covariance [B, N, N] complex
                 "phi_theta_r":    aux_ptr,
                 "phi_soft":       phi_soft,
                 "theta_soft":     theta_soft,
-                "aux_power":      aux_power_out,  # Per-source power [B, K]
+                "aux_power":      aux_power,      # Raw per-slot power (pre-mask) [B,K]
+                "aux_mask":       aux_mask,       # Presence probability [B,K]
+                "aux_mask_logit": aux_mask_logit, # Presence logits [B,K] (for stable mask losses)
+                "aux_power_eff":  power_eff,      # Gated power used in R [B,K]
             }
         else:
             # Legacy path: use free-form covariance factors

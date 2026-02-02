@@ -318,9 +318,15 @@ class Trainer:
         # NOTE: K-head components removed - using MVDR peak detection instead
         # Include all prediction heads for higher LR (structural R needs aux_power too)
         HEAD_KEYS = (
-            'head', 'classifier', 'aux_angles', 'aux_range', 'aux_power',
-            'cov_fact_angle', 'cov_fact_range', 'logits_gg',
-            'phi_logits', 'theta_logits'  # Factored soft-argmax heads
+            'head', 'classifier',
+            # structural-R / slot head modules
+            'slot_', 'slot_head', 'slot_attn', 'slot_queries', 'slot_fusion', 'slot_ln', 'slot_heads_ln',
+            # legacy aux heads (kept for ablations)
+            'aux_angles', 'aux_range', 'aux_power',
+            # legacy factor heads (non-structural)
+            'cov_fact_angle', 'cov_fact_range',
+            # soft-argmax heads
+            'logits_gg', 'phi_logits', 'theta_logits',
         )
         
         if self.train_refiner_only:
@@ -1315,9 +1321,11 @@ class Trainer:
                 # NOTE: K-head removed - using MVDR peak detection instead
                 # Include all prediction heads for higher LR (structural R needs aux_power too)
                 HEAD_KEYS = (
-                    'head', 'classifier', 'aux_angles', 'aux_range', 'aux_power',
-                    'cov_fact_angle', 'cov_fact_range', 'logits_gg',
-                    'phi_logits', 'theta_logits'  # Factored soft-argmax heads
+                    'head', 'classifier',
+                    'slot_', 'slot_head', 'slot_attn', 'slot_queries', 'slot_fusion', 'slot_ln', 'slot_heads_ln',
+                    'aux_angles', 'aux_range', 'aux_power',
+                    'cov_fact_angle', 'cov_fact_range',
+                    'logits_gg', 'phi_logits', 'theta_logits',
                 )
                 
                 def _group_grad_norm(params):

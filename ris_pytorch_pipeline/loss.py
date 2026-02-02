@@ -841,6 +841,33 @@ class UltimateHybridLoss(nn.Module):
             Rc = y_pred['R_blend'] if 'R_blend' in y_pred else R_hat
             loss_align = self._subspace_align(Rc, phi_p, theta_p, r_p, K_true)
 
+        # ------------------------------------------------------------
+        # Presence / mask supervision (permutation-safe)
+        # ------------------------------------------------------------
+        # We avoid slot-index BCE targets (slots are unordered). Instead:
+        #  - enforce that the *count* of active slots matches K_true
+        #  - optionally encourage binarization (push probabilities toward {0,1})
+        loss_mask = torch.tensor(0.0, device=device)
+        lam_mask = float(getattr(mdl_cfg, "LAM_AUX_MASK", 0.0))
+        lam_mask_bin = float(getattr(mdl_cfg, "LAM_AUX_MASK_BIN", 0.0))
+        if lam_mask > 0.0 and ("aux_mask" in y_pred or "aux_mask_logit" in y_pred):
+            if "aux_mask" in y_pred:
+                m = y_pred["aux_mask"].to(device).float()
+            else:
+                m = torch.sigmoid(y_pred["aux_mask_logit"].to(device).float())
+            # Clamp for safety; keep gradients (avoid hard 0/1 due to numerical extremes)
+            m = m.clamp(min=1e-4, max=1.0 - 1e-4)
+            kf = K_true.to(device).float()
+            # Count loss: encourage sum(m) ≈ K_true (normalized by K_MAX for scale stability)
+            count_err = (m.sum(dim=1) - kf) / float(max(1, int(getattr(cfg, "K_MAX", 5))))
+            loss_mask = (count_err ** 2).mean()
+            if lam_mask_bin > 0.0:
+                # Binarization penalty: minimized at 0 or 1, maximized at 0.5
+                loss_mask = loss_mask + lam_mask_bin * (m * (1.0 - m)).mean()
+            if not hasattr(self, "_mask_loss_logged"):
+                print(f"[LOSS DEBUG] Mask count loss: enabled @ weight={lam_mask} (bin={lam_mask_bin})", flush=True)
+                self._mask_loss_logged = True
+
         # Training-inference alignment losses
         loss_subspace_align = 0.0
         loss_peak_contrast = 0.0
@@ -921,6 +948,7 @@ class UltimateHybridLoss(nn.Module):
             + self.lam_subspace_align * loss_subspace_align  # Subspace alignment loss
             + self.lam_peak_contrast * loss_peak_contrast     # Peak contrast loss
             + self.lam_heatmap * loss_heatmap                 # SpectrumRefiner supervision
+            + lam_mask * loss_mask                             # Slot presence/mask supervision
         )
         
         # Log loss breakdown (once per run)
