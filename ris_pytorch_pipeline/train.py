@@ -563,14 +563,11 @@ class Trainer:
         # Eigengap/margin disabled globally (ignore any config values).
         self.loss_fn.lam_gap = 0.0
         self.loss_fn.lam_margin = 0.0
-        
-        # CRITICAL WARNING: lam_cov > 0 with structural R causes gradient conflict!
-        use_structured_R = getattr(mdl_cfg, 'USE_STRUCTURED_R', True)
-        if use_structured_R and self.loss_fn.lam_cov > 0.0:
-            print(f"⚠️  WARNING: lam_cov={self.loss_fn.lam_cov:.3f} with USE_STRUCTURED_R=True!")
-            print(f"⚠️  This causes gradient conflict (R_true has path loss, R_pred doesn't).")
-            print(f"⚠️  Recommend setting lam_cov=0.0 for structural R training.")
-        
+
+        # Store phase targets for optional schedules (e.g., structural-R lam_cov warmup).
+        self._phase_lam_cov_target = float(getattr(self.loss_fn, "lam_cov", 0.0))
+        self._phase_lam_aux_target = float(getattr(self.loss_fn, "lam_aux", 0.0))
+
         print(f"🎯 Applied phase '{phase}' loss weights: "
               f"lam_cov={self.loss_fn.lam_cov:.3f}, "
               f"lam_subspace_align={self.loss_fn.lam_subspace_align:.3f}, "
@@ -2727,6 +2724,25 @@ class Trainer:
 
         print(f"[Training] Starting {epochs} epochs at ep={start_ep+1} (train batches={len(tr_loader)}, val batches={len(va_loader)})...", flush=True)
         for ep in range(start_ep, epochs):
+            # ----------------------------
+            # Structural-R stability schedule: warm up covariance loss
+            # ----------------------------
+            # cov_nmse is useful for MVDR readiness, but it can dominate early when geometry is random.
+            # Warm it up so aux learns sensible φ/θ/r first, then cov loss ramps in.
+            use_structured_R = bool(getattr(mdl_cfg, "USE_STRUCTURED_R", True))
+            phase_name = str(getattr(cfg, "TRAIN_PHASE", "geom")).lower()
+            if use_structured_R and phase_name == "joint":
+                warm = int(getattr(mdl_cfg, "STRUCTURED_COV_WARMUP_EPOCHS", 5))
+                warm = max(0, warm)
+                target = float(getattr(self, "_phase_lam_cov_target", float(getattr(self.loss_fn, "lam_cov", 0.0))))
+                if warm > 0:
+                    frac = min(1.0, float(ep + 1) / float(warm))
+                    self.loss_fn.lam_cov = target * frac
+                    if ep == start_ep:
+                        print(f"[Loss Schedule] STRUCTURED_R: warmup lam_cov 0→{target:.3f} over {warm} epochs", flush=True)
+                    if (ep + 1) in (1, warm):
+                        print(f"[Loss Schedule] STRUCTURED_R: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
+
             # 3-phase schedule (if enabled)
             if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', True):
                 phase = 0 if ep < max(1, epochs // 3) else (1 if ep < max(2, 2 * epochs // 3) else 2)

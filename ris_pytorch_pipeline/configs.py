@@ -413,21 +413,15 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                # STRUCTURAL FIX (2026-02-01): CRITICAL - cov_nmse DISABLED for structural R!
-                # 
-                # ROOT CAUSE OF FLAT AUX RMSE:
-                # - R_true (in shards) has PATH LOSS baked into steering vectors: A0 ∝ 1/r²
-                # - R_pred (structural) uses UNIT-NORMALIZED steering vectors (no path loss)
-                # - Even with PERFECT geometry, R_pred ≠ R_true due to magnitude mismatch
-                # - cov_nmse tries to minimize this irreducible gap by pushing aux_power
-                # - This creates CONFLICTING gradients with aux_l2, stalling learning
-                #
-                # FIX: Disable cov_nmse, rely ONLY on aux_l2 for geometry learning.
-                # Once geometry is good, R_pred subspace will be correct by construction.
-                "lam_cov": 0.0,              # DISABLED: physics mismatch with structural R
-                "lam_subspace_align": 0.0,   # DISABLED: redundant with structural R
-                "lam_aux": 2.0,              # PRIMARY: ONLY loss for geometry (increased weight)
-                "lam_peak_contrast": 0.0,    # DISABLED: redundant with structural R
+                # STRUCTURAL R (2026-02-02): Use BOTH aux + cov, but with a warmup schedule.
+                # R_true uses nearfield_vec()/sqrt(N) and path-loss is a per-source scalar,
+                # so it can be absorbed into aux_power (effective received power). Therefore
+                # cov_nmse is compatible, but it can be too dominant early when geometry is random.
+                # We warm up lam_cov in train.py for stability.
+                "lam_cov": 0.3,              # Target (will be warmed up for structural R)
+                "lam_subspace_align": 0.0,   # keep off unless explicitly enabled later
+                "lam_aux": 1.5,              # primary driver for geometry
+                "lam_peak_contrast": 0.0,    # off for now
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
             "refiner": {
@@ -458,6 +452,10 @@ class ModelConfig:
     USE_3_PHASE_CURRICULUM = False
 
     # geometry helpers if needed
+
+    # --- Structural-R training stability ---
+    # Warm up covariance loss so aux geometry learns first; then cov_nmse ramps in to improve MVDR readiness.
+    STRUCTURED_COV_WARMUP_EPOCHS = 5
     DH, DV = 3, 3
 
     def __init__(self):
