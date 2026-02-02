@@ -345,6 +345,23 @@ class HybridModel(nn.Module):
                 nn.Dropout(float(getattr(mdl_cfg, 'DROPOUT', 0.1)) * 0.5),
                 nn.Linear(slot_hidden, 5),  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
             )
+            # ------------------------------------------------------------
+            # Initialization: make early structured-R stable
+            # ------------------------------------------------------------
+            # At init, predicting K_max equally-active sources (mask~0.5, power~0.7) creates a
+            # noisy rank-K_max covariance that can hurt early learning. We bias the slot head
+            # to start with *sparse* masks and low effective power, and let the mask-count loss
+            # + aux loss open up the needed slots.
+            try:
+                last = self.slot_head[-1]
+                if isinstance(last, nn.Linear) and last.bias is not None and last.bias.numel() == 5:
+                    with torch.no_grad():
+                        # power bias (p_raw): softplus(-2) ~ 0.13  (low)
+                        last.bias[3].fill_(-2.0)
+                        # mask bias (mask_logit): sigmoid(-2) ~ 0.12 (sparse)
+                        last.bias[4].fill_(-2.0)
+            except Exception:
+                pass
         else:
             self.slot_queries = None
             self.slot_attn = None
