@@ -1195,16 +1195,25 @@ class Trainer:
                 
                 # Unit-test the gradient path from R_blend to any head parameter
                 try:
-                    # Structural R mode: gradients flow through aux heads (aux_angles/aux_range/aux_power)
+                    # Structural R mode (slot head): gradients flow through slot_* parameters.
+                    # Legacy (non-slot): gradients flow through aux_* heads.
                     any_head = next(
                         p for n, p in self.model.named_parameters()
-                        if (("aux_angles" in n) or ("aux_range" in n) or ("aux_power" in n)) and p.requires_grad
+                        if (
+                            ("slot_" in n)
+                            or ("slot_head" in n)
+                            or ("slot_attn" in n)
+                            or ("slot_queries" in n)
+                            or ("aux_angles" in n)
+                            or ("aux_range" in n)
+                            or ("aux_power" in n)
+                        ) and p.requires_grad
                     )
                     s = preds_fp32['R_blend'].real.mean()  # cheap scalar depending on R_pred
                     g = torch.autograd.grad(s, any_head, retain_graph=True, allow_unused=True)[0]
-                    print(f"[GRADPATH] d<R_blend>/d(aux_head) = {0.0 if g is None else g.norm().item():.3e}", flush=True)
+                    print(f"[GRADPATH] d<R_blend>/d(head_param) = {0.0 if g is None else g.norm().item():.3e}", flush=True)
                 except StopIteration:
-                    print(f"[GRADPATH] No aux_head parameter found!", flush=True)
+                    print(f"[GRADPATH] No head parameter found for gradpath test (slot_/aux_).", flush=True)
             
             # DEBUG: Check if loss itself is NaN (first batch only)
             if epoch == 1 and bi == 0:
