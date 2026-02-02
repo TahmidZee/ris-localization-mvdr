@@ -444,6 +444,23 @@ def main():
 
         if (n_tr + n_va + n_te) == 0:
             print("  ❌ No .npz shards found. Run pregen first.")
+            # Helpful hint: list any nearby shard dirs so users can see what's available.
+            try:
+                root = Path(".")
+                candidates = sorted([p for p in root.glob("data_shards*") if p.is_dir()])
+                if candidates:
+                    print("  ℹ️  Found these shard directories in repo root:")
+                    for p in candidates[:10]:
+                        # show whether they have any npz
+                        n_any = len(list(p.rglob("*.npz")))
+                        print(f"    - {p}  (npz files: {n_any})")
+                    if len(candidates) > 10:
+                        print(f"    ... and {len(candidates) - 10} more")
+                    print("  ℹ️  If you already have shards in a different folder, either:")
+                    print("    - regenerate with current cfg (recommended), or")
+                    print("    - update cfg.DATA_SHARDS_DIR / cfg.L / cfg.N to match those shards.")
+            except Exception:
+                pass
             raise SystemExit(2)
         print("  ✅ Shards exist")
 
@@ -606,6 +623,28 @@ def main():
             if "phi_theta_r" in out:
                 ptr_out = out["phi_theta_r"][0].numpy()
                 print(f"  phi_theta_r: shape={tuple(out['phi_theta_r'].shape)}")
+
+            # Slot-head self-check (structural-R recommended path)
+            if bool(getattr(mdl_cfg, "USE_SLOT_HEAD", False)):
+                if "aux_mask" not in out:
+                    print("  ❌ USE_SLOT_HEAD=True but aux_mask missing from model output!")
+                    raise SystemExit(5)
+                if "aux_power_eff" not in out:
+                    print("  ❌ USE_SLOT_HEAD=True but aux_power_eff missing from model output!")
+                    raise SystemExit(5)
+                msk = out["aux_mask"].detach().cpu().numpy()
+                pwr = out.get("aux_power", None)
+                pef = out["aux_power_eff"].detach().cpu().numpy()
+                print(f"  aux_mask: min={msk.min():.3f}, max={msk.max():.3f}")
+                print(f"  aux_power_eff: min={pef.min():.3e}, max={pef.max():.3e}")
+                if (msk.min() < -1e-3) or (msk.max() > 1.0 + 1e-3):
+                    print("  ❌ aux_mask out of [0,1] range!")
+                    raise SystemExit(5)
+                if pwr is not None:
+                    pwr_np = pwr.detach().cpu().numpy()
+                    if (pef > (pwr_np + 1e-6)).any():
+                        print("  ⚠️ aux_power_eff > aux_power detected (unexpected); check gating.")
+                print("  ✅ Slot-head outputs look sane")
             
             print("  ✅ Forward pass successful")
             
