@@ -6,6 +6,47 @@ This is a **step-by-step implementation checklist** for upgrading the pipeline f
 
 ---
 
+## CRITICAL FIX #4 APPLIED (2026-02-01): Physics Mismatch - cov_nmse vs aux_l2
+
+### Issue: Gradient Conflict Between Loss Terms
+The **ROOT CAUSE** of flat aux RMSE was a fundamental physics mismatch:
+
+**R_true (generated in shards):**
+```python
+A0 = sqrt(pW * (λ²) / (4πr)²) * nearfield_vec(...)  # PATH LOSS INCLUDED!
+R_true = A0 @ diag(p_src) @ A0^H
+```
+
+**R_pred (structural model):**
+```python
+A = exp(1j * phase) / sqrt(N)  # UNIT-NORMALIZED, NO PATH LOSS!
+R_pred = A @ diag(power) @ A^H + sigma2 * I
+```
+
+**The Problem:**
+- Even with PERFECT geometry (φ, θ, r = GT), R_pred ≠ R_true because steering vector magnitudes differ
+- `cov_nmse` tries to minimize `||R_pred - R_true||` which is **impossible** to make zero
+- `cov_nmse` gradient pushes `aux_power` to compensate for path loss mismatch
+- This CONFLICTS with `aux_l2` gradient which wants correct geometry
+- Result: model is stuck, aux RMSE flat
+
+### Fix Applied in `configs.py`:
+```python
+"joint": {
+    "lam_cov": 0.0,   # DISABLED: physics mismatch with structural R
+    "lam_aux": 2.0,   # PRIMARY: ONLY loss for geometry (increased)
+    ...
+}
+```
+
+### Why This Works:
+- With `lam_cov=0.0`, only `aux_l2` drives training
+- No conflicting gradients → clean learning signal
+- Geometry improves → R_pred subspace is correct by construction
+- At inference, R_pred can still be used for MVDR (subspace matters, not magnitude)
+
+---
+
 ## CRITICAL FIX #3 APPLIED (2026-02-01): Huber Delta Too Small
 
 ### Issue: Loss in Linear Regime (Constant Gradient)
