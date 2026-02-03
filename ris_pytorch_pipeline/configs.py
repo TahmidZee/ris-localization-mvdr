@@ -548,6 +548,13 @@ class ModelConfig:
         # on the structured covariance target.
         self.GEOM_ONLY_EPOCHS = 5
 
+        # Aux permutation matching stability:
+        # Hard argmin assignment can "flip" early, producing a non-smooth loss surface and
+        # making optimization look stalled (or spiky) even when gradients exist.
+        # Use a softmin over all permutations for a few warmup epochs, then switch to hard.
+        self.AUX_MATCH_SOFT_EPOCHS = 8     # soft matching for first N epochs
+        self.AUX_MATCH_SOFT_TAU = 0.25     # softmin temperature (in radians-ish units)
+
         # Presence/mask supervision
         # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
         # The permutation matching for mask BCE depends on geometry predictions being reasonable.

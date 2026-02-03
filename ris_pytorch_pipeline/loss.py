@@ -41,7 +41,8 @@ def _range_huber_loss(pred_r, gt_r, delta=0.2):
     return torch.where(e < delta, 0.5 * (e ** 2) / delta, e - 0.5 * delta)
 
 def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *,
-                             delta_ang=0.175, delta_logr=0.5, mask_p=None):
+                             delta_ang=0.175, delta_logr=0.5, mask_p=None,
+                             soft: bool = False, soft_tau: float = 0.25):
     """
     Permutation-invariant aux loss for unordered multi-source scenes.
     Matches predicted slots (size K_MAX) to GT slots (size k<=K_MAX) via brute-force
@@ -71,54 +72,65 @@ def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *
             continue
         perms = perms_by_k[k]  # [P,k]
 
-        # Choose best assignment using detached costs (avoid noisy argmin gradients).
-        with torch.no_grad():
-            # [P,k]
-            pp = phi_p[b].detach()[perms]
-            tp = theta_p[b].detach()[perms]
-            rp = r_p[b].detach()[perms]
-            gt_phi = phi_t[b, :k].detach().view(1, k)
-            gt_th = theta_t[b, :k].detach().view(1, k)
-            gt_r = r_t[b, :k].detach().view(1, k)
+        # Vectorized per-permutation losses/costs.
+        # Shapes:
+        #   pp,tp,rp: [P,k]
+        #   gt_*:     [1,k]
+        pp = phi_p[b][perms]
+        tp = theta_p[b][perms]
+        rp = r_p[b][perms]
+        gt_phi = phi_t[b, :k].view(1, k)
+        gt_th  = theta_t[b, :k].view(1, k)
+        gt_r   = r_t[b, :k].view(1, k)
 
-            dphi = _wrap_angle(pp - gt_phi).abs()
-            dth = _wrap_angle(tp - gt_th).abs()
-            # Wrapped huber in "distance" space (scalar cost for matching)
-            cphi = torch.where(dphi <= delta_ang, 0.5 * (dphi ** 2) / delta_ang, dphi - 0.5 * delta_ang)
-            cth = torch.where(dth <= delta_ang, 0.5 * (dth ** 2) / delta_ang, dth - 0.5 * delta_ang)
+        # Cost for assignment (same structure as loss, but used for weighting/argmin)
+        dphi = _wrap_angle(pp - gt_phi).abs()
+        dth  = _wrap_angle(tp - gt_th).abs()
+        cphi = torch.where(dphi <= delta_ang, 0.5 * (dphi ** 2) / delta_ang, dphi - 0.5 * delta_ang)
+        cth  = torch.where(dth  <= delta_ang, 0.5 * (dth  ** 2) / delta_ang, dth  - 0.5 * delta_ang)
 
-            eps_m = float(getattr(cfg, "RANGE_EPS_M", 1e-3))
-            rp_pos = torch.clamp(rp, min=eps_m)
-            gt_pos = torch.clamp(gt_r, min=eps_m)
-            elog = (torch.log(rp_pos) - torch.log(gt_pos)).abs()
-            cr = torch.where(elog <= delta_logr, 0.5 * (elog ** 2) / delta_logr, elog - 0.5 * delta_logr)
+        eps_m = float(getattr(cfg, "RANGE_EPS_M", 1e-3))
+        rp_pos = torch.clamp(rp, min=eps_m)
+        gt_pos = torch.clamp(gt_r, min=eps_m)
+        elog = (torch.log(rp_pos) - torch.log(gt_pos)).abs()
+        cr = torch.where(elog <= delta_logr, 0.5 * (elog ** 2) / delta_logr, elog - 0.5 * delta_logr)
 
-            cost = (cphi + cth + cr).sum(dim=1)  # [P]
-            best_i = int(torch.argmin(cost).item())
-            best_perm = perms[best_i]  # [k]
+        cost = (cphi + cth + cr).sum(dim=1)  # [P]
 
-        # Compute final per-sample loss with gradients through selected slots
-        pp = phi_p[b, best_perm]
-        tp = theta_p[b, best_perm]
-        rp = r_p[b, best_perm]
-        gt_phi = phi_t[b, :k]
-        gt_th = theta_t[b, :k]
-        gt_r = r_t[b, :k]
+        # True loss per permutation (with wrapped huber + range huber)
+        phi_h = _wrapped_huber_loss(pp, gt_phi, delta=delta_ang).mean(dim=1)  # [P]
+        th_h  = _wrapped_huber_loss(tp, gt_th,  delta=delta_ang).mean(dim=1)  # [P]
+        th_h  = th_h * float(getattr(mdl_cfg, "THETA_LOSS_SCALE", 1.0))
+        r_h   = _range_huber_loss(rp, gt_r.expand_as(rp), delta=delta_logr).mean(dim=1)  # [P]
+        loss_perm = phi_h + th_h + r_h  # [P]
 
-        phi_huber = _wrapped_huber_loss(pp, gt_phi, delta=delta_ang).mean()
-        theta_huber = _wrapped_huber_loss(tp, gt_th, delta=delta_ang).mean()
-        theta_huber = theta_huber * float(getattr(mdl_cfg, "THETA_LOSS_SCALE", 1.0))
-        rng_huber = _range_huber_loss(rp, gt_r, delta=delta_logr).mean()
-        losses.append(phi_huber + theta_huber + rng_huber)
-
-        # ======== PERMUTATION-AWARE MASK BCE ========
-        # Matched slots (best_perm indices) should have mask=1, others should have mask=0
-        if mask_p is not None:
-            mask_target = torch.zeros(Kmax, device=device)
-            mask_target[best_perm] = 1.0
-            m = mask_p[b].clamp(min=1e-6, max=1.0 - 1e-6)  # for numerical stability in BCE
-            bce = -(mask_target * torch.log(m) + (1.0 - mask_target) * torch.log(1.0 - m))
-            mask_bce_losses.append(bce.mean())
+        if soft:
+            # Softmin weighting for smooth optimization early (reduces assignment flips).
+            tau = float(max(1e-6, soft_tau))
+            w = torch.softmax(-cost / tau, dim=0)  # [P]
+            losses.append((w * loss_perm).sum())
+            # For mask BCE, keep hard assignment semantics (only used when masks are enabled later).
+            if mask_p is not None:
+                best_i = int(torch.argmin(cost.detach()).item())
+                best_perm = perms[best_i]
+                mask_target = torch.zeros(Kmax, device=device)
+                mask_target[best_perm] = 1.0
+                m = mask_p[b].clamp(min=1e-6, max=1.0 - 1e-6)
+                bce = -(mask_target * torch.log(m) + (1.0 - mask_target) * torch.log(1.0 - m))
+                mask_bce_losses.append(bce.mean())
+        else:
+            # Hard assignment (argmin) used once geometry is stable.
+            with torch.no_grad():
+                best_i = int(torch.argmin(cost).item())
+                best_perm = perms[best_i]
+            # Selected permutation loss
+            losses.append(loss_perm[best_i])
+            if mask_p is not None:
+                mask_target = torch.zeros(Kmax, device=device)
+                mask_target[best_perm] = 1.0
+                m = mask_p[b].clamp(min=1e-6, max=1.0 - 1e-6)
+                bce = -(mask_target * torch.log(m) + (1.0 - mask_target) * torch.log(1.0 - m))
+                mask_bce_losses.append(bce.mean())
 
     if not losses:
         zero = torch.tensor(0.0, device=device)
@@ -237,10 +249,20 @@ class UltimateHybridLoss(nn.Module):
         # Mask loss warmup: scale all mask losses by this factor (0.0 to disable, 1.0 for full)
         # Set by Trainer based on epoch and MASK_LOSS_WARMUP_EPOCHS
         self.mask_loss_scale = 0.0  # Start disabled
+
+        # Aux matching mode (perm-invariant geometry loss):
+        # Use soft matching early to avoid assignment flips, then switch to hard.
+        self.aux_match_soft = False
+        self.aux_match_tau = 0.25
     
     def set_mask_loss_scale(self, scale: float):
         """Set the mask loss scale (0.0 = disabled, 1.0 = full weight)"""
         self.mask_loss_scale = float(max(0.0, min(1.0, scale)))
+
+    def set_aux_match(self, soft: bool, tau: float = 0.25):
+        """Configure permutation matching for aux geometry loss."""
+        self.aux_match_soft = bool(soft)
+        self.aux_match_tau = float(max(1e-6, tau))
 
     # -------- helpers --------
 
@@ -876,13 +898,24 @@ class UltimateHybridLoss(nn.Module):
             
             if mask_for_perm is not None:
                 aux_l2, loss_mask_bce = _perm_invariant_aux_loss(
-                    phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, mask_p=mask_for_perm
+                    phi_p, theta_p, r_p,
+                    phi_t, theta_t, r_t,
+                    K_true,
+                    mask_p=mask_for_perm,
+                    soft=bool(getattr(self, "aux_match_soft", False)),
+                    soft_tau=float(getattr(self, "aux_match_tau", 0.25)),
                 )
                 if not hasattr(self, "_mask_bce_logged"):
                     print(f"[LOSS DEBUG] Permutation-aware mask BCE: enabled @ weight={lam_mask_bce}", flush=True)
                     self._mask_bce_logged = True
             else:
-                aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true)
+                aux_l2 = _perm_invariant_aux_loss(
+                    phi_p, theta_p, r_p,
+                    phi_t, theta_t, r_t,
+                    K_true,
+                    soft=bool(getattr(self, "aux_match_soft", False)),
+                    soft_tau=float(getattr(self, "aux_match_tau", 0.25)),
+                )
         else:
             phi_huber = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
             theta_huber = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
