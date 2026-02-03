@@ -679,3 +679,78 @@ python -m ris_pytorch_pipeline.ris_pipeline suite --bench B2 --limit 1000 --no-b
 | `loss.py` | — | maybe R_samp | — |
 | `music_gpu.py` | — | — | Phase B only |
 
+
+---
+
+## CRITICAL FIX #11: Sorted Matching (2026-02-03)
+
+### Root Cause Analysis
+
+**Evidence from Training Logs:**
+- `aux_φ_rmse = 34.55°` (constant across all 15 epochs)
+- `aux_θ_rmse = 17.42°` (constant)
+- `aux_r_rmse = 2.76m` (constant)
+
+These are EXACTLY the expected RMSE values for a **mean predictor**:
+- For φ uniform in ±60°, predicting 0° gives RMSE = 60°/√3 ≈ 34.6°
+- For θ uniform in ±30°, predicting 0° gives RMSE = 30°/√3 ≈ 17.3°
+- For r uniform in [0.5, 10], predicting 5m gives RMSE ≈ 2.7m
+
+**Evidence from Smoke Tests:**
+- `pred phi mean/std = 0.024 rad, 0.076 rad` → All slots predict ~0°
+- `mean |phi[i]-phi[0]| = 0.10 rad` → All 5 slots are nearly identical
+- `pred mask = 0.155 ± 0.005` → All masks identical (~15%)
+- Overfit test: Loss goes 2.2 → 3.8 → 3.1 → 1.7 (non-monotonic, permutation flipping)
+
+### The Problem: Symmetric Fixed Point
+
+The **permutation-invariant aux loss has a stable equilibrium** where all slots predict the dataset mean:
+
+1. When all K slots predict φ ≈ 0:
+   - For any sample, all K! permutations have nearly equal cost
+   - argmin picks one arbitrarily
+   - The gradient pushes all slots toward that sample's GT values
+
+2. Across a batch:
+   - Sample A: GT = [-0.5, 0.0, 0.5] rad → gradients point that way
+   - Sample B: GT = [0.3, 0.4, 0.5] rad → gradients point that way
+   - Batch average: gradients cancel out, slots stay at 0
+
+3. **This is a symmetry-preserving equilibrium** - the loss is minimized in expectation,
+   but no slot specializes.
+
+### The Fix: Sorted Matching
+
+Replace permutation enumeration with **sorting-based deterministic matching**:
+
+```python
+# Sort predictions by phi
+pred_order = torch.argsort(phi_p[b])
+sorted_pp = phi_p[b][pred_order[:k]]
+
+# Sort GT by phi  
+gt_order = torch.argsort(phi_t[b, :k])
+sorted_gt_phi = phi_t[b, :k][gt_order]
+
+# Match by index (no permutation ambiguity)
+loss = huber(sorted_pp, sorted_gt_phi)
+```
+
+**Why this works:**
+- Slot 0 is always assigned to the smallest-phi GT source
+- Slot 1 is always assigned to the second-smallest-phi GT source
+- No permutation ambiguity → deterministic gradients
+- Forces slot specialization → breaks the symmetric equilibrium
+
+### Config
+
+```python
+mdl_cfg.USE_SORTED_MATCHING = True  # Default: enabled
+```
+
+### Verification
+
+After pulling, run a short training and check:
+- `[LOSS] Using SORTED matching (breaks symmetric equilibrium)` appears
+- `aux_φ_rmse` should start decreasing within 2-3 epochs
+
