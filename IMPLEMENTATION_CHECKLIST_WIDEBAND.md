@@ -6,6 +6,30 @@ This is a **step-by-step implementation checklist** for upgrading the pipeline f
 
 ---
 
+## CRITICAL FIX #9 APPLIED (2026-02-02): Mask Loss Warmup
+
+### Problem: Mask losses interfere with geometry learning when geometry is random
+
+When slot-head geometry predictions are stuck near 0° (as at init), the permutation matching for mask BCE becomes **unstable/arbitrary** (all slots are equally far from all GT sources in φ). This causes:
+- Noisy, contradictory gradients across batches
+- Gradients that cancel out on average
+- Geometry learning is blocked
+
+**Symptom**: aux_φ_rmse stuck at exactly ~35° (the expected RMSE for "predict φ=0" under ±60° uniform distribution).
+
+### Fix Applied (commit `9eab497`):
+
+1. **Disable mask losses for first 10 epochs** (`MASK_LOSS_WARMUP_EPOCHS = 10`)
+2. **After warmup, ramp mask losses up over 5 epochs**
+3. **Reduced mask loss weights** to moderate levels:
+   - `LAM_AUX_MASK = 0.3` (was 0.5)
+   - `LAM_AUX_MASK_BIN = 0.1` (was 0.2)
+   - `LAM_AUX_MASK_BCE = 0.2` (was 0.3)
+
+**Logic**: Let the slot head learn geometry first (using only `lam_aux` on permutation-matched Huber losses). Once aux RMSE drops below ~20°, the permutation matching becomes stable, and mask losses can effectively supervise which slots to activate.
+
+---
+
 ## CRITICAL FIX #8 APPLIED (2026-02-02): Cov-Loss Target Alignment
 
 ### Problem: Train/Infer Covariance Preprocessing Mismatch
