@@ -418,10 +418,15 @@ class Trainer:
             self.swa_model = AveragedModel(self.model)
             self.swa_scheduler = None  # Will be initialized when SWA starts
             self.swa_started = False
+            # IMPORTANT: SWA requires BatchNorm statistics to be updated via update_bn()
+            # before evaluation. We track that here and DO NOT swap SWA weights into the
+            # live model for validation until BN has been finalized.
+            self.swa_bn_finalized = False
         else:
             self.swa_model = None
             self.swa_scheduler = None
             self.swa_started = False
+            self.swa_bn_finalized = False
 
         # Scheduler is created in fit() when epochs is known
         self.sched = None
@@ -632,10 +637,12 @@ class Trainer:
             
         print("🔧 Finalizing SWA: updating batch norm statistics...")
         torch.optim.swa_utils.update_bn(dataloader, self.swa_model)
+        self.swa_bn_finalized = True
         
     def _swa_swap_in(self):
         """Swap in SWA model for evaluation"""
-        if not self.use_swa or not self.swa_started:
+        # Never evaluate with SWA weights until BN stats have been updated.
+        if (not self.use_swa) or (not self.swa_started) or (not getattr(self, "swa_bn_finalized", False)):
             return
             
         self._swa_bak = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
@@ -2584,6 +2591,19 @@ class Trainer:
 
         if not use_shards:
             raise RuntimeError("This pipeline requires pregenerated shards.")
+
+        # Guardrail: SWA is not meaningful (and can be actively misleading) for very short runs.
+        # With epochs=5 and SWA_START_FRAC=0.8, SWA begins at epoch 4; BN stats are not finalized,
+        # so swapping SWA weights into validation can explode aux metrics. Disable SWA here.
+        if getattr(self, "use_swa", False) and int(epochs) < 20:
+            print(f"⚠️  [SWA] Disabling SWA for short run (epochs={int(epochs)}). "
+                  f"Enable SWA only for longer runs (>=20) where BN finalization is meaningful.",
+                  flush=True)
+            self.use_swa = False
+            self.swa_started = False
+            self.swa_model = None
+            self.swa_scheduler = None
+            self.swa_bn_finalized = False
         
         # Save reproducibility info
         self._save_run_config(epochs, n_train, n_val, grad_accumulation, early_stop_patience)
@@ -2842,16 +2862,12 @@ class Trainer:
             # Log per-term debug info every 3 epochs or last epoch
             return_debug = (ep % 3 == 0) or (ep == epochs - 1)
             
-            if self.swa_started:
-                # Use SWA model for validation during SWA phase
-                self._swa_swap_in()
-                val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
-                self._swa_swap_out()
-            else:
-                # Use EMA model for validation before SWA
-                self._ema_swap_in()
-                val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
-                self._ema_swap_out()
+            # Validation policy:
+            # - Prefer EMA (fast, stable) for per-epoch validation.
+            # - SWA is only evaluated after BN stats are finalized (typically end-of-training).
+            self._ema_swap_in()
+            val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
+            self._ema_swap_out()
             
             # Extract val_loss and debug terms
             if isinstance(val_result, tuple):
@@ -2869,14 +2885,9 @@ class Trainer:
                 if (ep + 1) % val_every == 0 or ep == epochs - 1:
                     try:
                         hpo_max_batches = max_val_batches or 20
-                        if self.swa_started:
-                            self._swa_swap_in()
-                            metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
-                            self._swa_swap_out()
-                        else:
-                            self._ema_swap_in()
-                            metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
-                            self._ema_swap_out()
+                        self._ema_swap_in()
+                        metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
+                        self._ema_swap_out()
                         # Surrogate score: higher is better
                         val_score = float(metrics.get("score", 0.0))
                     except Exception as e:
@@ -2889,14 +2900,9 @@ class Trainer:
                 if not skip_music_val and ((ep + 1) % val_every == 0 or ep == epochs - 1):
                     try:
                         hpo_max_batches = max_val_batches or 20
-                        if self.swa_started:
-                            self._swa_swap_in()
-                            metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
-                            self._swa_swap_out()
-                        else:
-                            self._ema_swap_in()
-                            metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
-                            self._ema_swap_out()
+                        self._ema_swap_in()
+                        metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
+                        self._ema_swap_out()
                         # MUSIC score: lower is better
                         phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
                         theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))
