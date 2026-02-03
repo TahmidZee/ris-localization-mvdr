@@ -976,8 +976,8 @@ class Trainer:
         lrs = [g['lr'] for g in self.opt.param_groups]
         print(f"[LR] epoch={epoch} groups={['backbone','head']} lr={lrs}", flush=True)
         if epoch_dbg:
-        print(f"[EPOCH DEBUG] epoch={epoch} iters={iters} len(loader)={len(loader)}", flush=True)
-        print(f"[EPOCH DEBUG] entering for loop over loader...", flush=True)
+            print(f"[EPOCH DEBUG] epoch={epoch} iters={iters} len(loader)={len(loader)}", flush=True)
+            print(f"[EPOCH DEBUG] entering for loop over loader...", flush=True)
             import sys
             sys.stdout.flush()
             sys.stderr.flush()
@@ -1132,52 +1132,21 @@ class Trainer:
                         assert R_pred.shape == (Bn, Nn, Nn), f"R_pred bad shape: {tuple(R_pred.shape)}"
 
                         # Optional hybrid blend if offline R_samp exists (currently typically absent).
-                    if R_samp is not None:
-                        R_samp_c = _ri_to_c(R_samp.to(torch.float32))
-                            R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
-
-                        # Beta schedule
-                            if hasattr(self, "beta_warmup_epochs") and (self.beta_warmup_epochs is not None) and (epoch <= self.beta_warmup_epochs):
-                            beta = self.beta_start + (self.beta_final - self.beta_start) * (epoch / max(1, self.beta_warmup_epochs))
-                        else:
-                            beta = self.beta_final
-
-                        # Optional jitter
-                        if self.model.training and (self.beta_warmup_epochs is None or epoch > self.beta_warmup_epochs):
-                                jitter = (
-                                    getattr(cfg, "BETA_JITTER_HPO", 0.02)
-                                    if hasattr(self, "_hpo_loss_weights") and self._hpo_loss_weights
-                                    else getattr(cfg, "BETA_JITTER_FULL", 0.05)
-                                )
-                            if jitter > 0.0:
-                                beta = float((beta + jitter * (2.0 * torch.rand((), device=R_pred.device) - 1.0)).clamp(0.0, 0.95))
-
+                        # NOTE: Offline R_samp is typically absent in current shards; keep this path simple and safe.
+                        # We still attach R_blend for downstream loss plumbing.
                         if epoch == 1 and bi == 0:
-                            print(f"[Beta] epoch={epoch}, beta={beta:.3f} (offline R_samp)", flush=True)
-
-                            preds_fp32["R_blend"] = build_effective_cov_torch(
-                            R_pred,
-                                snr_db=None,
-                                R_samp=R_samp_c.detach(),
-                            beta=float(beta),
-                            diag_load=False,
-                            apply_shrink=False,
-                                target_trace=float(Nn),
-                        )
-                    else:
-                            if epoch == 1 and bi == 0:
                             print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
-                            preds_fp32["R_blend"] = build_effective_cov_torch(
+                        preds_fp32["R_blend"] = build_effective_cov_torch(
                             R_pred,
                             snr_db=None,
                             R_samp=None,
                             beta=None,
                             diag_load=False,
                             apply_shrink=False,
-                                target_trace=float(Nn),
+                            target_trace=float(Nn),
                         )
-        
-            # Compute loss in FP32
+
+# Compute loss in FP32
             import os, time
             _dbg_timing = (os.environ.get("DEBUG_TIMINGS", "") == "1")
             if _dbg_timing and epoch == 1 and bi == 0:
@@ -1245,7 +1214,7 @@ class Trainer:
                 print("[TIMING] backward: start", flush=True)
             self.scaler.scale(loss).backward()
             if loopcheck_dbg and _should_log_batch(bi):
-            print(f"[LOOP-CHECK] bi={bi} did_backward", flush=True)  # Verify loop fix
+                print(f"[LOOP-CHECK] bi={bi} did_backward", flush=True)  # Verify loop fix
             if _dbg_timing and epoch == 1 and bi == 0:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -1255,7 +1224,7 @@ class Trainer:
             batch_loss_val = float(loss.detach().item()) * grad_accumulation
             running += batch_loss_val
             if _should_log_batch(bi):
-            print(f"[BATCH] ep={epoch} bi={bi} batch_loss={batch_loss_val:.4f} running={running:.4f}", flush=True)
+                print(f"[BATCH] ep={epoch} bi={bi} batch_loss={batch_loss_val:.4f} running={running:.4f}", flush=True)
             
             # Only step optimizer every grad_accumulation steps
             if (bi + 1) % grad_accumulation == 0 or (bi + 1) == iters:
@@ -1276,7 +1245,7 @@ class Trainer:
 
                 if epoch == 1 and bi < 3:
                     if epoch_dbg:
-                    print(f"[AMP] scale={current_scale} found_inf={found_inf_map}", flush=True)
+                        print(f"[AMP] scale={current_scale} found_inf={found_inf_map}", flush=True)
                 
                 train_params = list(self.refiner.parameters()) if (self.train_refiner_only and self.refiner is not None) else list(self.model.parameters())
 
@@ -1375,7 +1344,7 @@ class Trainer:
                 # Expert fix: Log gradient status for ALL batches in first epoch
                 # DEBUG: Print for EVERY batch, not just epoch 1
                 if _should_log_batch(bi):
-                print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow_hint={overflow_hint}", flush=True)
+                    print(f"[GRAD] ep={epoch} batch={bi} ||g||_2={g_total:.3e} ok={ok} overflow_hint={overflow_hint}", flush=True)
                     import sys
                     sys.stdout.flush()
                     sys.stderr.flush()
@@ -1387,7 +1356,7 @@ class Trainer:
                 if not ok:
                     if epoch == 1:
                         if _should_log_batch(bi):
-                        print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
+                            print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
                     self.opt.zero_grad(set_to_none=True)
                     self.scaler.update()  # Still update scaler state
                 else:
@@ -1398,17 +1367,17 @@ class Trainer:
                     scaler_skipped = (scale_after_step < scale_before_step)
                     self.opt.zero_grad(set_to_none=True)
                     if loopcheck_dbg and _should_log_batch(bi):
-                    print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
+                        print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
                     stepped = (not scaler_skipped)
                     
                     # Expert fix: Log when step is actually taken
                     if epoch == 1:
                         if scaler_skipped:
                             if _should_log_batch(bi):
-                            print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
+                                print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
                         else:
                             if _should_log_batch(bi):
-                            print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
+                                print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
                     
                     # Expert fix: Track steps taken (only when optimizer step actually applied)
                     if stepped:
@@ -1416,7 +1385,7 @@ class Trainer:
                     if epoch == 1 and bi < 3:
                         lrs = [g['lr'] for g in self.opt.param_groups]
                         if epoch_dbg:
-                        print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
+                            print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
                     
                     # Expert fix: Parameter drift probe - measure BEFORE EMA update
                     with torch.no_grad():
@@ -1425,7 +1394,7 @@ class Trainer:
                         delta = (vec_now - getattr(self, "_param_vec_prev", vec_now)).norm().item()
                         self._param_vec_prev = vec_now.detach().clone()
                         if _should_log_batch(bi):
-                        print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
+                            print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
                     
                     if stepped:
                         self._ema_update()
@@ -1439,8 +1408,8 @@ class Trainer:
                 del y, H, C, ptr, K, R_in, snr, R_true_c, R_true, labels, loss
 
         if epoch_dbg:
-        # DEBUG: Print how many batches were processed (OUTSIDE for loop)
-        print(f"[EPOCH DEBUG] epoch={epoch} processed {batch_count} batches", flush=True)
+            # DEBUG: Print how many batches were processed (OUTSIDE for loop)
+            print(f"[EPOCH DEBUG] epoch={epoch} processed {batch_count} batches", flush=True)
 
         # Expert fix: Update schedulers only after actual steps
         # NOTE: 'stepped' is only valid for the last batch - scheduler step happens once per epoch
@@ -1453,7 +1422,7 @@ class Trainer:
             torch.cuda.empty_cache()
             
         if epoch_dbg:
-        print(f"[EPOCH DEBUG] epoch={epoch} done, avg_loss={running / max(1, iters):.4f}", flush=True)
+            print(f"[EPOCH DEBUG] epoch={epoch} done, avg_loss={running / max(1, iters):.4f}", flush=True)
         return running / max(1, iters)
 
     @torch.no_grad()
@@ -1821,7 +1790,7 @@ class Trainer:
                                 try:
                                     R_samp_c = _ri_to_c(R_samp.float())
                                     R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
-                            beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
+                                    beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
                                 except Exception:
                                     R_samp_c = None
                                     beta = None
@@ -2895,10 +2864,10 @@ class Trainer:
                 self._apply_curriculum(ep, epochs)
 
             if bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)):
-            print(f"[EPOCH DEBUG] calling _train_one_epoch ep={ep+1}", flush=True)
+                print(f"[EPOCH DEBUG] calling _train_one_epoch ep={ep+1}", flush=True)
             tr_loss = self._train_one_epoch(tr_loader, ep + 1, epochs, max_train_batches, grad_accumulation)
             if bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)):
-            print(f"[EPOCH DEBUG] finished _train_one_epoch ep={ep+1} train_loss={tr_loss}", flush=True)
+                print(f"[EPOCH DEBUG] finished _train_one_epoch ep={ep+1} train_loss={tr_loss}", flush=True)
 
             # validate with best available model (SWA > EMA > regular)
             # Log per-term debug info every 3 epochs or last epoch
@@ -2907,9 +2876,9 @@ class Trainer:
             # Validation policy:
             # - Prefer EMA (fast, stable) for per-epoch validation.
             # - SWA is only evaluated after BN stats are finalized (typically end-of-training).
-                self._ema_swap_in()
-                val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
-                self._ema_swap_out()
+            self._ema_swap_in()
+            val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
+            self._ema_swap_out()
             
             # Extract val_loss and debug terms
             if isinstance(val_result, tuple):
@@ -2927,9 +2896,9 @@ class Trainer:
                 if (ep + 1) % val_every == 0 or ep == epochs - 1:
                     try:
                         hpo_max_batches = max_val_batches or 20
-                            self._ema_swap_in()
-                            metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
-                            self._ema_swap_out()
+                        self._ema_swap_in()
+                        metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
+                        self._ema_swap_out()
                         # Surrogate score: higher is better
                         val_score = float(metrics.get("score", 0.0))
                     except Exception as e:
@@ -2942,9 +2911,9 @@ class Trainer:
                 if not skip_music_val and ((ep + 1) % val_every == 0 or ep == epochs - 1):
                     try:
                         hpo_max_batches = max_val_batches or 20
-                            self._ema_swap_in()
-                            metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
-                            self._ema_swap_out()
+                        self._ema_swap_in()
+                        metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
+                        self._ema_swap_out()
                         # MUSIC score: lower is better
                         phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
                         theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))
