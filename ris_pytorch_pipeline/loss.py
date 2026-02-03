@@ -233,6 +233,14 @@ class UltimateHybridLoss(nn.Module):
         self.lam_heatmap = lam_heatmap
         self.heatmap_sigma_phi = heatmap_sigma_phi
         self.heatmap_sigma_theta = heatmap_sigma_theta
+        
+        # Mask loss warmup: scale all mask losses by this factor (0.0 to disable, 1.0 for full)
+        # Set by Trainer based on epoch and MASK_LOSS_WARMUP_EPOCHS
+        self.mask_loss_scale = 0.0  # Start disabled
+    
+    def set_mask_loss_scale(self, scale: float):
+        """Set the mask loss scale (0.0 = disabled, 1.0 = full weight)"""
+        self.mask_loss_scale = float(max(0.0, min(1.0, scale)))
 
     # -------- helpers --------
 
@@ -853,8 +861,9 @@ class UltimateHybridLoss(nn.Module):
 
         # Aux: wrapped Huber on angles + Huber on log-range
         # Also compute permutation-aware mask BCE if masks are available
+        # Note: lam_mask_bce is also scaled by mask_loss_scale (warmup)
         loss_mask_bce = torch.tensor(0.0, device=device)
-        lam_mask_bce = float(getattr(mdl_cfg, "LAM_AUX_MASK_BCE", 0.0))
+        lam_mask_bce = float(getattr(mdl_cfg, "LAM_AUX_MASK_BCE", 0.0)) * self.mask_loss_scale
         
         if bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
             # Get mask predictions if available (for permutation-aware BCE)
@@ -901,9 +910,14 @@ class UltimateHybridLoss(nn.Module):
         # We avoid slot-index BCE targets (slots are unordered). Instead:
         #  - enforce that the *count* of active slots matches K_true
         #  - optionally encourage binarization (push probabilities toward {0,1})
+        #
+        # CRITICAL: Mask losses are scaled by self.mask_loss_scale (set by Trainer).
+        # During early training, geometry is random, so permutation matching is unstable,
+        # which makes mask gradients noisy and interferes with geometry learning.
+        # We warm up mask losses only after geometry has stabilized.
         loss_mask = torch.tensor(0.0, device=device)
-        lam_mask = float(getattr(mdl_cfg, "LAM_AUX_MASK", 0.0))
-        lam_mask_bin = float(getattr(mdl_cfg, "LAM_AUX_MASK_BIN", 0.0))
+        lam_mask = float(getattr(mdl_cfg, "LAM_AUX_MASK", 0.0)) * self.mask_loss_scale
+        lam_mask_bin = float(getattr(mdl_cfg, "LAM_AUX_MASK_BIN", 0.0)) * self.mask_loss_scale
         if lam_mask > 0.0 and ("aux_mask" in y_pred or "aux_mask_logit" in y_pred):
             if "aux_mask" in y_pred:
                 m = y_pred["aux_mask"].to(device).float()
@@ -919,8 +933,11 @@ class UltimateHybridLoss(nn.Module):
                 # Binarization penalty: minimized at 0 or 1, maximized at 0.5
                 loss_mask = loss_mask + lam_mask_bin * (m * (1.0 - m)).mean()
             if not hasattr(self, "_mask_loss_logged"):
-                print(f"[LOSS DEBUG] Mask count loss: enabled @ weight={lam_mask} (bin={lam_mask_bin})", flush=True)
+                print(f"[LOSS DEBUG] Mask count loss: enabled @ weight={lam_mask:.3f} (bin={lam_mask_bin:.3f}, scale={self.mask_loss_scale:.2f})", flush=True)
                 self._mask_loss_logged = True
+        elif self.mask_loss_scale < 1e-6 and not hasattr(self, "_mask_loss_warmup_logged"):
+            print(f"[LOSS DEBUG] Mask losses: WARMUP (scale={self.mask_loss_scale:.2f}, disabled until geometry stabilizes)", flush=True)
+            self._mask_loss_warmup_logged = True
 
         # Training-inference alignment losses
         loss_subspace_align = 0.0

@@ -2779,6 +2779,27 @@ class Trainer:
                         print(f"[Loss Schedule] STRUCTURED_R: warmup lam_cov 0→{target:.3f} over {warm} epochs", flush=True)
                     if (ep + 1) in (1, warm):
                         print(f"[Loss Schedule] STRUCTURED_R: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
+                
+                # MASK LOSS WARMUP: Disable mask losses until geometry stabilizes.
+                # When geometry is random, permutation matching is unstable, causing
+                # noisy gradients that interfere with geometry learning.
+                mask_warmup = int(getattr(mdl_cfg, "MASK_LOSS_WARMUP_EPOCHS", 10))
+                mask_warmup = max(0, mask_warmup)
+                if mask_warmup > 0:
+                    if ep < mask_warmup:
+                        mask_scale = 0.0  # Completely disabled
+                    else:
+                        # After warmup: ramp up over a few epochs
+                        ramp_epochs = min(5, epochs - mask_warmup)
+                        ramp_frac = min(1.0, float(ep - mask_warmup + 1) / float(max(1, ramp_epochs)))
+                        mask_scale = ramp_frac
+                    self.loss_fn.set_mask_loss_scale(mask_scale)
+                    if ep == start_ep:
+                        print(f"[Loss Schedule] MASK: disabled for first {mask_warmup} epochs (then ramp up)", flush=True)
+                    if ep == mask_warmup:
+                        print(f"[Loss Schedule] MASK: starting warmup at epoch {ep+1}", flush=True)
+                else:
+                    self.loss_fn.set_mask_loss_scale(1.0)  # No warmup, full mask loss
 
             # 3-phase schedule (if enabled)
             if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', True):

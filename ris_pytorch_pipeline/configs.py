@@ -536,13 +536,17 @@ class ModelConfig:
         self.USE_SLOT_HEAD = True
         self.SLOT_HEAD_HIDDEN_DIM = 256  # hidden width for per-slot MLP
 
-        # Presence/mask supervision: STRENGTHENED for early learning
-        # - LAM_AUX_MASK: count-based loss weight (was 0.1, too weak)
-        # - LAM_AUX_MASK_BIN: binarization penalty to push masks toward {0,1}
-        # - LAM_AUX_MASK_BCE: permutation-aware BCE (strongest, added in loss.py)
-        self.LAM_AUX_MASK = 0.5        # 5× stronger count loss
-        self.LAM_AUX_MASK_BIN = 0.2    # Push masks toward 0 or 1
-        self.LAM_AUX_MASK_BCE = 0.3    # NEW: permutation-aware BCE (applied after aux matching)
+        # Presence/mask supervision
+        # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
+        # The permutation matching for mask BCE depends on geometry predictions being reasonable.
+        # If geometry is stuck at ~0°, matching is random → gradients cancel → nothing learns.
+        # 
+        # FIX: Disable mask losses for the first MASK_LOSS_WARMUP_EPOCHS epochs.
+        # After that, ramp them up gradually.
+        self.MASK_LOSS_WARMUP_EPOCHS = 10  # Disable mask losses for first 10 epochs
+        self.LAM_AUX_MASK = 0.3        # Count-based loss (moderate)
+        self.LAM_AUX_MASK_BIN = 0.1    # Binarization penalty
+        self.LAM_AUX_MASK_BCE = 0.2    # Permutation-aware BCE
 
         # Legacy aux MLP capacity knob (unused when USE_SLOT_HEAD=True; kept for ablations)
         self.AUX_HEAD_HIDDEN_DIM = 256
