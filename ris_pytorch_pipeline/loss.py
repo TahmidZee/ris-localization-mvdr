@@ -207,7 +207,7 @@ class UltimateHybridLoss(nn.Module):
         lam_margin: float = 0.0,
         lam_range_factor: float = 0.3,  # weight for range factor in cov computation
         gap_margin: float = 0.03,
-        lam_subspace_align: float = 0.50,  # Primary: subspace alignment
+        lam_subspace_align: float = 0.0,  # Default OFF; trainer/phase sets this explicitly
         lam_peak_contrast: float = 0.0,   # Will be set from config
         lam_heatmap: float = 0.0,   # SpectrumRefiner heatmap supervision
         heatmap_sigma_phi: float = 2.0,   # Gaussian blob sigma (grid cells)

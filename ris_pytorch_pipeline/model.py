@@ -328,7 +328,21 @@ class HybridModel(nn.Module):
         # Mask is used to gate power so unused slots don't create phantom sources.
         self.use_slot_head = bool(getattr(mdl_cfg, "USE_SLOT_HEAD", True))
         if self.use_slot_head:
-            self.slot_queries = nn.Parameter(torch.randn(cfg.K_MAX, D) * 0.02)  # [K,D]
+            # Slot queries: important for symmetry breaking across K slots.
+            # Default init (too small std) can leave slots nearly identical early, which makes
+            # permutation matching unstable and slows geometry learning.
+            Kmax = int(getattr(cfg, "K_MAX", 5))
+            q_std = float(getattr(mdl_cfg, "SLOT_QUERY_INIT_STD", 0.02))
+            q_ortho = bool(getattr(mdl_cfg, "SLOT_QUERY_INIT_ORTHO", True))
+            if q_ortho and (Kmax <= D):
+                # Orthonormal init via QR on a (D x K) matrix, then transpose to (K x D)
+                with torch.no_grad():
+                    q0 = torch.randn(D, Kmax)
+                    Q, _ = torch.linalg.qr(q0, mode="reduced")  # [D,K]
+                    q_init = (Q.transpose(0, 1) * q_std).contiguous()  # [K,D]
+                self.slot_queries = nn.Parameter(q_init)
+            else:
+                self.slot_queries = nn.Parameter(torch.randn(Kmax, D) * q_std)  # [K,D]
             self.slot_attn = nn.MultiheadAttention(
                 embed_dim=D,
                 num_heads=self._choose_heads(D, getattr(mdl_cfg, 'NUM_HEADS', 6)),

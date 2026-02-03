@@ -2779,6 +2779,16 @@ class Trainer:
                         print(f"[Loss Schedule] STRUCTURED_R: warmup lam_cov 0→{target:.3f} over {warm} epochs", flush=True)
                     if (ep + 1) in (1, warm):
                         print(f"[Loss Schedule] STRUCTURED_R: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
+
+                # GEOMETRY-ONLY WARMUP: override lam_cov to 0 for the first few epochs.
+                # Rationale: early structured covariance gradients can pull the model toward
+                # a trivial/average solution before φ/θ/r have meaning. Let aux lock geometry first.
+                geom_only = int(getattr(mdl_cfg, "GEOM_ONLY_EPOCHS", 0))
+                geom_only = max(0, geom_only)
+                if geom_only > 0 and ep < geom_only:
+                    if ep == start_ep:
+                        print(f"[Loss Schedule] GEOM_ONLY: forcing lam_cov=0 for first {geom_only} epochs", flush=True)
+                    self.loss_fn.lam_cov = 0.0
                 
                 # MASK LOSS WARMUP: Disable mask losses until geometry stabilizes.
                 # When geometry is random, permutation matching is unstable, causing

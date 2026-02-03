@@ -536,6 +536,18 @@ class ModelConfig:
         self.USE_SLOT_HEAD = True
         self.SLOT_HEAD_HIDDEN_DIM = 256  # hidden width for per-slot MLP
 
+        # Slot head optimization / stability knobs
+        # - SLOT_QUERY_INIT_STD: larger std helps symmetry breaking across slots early
+        # - SLOT_QUERY_INIT_ORTHO: initialize slot queries as near-orthogonal vectors
+        self.SLOT_QUERY_INIT_STD = 0.20
+        self.SLOT_QUERY_INIT_ORTHO = True
+
+        # Geometry-only warmup (recommended):
+        # For the first GEOM_ONLY_EPOCHS epochs, force lam_cov=0 even in joint mode.
+        # This lets the slot head lock onto φ/θ/r before covariance NMSE starts pulling
+        # on the structured covariance target.
+        self.GEOM_ONLY_EPOCHS = 5
+
         # Presence/mask supervision
         # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
         # The permutation matching for mask BCE depends on geometry predictions being reasonable.
