@@ -30,6 +30,40 @@ When slot-head geometry predictions are stuck near 0° (as at init), the permuta
 
 ---
 
+## CRITICAL FIX #10 APPLIED (2026-02-03): Geometry-Only Warmup + Stronger Slot-Query Initialization
+
+### Problem: aux RMSE can plateau near the “predict zero” baseline (~35°) even when gradients exist
+
+We verified via smoke tests on real shards:
+- Model outputs vary with input (not a “constant-output” collapse)
+- Slot-head parameters receive non-zero gradients from the aux loss
+- The model can overfit a single batch (loss decreases over steps)
+
+Yet in full training logs, `aux_φ_rmse` often plateaus around ~34–36° early. This is consistent with **slow symmetry breaking** across slots + early covariance pressure:
+- All slots start near φ=0°, θ=0°, mid-range
+- Permutation matching is valid, but when slots are nearly identical, learning can drift toward an “average” geometry
+- Even small `lam_cov` early can pull geometry through structured-R before it has meaning
+
+### Fix Applied (commit `2d58627`)
+
+1. **Geometry-only warmup**: for the first `GEOM_ONLY_EPOCHS` epochs, force `lam_cov=0` even in joint mode.
+   - Added `mdl_cfg.GEOM_ONLY_EPOCHS = 5`
+   - Implemented in `train.py` schedule block
+
+2. **Stronger slot query initialization** (better symmetry breaking):
+   - Added `mdl_cfg.SLOT_QUERY_INIT_STD = 0.20`
+   - Added `mdl_cfg.SLOT_QUERY_INIT_ORTHO = True`
+   - Initialize slot queries via QR (near-orthogonal) when `K_MAX <= D`
+
+3. **Safer default for ad-hoc loss construction**:
+   - Set `UltimateHybridLoss` default `lam_subspace_align=0.0` so smoke tests that only set `lam_aux` don’t accidentally enable alignment.
+
+### Expected result
+- Within the first few epochs, `aux_φ_rmse` should begin trending down (not stuck at ~35°)
+- After geometry warmup, covariance NMSE can be warmed in (MVDR alignment) and mask losses can ramp in
+
+---
+
 ## CRITICAL FIX #8 APPLIED (2026-02-02): Cov-Loss Target Alignment
 
 ### Problem: Train/Infer Covariance Preprocessing Mismatch
