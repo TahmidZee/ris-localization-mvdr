@@ -1163,8 +1163,16 @@ class UltimateHybridLoss(nn.Module):
                 phi_p=aux[:,:cfg.K_MAX]; theta_p=aux[:,cfg.K_MAX:2*cfg.K_MAX]; r_p=aux[:,2*cfg.K_MAX:3*cfg.K_MAX]
 
         # Keep debug aux consistent with forward (sorted matching when enabled).
+        # NOTE: debug_terms() must ALWAYS define phi_huber_sum/theta_huber_sum/rng_err_log
+        # because train.py expects them for logging. When using sorted matching we compute
+        # approximate by-index scalars (not used for optimization).
         if bool(getattr(mdl_cfg, "USE_SORTED_MATCHING", True)):
             aux_l2 = _sorted_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true).item()
+            phi_huber_sum = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
+            theta_huber_sum = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
+            theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE
+            r_p_pos = torch.clamp(r_p, min=1e-6); r_t_pos = torch.clamp(r_t, min=1e-6)
+            rng_err_log = (((torch.log(r_p_pos) - torch.log(r_t_pos)) ** 2) * mask).sum() / (mask.sum() + 1e-9)
         elif bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
             aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true).item()
             # Provide rough per-term scalars for logging only (by-index; not used for optimization)
