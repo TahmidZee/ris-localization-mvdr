@@ -558,6 +558,12 @@ class ModelConfig:
         self.AUX_MATCH_SOFT_EPOCHS = 0     # soft matching for first N epochs
         self.AUX_MATCH_SOFT_TAU = 0.25     # softmin temperature (in radians-ish units)
 
+        # CRITICAL FIX (2026-02-03): Use sorted matching instead of permutation-invariant matching.
+        # Permutation-invariant set losses can have a stable symmetric fixed point where all slots
+        # predict the dataset mean. Sorted matching forces slot specialization by sorting both
+        # predictions and GT by phi and matching by index (slot 0=smallest phi, etc.).
+        self.USE_SORTED_MATCHING = True
+
         # Presence/mask supervision
         # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
         # The permutation matching for mask BCE depends on geometry predictions being reasonable.
@@ -629,12 +635,3 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed); torch.cuda.manual_seed_all(seed)
         # CUDNN settings moved to Trainer.__init__ to avoid global conflicts
-
-
-
-        # CRITICAL FIX: Use sorted matching instead of permutation-invariant matching
-        # Permutation-invariant loss has a symmetric fixed point where all slots predict
-        # the dataset mean. Sorted matching forces slot specialization by sorting both
-        # predictions and GT by phi and matching by index.
-        # Slot 0 → smallest phi, Slot 1 → second smallest, etc.
-        self.USE_SORTED_MATCHING = True  # STRONGLY RECOMMENDED
