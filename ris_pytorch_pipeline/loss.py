@@ -896,7 +896,28 @@ class UltimateHybridLoss(nn.Module):
                 else:
                     mask_for_perm = torch.sigmoid(y_pred["aux_mask_logit"].to(device).float())
             
-            if mask_for_perm is not None:
+            # CRITICAL FIX: Use sorted matching to break symmetric equilibrium
+            use_sorted = bool(getattr(mdl_cfg, "USE_SORTED_MATCHING", True))
+            
+            if use_sorted:
+                # Sorted matching: deterministic, forces slot specialization
+                if mask_for_perm is not None:
+                    aux_l2, loss_mask_bce = _sorted_aux_loss(
+                        phi_p, theta_p, r_p,
+                        phi_t, theta_t, r_t,
+                        K_true,
+                        mask_p=mask_for_perm,
+                    )
+                else:
+                    aux_l2 = _sorted_aux_loss(
+                        phi_p, theta_p, r_p,
+                        phi_t, theta_t, r_t,
+                        K_true,
+                    )
+                if not hasattr(self, "_sorted_match_logged"):
+                    print(f"[LOSS] Using SORTED matching (breaks symmetric equilibrium)", flush=True)
+                    self._sorted_match_logged = True
+            elif mask_for_perm is not None:
                 aux_l2, loss_mask_bce = _perm_invariant_aux_loss(
                     phi_p, theta_p, r_p,
                     phi_t, theta_t, r_t,
@@ -1141,8 +1162,10 @@ class UltimateHybridLoss(nn.Module):
                 aux=aux.to(device).float()
                 phi_p=aux[:,:cfg.K_MAX]; theta_p=aux[:,cfg.K_MAX:2*cfg.K_MAX]; r_p=aux[:,2*cfg.K_MAX:3*cfg.K_MAX]
 
-        # Keep debug aux consistent with forward (perm-invariant when enabled).
-        if bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
+        # Keep debug aux consistent with forward (sorted matching when enabled).
+        if bool(getattr(mdl_cfg, "USE_SORTED_MATCHING", True)):
+            aux_l2 = _sorted_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true).item()
+        elif bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
             aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true).item()
             # Provide rough per-term scalars for logging only (by-index; not used for optimization)
             phi_huber_sum = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
@@ -1202,3 +1225,69 @@ class UltimateHybridLoss(nn.Module):
             align=align,              # Subspace alignment
             range=float(rng)          # Range L2 error
         )
+
+# ==============================================================================
+# CRITICAL FIX: Sorted matching to break symmetric equilibrium
+# ==============================================================================
+
+def _sorted_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *,
+                     delta_ang=0.175, delta_logr=0.5, mask_p=None):
+    """
+    Sorted matching: sort both predictions and GT by phi, match by index.
+    This BREAKS the symmetric equilibrium that traps all slots at the mean.
+    
+    Key insight: Permutation-invariant loss has a stable fixed point where all
+    slots predict the dataset mean. Sorting forces slot specialization:
+      - Slot 0 → smallest phi
+      - Slot 1 → second smallest phi
+      - etc.
+    
+    Returns (geom_loss, mask_bce_loss) if mask_p is provided, else just geom_loss.
+    """
+    device = phi_p.device
+    B, Kmax = phi_p.shape
+    losses = []
+    mask_bce_losses = [] if mask_p is not None else None
+    
+    for b in range(B):
+        k = int(K_true[b].item())
+        if not (1 <= k <= Kmax):
+            continue
+        
+        # Sort predictions by phi (deterministic ordering)
+        pred_order = torch.argsort(phi_p[b])  # [Kmax]
+        sorted_pp = phi_p[b][pred_order[:k]]
+        sorted_tp = theta_p[b][pred_order[:k]]
+        sorted_rp = r_p[b][pred_order[:k]]
+        
+        # Sort GT by phi
+        gt_order = torch.argsort(phi_t[b, :k])  # [k]
+        sorted_gt_phi = phi_t[b, :k][gt_order]
+        sorted_gt_th = theta_t[b, :k][gt_order]
+        sorted_gt_r = r_t[b, :k][gt_order]
+        
+        # Direct matching by sorted index (no permutation ambiguity)
+        phi_loss = _wrapped_huber_loss(sorted_pp, sorted_gt_phi, delta=delta_ang).mean()
+        th_loss = _wrapped_huber_loss(sorted_tp, sorted_gt_th, delta=delta_ang).mean()
+        th_loss = th_loss * float(getattr(mdl_cfg, "THETA_LOSS_SCALE", 1.0))
+        r_loss = _range_huber_loss(sorted_rp, sorted_gt_r, delta=delta_logr).mean()
+        
+        losses.append(phi_loss + th_loss + r_loss)
+        
+        # Mask BCE: slots used in matching get target=1, others get target=0
+        if mask_p is not None:
+            mask_target = torch.zeros(Kmax, device=device)
+            mask_target[pred_order[:k]] = 1.0
+            m = mask_p[b].clamp(min=1e-6, max=1.0 - 1e-6)
+            bce = -(mask_target * torch.log(m) + (1.0 - mask_target) * torch.log(1.0 - m))
+            mask_bce_losses.append(bce.mean())
+    
+    if not losses:
+        zero = torch.tensor(0.0, device=device)
+        return (zero, zero) if mask_p is not None else zero
+    
+    geom_loss = torch.stack(losses).mean()
+    if mask_p is not None:
+        mask_bce = torch.stack(mask_bce_losses).mean() if mask_bce_losses else torch.tensor(0.0, device=device)
+        return geom_loss, mask_bce
+    return geom_loss

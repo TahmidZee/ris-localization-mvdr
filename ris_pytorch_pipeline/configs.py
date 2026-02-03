@@ -631,3 +631,10 @@ def set_seed(seed=42):
         # CUDNN settings moved to Trainer.__init__ to avoid global conflicts
 
 
+
+        # CRITICAL FIX: Use sorted matching instead of permutation-invariant matching
+        # Permutation-invariant loss has a symmetric fixed point where all slots predict
+        # the dataset mean. Sorted matching forces slot specialization by sorting both
+        # predictions and GT by phi and matching by index.
+        # Slot 0 → smallest phi, Slot 1 → second smallest, etc.
+        self.USE_SORTED_MATCHING = True  # STRONGLY RECOMMENDED
