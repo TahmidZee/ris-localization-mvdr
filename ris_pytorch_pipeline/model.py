@@ -745,11 +745,16 @@ class HybridModel(nn.Module):
             R_pred = build_structured_R(aux_phi, aux_theta, aux_r, power_eff, cfg)
 
             # Return with R_pred (no legacy factors - saves 2.6M params)
+            # CRITICAL FIX (2026-02-03): Return SLOT HEAD outputs as phi_soft/theta_soft!
+            # Previously we returned soft-argmax outputs, but loss.py uses phi_soft/theta_soft
+            # for aux loss. This disconnected the slot head from gradients, causing training
+            # to stall (aux_φ_rmse stuck at ~35° = dataset mean baseline).
             return {
                 "R_pred": R_pred,          # Structured covariance [B, N, N] complex
                 "phi_theta_r":    aux_ptr,
-                "phi_soft":       phi_soft,
-                "theta_soft":     theta_soft,
+                "phi_soft":       aux_phi,   # SLOT HEAD output (was: soft-argmax)
+                "theta_soft":     aux_theta, # SLOT HEAD output (was: soft-argmax)
+                "r_soft":         aux_r,     # SLOT HEAD output (explicit for completeness)
                 "aux_power":      aux_power,      # Raw per-slot power (pre-mask) [B,K]
                 "aux_mask":       aux_mask,       # Presence probability [B,K]
                 "aux_mask_logit": aux_mask_logit, # Presence logits [B,K] (for stable mask losses)
