@@ -2886,9 +2886,10 @@ class Trainer:
                     f"(EMA eval starts at epoch {ema_warm+1}).",
                     flush=True,
                 )
+            # Always run validation; optionally under EMA weights.
             if use_ema_for_val:
                 self._ema_swap_in()
-                val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
+            val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
             if use_ema_for_val:
                 self._ema_swap_out()
             
