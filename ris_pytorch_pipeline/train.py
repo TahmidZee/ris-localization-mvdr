@@ -1145,8 +1145,8 @@ class Trainer:
                             apply_shrink=False,
                             target_trace=float(Nn),
                         )
-
-# Compute loss in FP32
+        
+            # Compute loss in FP32
             import os, time
             _dbg_timing = (os.environ.get("DEBUG_TIMINGS", "") == "1")
             if _dbg_timing and epoch == 1 and bi == 0:
@@ -1356,7 +1356,7 @@ class Trainer:
                 if not ok:
                     if epoch == 1:
                         if _should_log_batch(bi):
-                            print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
+	                            print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
                     self.opt.zero_grad(set_to_none=True)
                     self.scaler.update()  # Still update scaler state
                 else:
@@ -1367,17 +1367,17 @@ class Trainer:
                     scaler_skipped = (scale_after_step < scale_before_step)
                     self.opt.zero_grad(set_to_none=True)
                     if loopcheck_dbg and _should_log_batch(bi):
-                        print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
+	                        print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
                     stepped = (not scaler_skipped)
                     
                     # Expert fix: Log when step is actually taken
                     if epoch == 1:
                         if scaler_skipped:
                             if _should_log_batch(bi):
-                                print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
+	                                print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
                         else:
                             if _should_log_batch(bi):
-                                print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
+	                                print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
                     
                     # Expert fix: Track steps taken (only when optimizer step actually applied)
                     if stepped:
@@ -1385,7 +1385,7 @@ class Trainer:
                     if epoch == 1 and bi < 3:
                         lrs = [g['lr'] for g in self.opt.param_groups]
                         if epoch_dbg:
-                            print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
+	                            print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
                     
                     # Expert fix: Parameter drift probe - measure BEFORE EMA update
                     with torch.no_grad():
@@ -1394,7 +1394,7 @@ class Trainer:
                         delta = (vec_now - getattr(self, "_param_vec_prev", vec_now)).norm().item()
                         self._param_vec_prev = vec_now.detach().clone()
                         if _should_log_batch(bi):
-                            print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
+	                            print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
                     
                     if stepped:
                         self._ema_update()
@@ -2876,9 +2876,21 @@ class Trainer:
             # Validation policy:
             # - Prefer EMA (fast, stable) for per-epoch validation.
             # - SWA is only evaluated after BN stats are finalized (typically end-of-training).
-            self._ema_swap_in()
-            val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
-            self._ema_swap_out()
+            # EMA can hide early learning (decay=0.999 => EMA ~ init for first few epochs).
+            # Validate on raw weights for the first EMA_EVAL_WARMUP_EPOCHS, then switch to EMA.
+            ema_warm = int(getattr(mdl_cfg, "EMA_EVAL_WARMUP_EPOCHS", 0))
+            use_ema_for_val = bool(self.use_ema) and ((ep + 1) > ema_warm)
+            if bool(self.use_ema) and (not use_ema_for_val) and (ep == 0):
+                print(
+                    f"🧪 [EMA] Validation using RAW weights for first {ema_warm} epoch(s) "
+                    f"(EMA eval starts at epoch {ema_warm+1}).",
+                    flush=True,
+                )
+            if use_ema_for_val:
+                self._ema_swap_in()
+                val_result = self._validate_one_epoch(va_loader, max_val_batches, return_debug=return_debug)
+            if use_ema_for_val:
+                self._ema_swap_out()
             
             # Extract val_loss and debug terms
             if isinstance(val_result, tuple):
@@ -2896,9 +2908,11 @@ class Trainer:
                 if (ep + 1) % val_every == 0 or ep == epochs - 1:
                     try:
                         hpo_max_batches = max_val_batches or 20
-                        self._ema_swap_in()
-                        metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
-                        self._ema_swap_out()
+                        if use_ema_for_val:
+                            self._ema_swap_in()
+                            metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
+                        if use_ema_for_val:
+                            self._ema_swap_out()
                         # Surrogate score: higher is better
                         val_score = float(metrics.get("score", 0.0))
                     except Exception as e:
@@ -2911,9 +2925,11 @@ class Trainer:
                 if not skip_music_val and ((ep + 1) % val_every == 0 or ep == epochs - 1):
                     try:
                         hpo_max_batches = max_val_batches or 20
-                        self._ema_swap_in()
-                        metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
-                        self._ema_swap_out()
+                        if use_ema_for_val:
+                            self._ema_swap_in()
+                            metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
+                        if use_ema_for_val:
+                            self._ema_swap_out()
                         # MUSIC score: lower is better
                         phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
                         theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))

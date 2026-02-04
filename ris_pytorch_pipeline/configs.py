@@ -479,6 +479,12 @@ class ModelConfig:
         self.OPT = "adamw"
         self.WEIGHT_DECAY = 1e-4
         self.SEED = 42
+        
+        # --- EMA validation policy ---
+        # EMA (decay~0.999) is great for final metrics, but in the first few epochs it can
+        # mask real learning because the EMA weights stay extremely close to initialization.
+        # Validate on raw weights for the first N epochs, then switch to EMA for stability.
+        self.EMA_EVAL_WARMUP_EPOCHS = 5
 
         # --- inference / loss knobs ---
         self.PHASE_BITS = 3
