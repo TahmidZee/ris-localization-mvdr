@@ -2911,10 +2911,11 @@ class Trainer:
                         hpo_max_batches = max_val_batches or 20
                         if use_ema_for_val:
                             self._ema_swap_in()
-                            metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
+                        metrics = self._validate_surrogate_epoch(va_loader, hpo_max_batches)
                         if use_ema_for_val:
                             self._ema_swap_out()
                         # Surrogate score: higher is better
+                        metrics = metrics or {}
                         val_score = float(metrics.get("score", 0.0))
                     except Exception as e:
                         print(f"[VAL SURROGATE] Error: {e}", flush=True)
@@ -2928,9 +2929,10 @@ class Trainer:
                         hpo_max_batches = max_val_batches or 20
                         if use_ema_for_val:
                             self._ema_swap_in()
-                            metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
+                        metrics = self._eval_hungarian_metrics(va_loader, hpo_max_batches)
                         if use_ema_for_val:
                             self._ema_swap_out()
+                        metrics = metrics or {}
                         # MUSIC score: lower is better
                         phi_norm = float(getattr(cfg, "VAL_NORM_PHI_DEG", 5.0))
                         theta_norm = float(getattr(cfg, "VAL_NORM_THETA_DEG", 5.0))
