@@ -1241,14 +1241,17 @@ class UltimateHybridLoss(nn.Module):
 def _sorted_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *,
                      delta_ang=0.175, delta_logr=0.5, mask_p=None):
     """
-    Sorted matching: sort both predictions and GT by phi, match by index.
+    Sorted matching: match predictions (by slot index) to sorted GT (by phi).
     This BREAKS the symmetric equilibrium that traps all slots at the mean.
     
-    Key insight: Permutation-invariant loss has a stable fixed point where all
-    slots predict the dataset mean. Sorting forces slot specialization:
-      - Slot 0 → smallest phi
-      - Slot 1 → second smallest phi
+    CRITICAL: We do NOT sort predictions! Sorting predictions causes the
+    matching to be random when all predictions are clustered (ties in argsort).
+    Instead, we fix the prediction order by slot index:
+      - Slot 0 → smallest φ_gt
+      - Slot 1 → second smallest φ_gt
       - etc.
+    
+    This provides a CONSISTENT gradient direction across all batches.
     
     Returns (geom_loss, mask_bce_loss) if mask_p is provided, else just geom_loss.
     """
@@ -1262,30 +1265,31 @@ def _sorted_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *,
         if not (1 <= k <= Kmax):
             continue
         
-        # Sort predictions by phi (deterministic ordering)
-        pred_order = torch.argsort(phi_p[b])  # [Kmax]
-        sorted_pp = phi_p[b][pred_order[:k]]
-        sorted_tp = theta_p[b][pred_order[:k]]
-        sorted_rp = r_p[b][pred_order[:k]]
+        # Predictions: use slot-index order (slots 0..k-1)
+        # This is DETERMINISTIC and independent of prediction values!
+        pred_pp = phi_p[b, :k]
+        pred_tp = theta_p[b, :k]
+        pred_rp = r_p[b, :k]
         
-        # Sort GT by phi
+        # Sort GT by phi (deterministic ordering based on ground truth)
         gt_order = torch.argsort(phi_t[b, :k])  # [k]
         sorted_gt_phi = phi_t[b, :k][gt_order]
         sorted_gt_th = theta_t[b, :k][gt_order]
         sorted_gt_r = r_t[b, :k][gt_order]
         
-        # Direct matching by sorted index (no permutation ambiguity)
-        phi_loss = _wrapped_huber_loss(sorted_pp, sorted_gt_phi, delta=delta_ang).mean()
-        th_loss = _wrapped_huber_loss(sorted_tp, sorted_gt_th, delta=delta_ang).mean()
+        # Match: prediction[i] → sorted_GT[i]
+        # Slot 0 learns smallest φ, Slot 1 learns 2nd smallest, etc.
+        phi_loss = _wrapped_huber_loss(pred_pp, sorted_gt_phi, delta=delta_ang).mean()
+        th_loss = _wrapped_huber_loss(pred_tp, sorted_gt_th, delta=delta_ang).mean()
         th_loss = th_loss * float(getattr(mdl_cfg, "THETA_LOSS_SCALE", 1.0))
-        r_loss = _range_huber_loss(sorted_rp, sorted_gt_r, delta=delta_logr).mean()
+        r_loss = _range_huber_loss(pred_rp, sorted_gt_r, delta=delta_logr).mean()
         
         losses.append(phi_loss + th_loss + r_loss)
         
-        # Mask BCE: slots used in matching get target=1, others get target=0
+        # Mask BCE: first k slots should be active (=1), rest inactive (=0)
         if mask_p is not None:
             mask_target = torch.zeros(Kmax, device=device)
-            mask_target[pred_order[:k]] = 1.0
+            mask_target[:k] = 1.0  # First k slots are active
             m = mask_p[b].clamp(min=1e-6, max=1.0 - 1e-6)
             bce = -(mask_target * torch.log(m) + (1.0 - mask_target) * torch.log(1.0 - m))
             mask_bce_losses.append(bce.mean())
