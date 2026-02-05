@@ -298,16 +298,13 @@ class UltimateHybridLoss(nn.Module):
         dist = dphi + dtheta + dr  # [B, K, K]
         
         # Mask out diagonal (slot vs itself)
-        mask = 1.0 - torch.eye(K, device=dist.device)
-        dist_offdiag = dist * mask
+        eye_mask = 1.0 - torch.eye(K, device=dist.device)
+        dist_offdiag = dist * eye_mask
         
-        # Loss: encourage minimum pairwise distance > threshold
-        # Using exp(-d/tau) as a soft "too close" penalty
-        tau = 0.3  # radians + normalized range units
-        penalty = torch.exp(-dist_offdiag / tau)  # [B, K, K]
-        
-        # Average over pairs (exclude diagonal)
-        loss = (penalty * mask).sum() / (mask.sum() + 1e-9)
+        # Loss: negative mean pairwise distance (encourage slots to be far apart)
+        # Simpler and more stable than exp(-d/tau) which was too sensitive.
+        # Clamp individual distances to avoid extreme values.
+        loss = -(dist_offdiag * eye_mask).sum() / (eye_mask.sum() + 1e-9)
         
         return loss
 

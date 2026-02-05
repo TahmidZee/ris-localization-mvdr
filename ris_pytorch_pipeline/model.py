@@ -694,13 +694,19 @@ class HybridModel(nn.Module):
         if self.use_slot_head and self.slot_attn is not None:
             Kmax = int(getattr(cfg, "K_MAX", 5))
             q = self.slot_queries.unsqueeze(0).expand(B, Kmax, -1)  # [B,K,D]
-            slot, _ = self.slot_attn(q, tok_out, tok_out, need_weights=False)  # [B,K,D]
-            slot = self.slot_ln(slot + q)
+            
+            # Multi-round slot attention (DETR-style iterative refinement).
+            # Single-round cross-attention can't specialize slots from the same token sequence.
+            # Multiple rounds let slots "compete" and differentiate iteratively.
+            n_slot_rounds = int(getattr(mdl_cfg, "SLOT_ATTN_ROUNDS", 3))
+            for _ in range(n_slot_rounds):
+                slot, _ = self.slot_attn(q, tok_out, tok_out, need_weights=False)  # [B,K,D]
+                q = self.slot_ln(slot + q)  # Update queries for next round
 
             # Fuse global H_full + snr conditioning per slot
             H_b = H_feat.unsqueeze(1).expand(B, Kmax, -1)      # [B,K,D/2]
             snr_b = snr_feat.unsqueeze(1).expand(B, Kmax, -1)  # [B,K,snr_dim]
-            slot = F.gelu(self.slot_fusion(torch.cat([slot, H_b, snr_b], dim=-1)))  # [B,K,D]
+            slot = F.gelu(self.slot_fusion(torch.cat([q, H_b, snr_b], dim=-1)))  # [B,K,D]
             slot = self.slot_heads_ln(slot)
 
             out = self.slot_head(slot)  # [B,K,5]

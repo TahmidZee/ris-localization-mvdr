@@ -541,6 +541,7 @@ class ModelConfig:
         # This uses the backbone capacity properly for set prediction.
         self.USE_SLOT_HEAD = True
         self.SLOT_HEAD_HIDDEN_DIM = 256  # hidden width for per-slot MLP
+        self.SLOT_ATTN_ROUNDS = 3       # Multi-round slot attention (DETR uses 6; 3 is a good start)
 
         # Slot head optimization / stability knobs
         # - SLOT_QUERY_INIT_STD: larger std helps symmetry breaking across slots early
@@ -598,7 +599,10 @@ class ModelConfig:
         # 
         # This loss explicitly penalizes slots that predict too-similar outputs, forcing
         # them to remain differentiated. Essential for multi-source learning.
-        self.LAM_SLOT_DIVERSITY = 0.1  # Diversity loss weight (moderate)
+        # 
+        # NOTE: Weight must be small relative to aux_l2 (~1.5). With LAM=0.1, diversity 
+        # dominated the loss (3.5/5.0 = 70%) causing instability. Use 0.01-0.02.
+        self.LAM_SLOT_DIVERSITY = 0.02  # Reduced from 0.1 → 0.02 (was dominating)
 
         # Presence/mask supervision
         # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
