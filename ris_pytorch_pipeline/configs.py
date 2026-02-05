@@ -545,7 +545,12 @@ class ModelConfig:
         # Slot head optimization / stability knobs
         # - SLOT_QUERY_INIT_STD: larger std helps symmetry breaking across slots early
         # - SLOT_QUERY_INIT_ORTHO: initialize slot queries as near-orthogonal vectors
-        self.SLOT_QUERY_INIT_STD = 0.20
+        # 
+        # CRITICAL FIX (2026-02-04): Increased from 0.20 to 1.0.
+        # With D=512, std=0.20 gives queries with ||q||~4.5, which is dwarfed by backbone
+        # features after LayerNorm. Larger std=1.0 gives ||q||~22, providing meaningful
+        # differentiation between slots at initialization.
+        self.SLOT_QUERY_INIT_STD = 1.0
         self.SLOT_QUERY_INIT_ORTHO = True
 
         # Geometry-only warmup (recommended):
@@ -568,7 +573,16 @@ class ModelConfig:
         # Permutation-invariant set losses can have a stable symmetric fixed point where all slots
         # predict the dataset mean. Sorted matching forces slot specialization by sorting both
         # predictions and GT by phi and matching by index (slot 0=smallest phi, etc.).
-        self.USE_SORTED_MATCHING = True
+        # 
+        # CRITICAL FIX (2026-02-04): Sorted matching is DISABLED.
+        # Problem: At init, all slots predict similar values. Sorted matching assigns
+        # slot[i] → i-th smallest-phi GT, which creates CONTRADICTORY gradients on the
+        # backbone (slot 0 wants small phi, slot 1 wants medium, etc.). These cancel out,
+        # causing the model to get WORSE during training.
+        # 
+        # Solution: Use Hungarian matching (brute-force optimal assignment in _perm_invariant_aux_loss).
+        # This matches each slot to its closest GT, giving consistent gradients.
+        self.USE_SORTED_MATCHING = False
 
         # Presence/mask supervision
         # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
