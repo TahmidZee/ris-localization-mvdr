@@ -8,7 +8,7 @@ import torch.nn as nn
 import sys
 sys.path.insert(0, ".")
 
-from ris_pytorch_pipeline.configs import sys_cfg as cfg, mdl_cfg
+from ris_pytorch_pipeline.configs import cfg, mdl_cfg
 from ris_pytorch_pipeline.model import HybridModel
 from ris_pytorch_pipeline.loss import UltimateHybridLoss
 
