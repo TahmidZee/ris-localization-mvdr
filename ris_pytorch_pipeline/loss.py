@@ -263,6 +263,53 @@ class UltimateHybridLoss(nn.Module):
         """Configure permutation matching for aux geometry loss."""
         self.aux_match_soft = bool(soft)
         self.aux_match_tau = float(max(1e-6, tau))
+    
+    def _slot_diversity_loss(self, phi_p, theta_p, r_p):
+        """
+        Penalize slots that predict too-similar values.
+        
+        Computes pairwise distances between all K_MAX slot outputs and encourages
+        them to be well-separated. This prevents the symmetric collapse where all
+        slots converge to predict the dataset mean.
+        
+        Args:
+            phi_p, theta_p: [B, K_MAX] angle predictions (radians)
+            r_p: [B, K_MAX] range predictions (meters)
+            
+        Returns:
+            Loss scalar (minimize when slots are diverse, maximize when slots are identical)
+        """
+        B, K = phi_p.shape
+        
+        # Pairwise angular distances (with wrapping)
+        dphi = phi_p.unsqueeze(2) - phi_p.unsqueeze(1)  # [B, K, K]
+        dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))  # Wrap to [-π, π]
+        dphi = dphi.abs()  # [B, K, K]
+        
+        dtheta = theta_p.unsqueeze(2) - theta_p.unsqueeze(1)
+        dtheta = torch.atan2(torch.sin(dtheta), torch.cos(dtheta))
+        dtheta = dtheta.abs()
+        
+        # Pairwise range distances (normalized by range span)
+        r_span = float(getattr(cfg, "RANGE_R", (0.5, 10.0))[1] - getattr(cfg, "RANGE_R", (0.5, 10.0))[0])
+        dr = (r_p.unsqueeze(2) - r_p.unsqueeze(1)).abs() / r_span  # [B, K, K]
+        
+        # Combined distance (exclude diagonal)
+        dist = dphi + dtheta + dr  # [B, K, K]
+        
+        # Mask out diagonal (slot vs itself)
+        mask = 1.0 - torch.eye(K, device=dist.device)
+        dist_offdiag = dist * mask
+        
+        # Loss: encourage minimum pairwise distance > threshold
+        # Using exp(-d/tau) as a soft "too close" penalty
+        tau = 0.3  # radians + normalized range units
+        penalty = torch.exp(-dist_offdiag / tau)  # [B, K, K]
+        
+        # Average over pairs (exclude diagonal)
+        loss = (penalty * mask).sum() / (mask.sum() + 1e-9)
+        
+        return loss
 
     # -------- helpers --------
 
@@ -905,6 +952,17 @@ class UltimateHybridLoss(nn.Module):
             r_span = (cfg.RANGE_R[1] - cfg.RANGE_R[0] + 1e-9)
             range_raw = (((r_p - r_t) / r_span)**2 * mask).sum() / (mask.sum() + 1e-9)
 
+        # CRITICAL FIX (2026-02-05): Slot diversity loss to prevent collapse.
+        # Without this, all slots converge to predict identical values (φ std = 0.04°).
+        # The permutation-invariant loss doesn't penalize this symmetric solution.
+        loss_diversity = torch.tensor(0.0, device=device)
+        lam_diversity = float(getattr(mdl_cfg, "LAM_SLOT_DIVERSITY", 0.1))
+        if lam_diversity > 0.0 and use_perm_aux:
+            loss_diversity = self._slot_diversity_loss(phi_p, theta_p, r_p)
+            if not hasattr(self, "_diversity_logged"):
+                print(f"[LOSS DEBUG] Slot diversity loss: enabled @ weight={lam_diversity:.3f}", flush=True)
+                self._diversity_logged = True
+        
         loss_align = torch.tensor(0.0, device=device)
         if getattr(mdl_cfg, "LAM_ALIGN", 0.0) > 0.0:
             # Expert fix: Re-enabled subspace alignment with SVD + projector (now safe)
@@ -1028,6 +1086,7 @@ class UltimateHybridLoss(nn.Module):
             + self.lam_heatmap * loss_heatmap                 # SpectrumRefiner supervision
             + lam_mask * loss_mask                             # Slot presence/mask count supervision
             + lam_mask_bce * loss_mask_bce                     # Permutation-aware mask BCE (strongest)
+            + lam_diversity * loss_diversity                   # CRITICAL: Slot diversity (prevents collapse)
         )
         
         # Log loss breakdown (once per run)

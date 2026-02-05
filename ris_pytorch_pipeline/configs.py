@@ -590,6 +590,15 @@ class ModelConfig:
         # Solution: Use Hungarian matching (brute-force optimal assignment in _perm_invariant_aux_loss).
         # This matches each slot to its closest GT, giving consistent gradients.
         self.USE_SORTED_MATCHING = False
+        
+        # CRITICAL FIX (2026-02-05): Slot diversity loss (prevents symmetric collapse).
+        # Permutation-invariant aux loss has a stable fixed point where all slots predict
+        # identical values. Even with strong init (std=3.0), slots can converge together
+        # during training because they share backbone features.
+        # 
+        # This loss explicitly penalizes slots that predict too-similar outputs, forcing
+        # them to remain differentiated. Essential for multi-source learning.
+        self.LAM_SLOT_DIVERSITY = 0.1  # Diversity loss weight (moderate)
 
         # Presence/mask supervision
         # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
