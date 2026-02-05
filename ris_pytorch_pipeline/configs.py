@@ -546,11 +546,12 @@ class ModelConfig:
         # - SLOT_QUERY_INIT_STD: larger std helps symmetry breaking across slots early
         # - SLOT_QUERY_INIT_ORTHO: initialize slot queries as near-orthogonal vectors
         # 
-        # CRITICAL FIX (2026-02-04): Increased from 0.20 to 1.0.
-        # With D=512, std=0.20 gives queries with ||q||~4.5, which is dwarfed by backbone
-        # features after LayerNorm. Larger std=1.0 gives ||q||~22, providing meaningful
-        # differentiation between slots at initialization.
-        self.SLOT_QUERY_INIT_STD = 1.0
+        # CRITICAL FIX (2026-02-05): Increased from 0.20 → 1.0 → 3.0.
+        # With D=512, std=0.20 gives queries with ||q||~4.5 (too small vs backbone features).
+        # std=1.0 gives ||q||~22 (better, but still insufficient to break symmetry in full training).
+        # std=3.0 gives ||q||~67, providing STRONG differentiation between slots at init.
+        # This is critical for permutation-invariant losses to escape the symmetric equilibrium.
+        self.SLOT_QUERY_INIT_STD = 3.0
         self.SLOT_QUERY_INIT_ORTHO = True
 
         # Geometry-only warmup (recommended):
@@ -564,12 +565,16 @@ class ModelConfig:
         # making optimization look stalled (or spiky) even when gradients exist.
         # Use a softmin over all permutations for a few warmup epochs, then switch to hard.
         # 
-        # CRITICAL FIX (2026-02-05): Enable soft matching for first 5 epochs to prevent assignment flips.
-        # When all slots predict similar values (~0-10° φ), hard matching flips randomly batch-to-batch,
-        # causing φ RMSE to jump from ~34° (baseline) to ~48° (random) around epoch 3-4.
-        # Soft matching (weighted gradient over all permutations) prevents this instability.
-        self.AUX_MATCH_SOFT_EPOCHS = 5     # soft matching for first 5 epochs (was: 0)
-        self.AUX_MATCH_SOFT_TAU = 0.25     # softmin temperature (in radians-ish units)
+        # CRITICAL FIX (2026-02-05): Soft matching is DISABLED by default.
+        # Problem: With τ=0.25, softmax gives nearly-uniform weights when all permutation
+        # costs are similar (which they are when slots predict ~0°). This causes gradients
+        # to average to zero → aux metrics stay frozen at dataset mean baseline.
+        # 
+        # Hard matching with strong slot init (std=1.0) provides better symmetry breaking.
+        # If you see assignment flips (φ RMSE jumping to ~48°), try soft matching for 2-3
+        # epochs with HIGHER tau (1.0-2.0) to give more gradient signal.
+        self.AUX_MATCH_SOFT_EPOCHS = 0     # soft matching disabled by default
+        self.AUX_MATCH_SOFT_TAU = 1.0      # if enabled, use warmer temp (was: 0.25)
 
         # CRITICAL FIX (2026-02-03): Use sorted matching instead of permutation-invariant matching.
         # Permutation-invariant set losses can have a stable symmetric fixed point where all slots
