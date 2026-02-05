@@ -20,18 +20,18 @@ if torch.cuda.is_available():
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-# Create model
-model = HybridModel(cfg, mdl_cfg).to(device)
+# Create model (no args - reads cfg/mdl_cfg from module globals)
+model = HybridModel().to(device)
 model.train()
 
-# Create loss
-loss_fn = UltimateHybridLoss(cfg, mdl_cfg)
+# Create loss (uses default params)
+loss_fn = UltimateHybridLoss()
 loss_fn.lam_aux = 1.0
 loss_fn.lam_cov = 0.0  # Disable cov loss to isolate aux gradient
 
 # Create dummy batch
 B = 4
-N = cfg.N_elem
+N = cfg.N
 K_true = torch.randint(1, 3, (B,)).to(device)  # K in [1,2]
 
 # Fake covariance input
