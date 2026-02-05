@@ -563,10 +563,12 @@ class ModelConfig:
         # Hard argmin assignment can "flip" early, producing a non-smooth loss surface and
         # making optimization look stalled (or spiky) even when gradients exist.
         # Use a softmin over all permutations for a few warmup epochs, then switch to hard.
-        # NOTE (2026-02-03): soft matching can encourage a symmetric collapse (all slots predict the mean)
-        # on symmetric datasets if it stays enabled too long. Default to hard matching from the start;
-        # if you see assignment-flip instability in tiny overfit tests, re-enable soft matching for 1-2 epochs.
-        self.AUX_MATCH_SOFT_EPOCHS = 0     # soft matching for first N epochs
+        # 
+        # CRITICAL FIX (2026-02-05): Enable soft matching for first 5 epochs to prevent assignment flips.
+        # When all slots predict similar values (~0-10° φ), hard matching flips randomly batch-to-batch,
+        # causing φ RMSE to jump from ~34° (baseline) to ~48° (random) around epoch 3-4.
+        # Soft matching (weighted gradient over all permutations) prevents this instability.
+        self.AUX_MATCH_SOFT_EPOCHS = 5     # soft matching for first 5 epochs (was: 0)
         self.AUX_MATCH_SOFT_TAU = 0.25     # softmin temperature (in radians-ish units)
 
         # CRITICAL FIX (2026-02-03): Use sorted matching instead of permutation-invariant matching.
