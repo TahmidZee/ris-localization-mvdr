@@ -945,12 +945,45 @@ class UltimateHybridLoss(nn.Module):
             rng_err_log = (_range_huber_loss(r_p, r_t) * mask).sum() / (mask.sum() + 1e-9)
             aux_l2 = ang_err + rng_err_log
 
-        # Chamfer on (phi,theta)
-        peak_l2 = self._angle_chamfer(phi_p, theta_p, phi_t, theta_t, mask)
+        # ------------------------------------------------------------
+        # IMPORTANT: Avoid slot-index-biased auxiliary terms when using
+        # permutation-invariant aux supervision.
+        #
+        # Historically we added:
+        #  - a Chamfer term on (phi,theta) (lam_peak)
+        #  - a tiny slot-index range MSE term (range_raw)
+        #
+        # Both of these were implemented with the "first K slots are active"
+        # mask (slot-index semantics). When aux is permutation-invariant, this
+        # creates contradictory gradients:
+        #   - aux_l2 matches *any* slots to GT via optimal assignment
+        #   - chamfer/range_raw push *specific slot indices* toward GT
+        #
+        # In practice this can destabilize training (φ jumps toward random/edge
+        # predictions even when gradients exist), exactly the failure mode
+        # observed in full training logs.
+        #
+        # Therefore:
+        #  - If AUX_LOSS_PERM_INVARIANT=True, disable these slot-index-biased
+        #    auxiliaries by default.
+        #  - If you really want them, re-enable only after introducing a
+        #    canonical slot ordering (scheduled sorted matching) or rewrite them
+        #    to use the same assignment as aux_l2.
+        # ------------------------------------------------------------
+        use_perm_aux = bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True))
+        if use_perm_aux:
+            peak_l2 = torch.tensor(0.0, device=device)
+            range_raw = torch.tensor(0.0, device=device)
+            if (self.lam_peak != 0.0) and (not hasattr(self, "_perm_aux_peak_disabled_logged")):
+                print("[LOSS DEBUG] Chamfer/range_raw disabled under perm-invariant aux (avoid slot-index bias).", flush=True)
+                self._perm_aux_peak_disabled_logged = True
+        else:
+            # Chamfer on (phi,theta)
+            peak_l2 = self._angle_chamfer(phi_p, theta_p, phi_t, theta_t, mask)
 
-        # small linear range term normalized by span (optional)
-        r_span = (cfg.RANGE_R[1] - cfg.RANGE_R[0] + 1e-9)
-        range_raw = (((r_p - r_t) / r_span)**2 * mask).sum() / (mask.sum() + 1e-9)
+            # small linear range term normalized by span (optional)
+            r_span = (cfg.RANGE_R[1] - cfg.RANGE_R[0] + 1e-9)
+            range_raw = (((r_p - r_t) / r_span)**2 * mask).sum() / (mask.sum() + 1e-9)
 
         loss_align = torch.tensor(0.0, device=device)
         if getattr(mdl_cfg, "LAM_ALIGN", 0.0) > 0.0:
