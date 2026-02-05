@@ -1,5 +1,6 @@
 # Wideband OFDM Implementation Checklist
 Date: 2026-02-02 (Updated with cov-loss alignment fix)  
+Update: 2026-02-05 (Aux matching stability fix: disable sorted matching; use Hungarian assignment)
 Reference: `OFDM_TR38901_INDOOR_PLAN.md`
 
 This is a **step-by-step implementation checklist** for upgrading the pipeline from narrowband to wideband OFDM.
@@ -51,7 +52,7 @@ Yet in full training logs, `aux_φ_rmse` often plateaus around ~34–36° early.
    - Implemented in `train.py` schedule block
 
 2. **Stronger slot query initialization** (better symmetry breaking):
-   - Added `mdl_cfg.SLOT_QUERY_INIT_STD = 0.20`
+   - Added `mdl_cfg.SLOT_QUERY_INIT_STD = 1.0` (updated from 0.20 → 1.0 for stronger early slot differentiation)
    - Added `mdl_cfg.SLOT_QUERY_INIT_ORTHO = True`
    - Initialize slot queries via QR (near-orthogonal) when `K_MAX <= D`
 
@@ -682,7 +683,16 @@ python -m ris_pytorch_pipeline.ris_pipeline suite --bench B2 --limit 1000 --no-b
 
 ---
 
-## CRITICAL FIX #11: Sorted Matching (2026-02-03)
+## CRITICAL FIX #11 APPLIED (2026-02-04): Disable Sorted Matching (Use Hungarian Optimal Assignment)
+
+> **UPDATE (2026-02-04)**: Sorted matching is now **disabled by default** (`mdl_cfg.USE_SORTED_MATCHING=False`).
+> In practice, enforcing a global slot ordering early created contradictory gradients and caused the
+> single-batch overfit smoke test to fail. We reverted to the brute-force optimal assignment in
+> `_perm_invariant_aux_loss` (K_MAX≤5 ⇒ ≤120 permutations), which passes smoke tests and yields stable learning.
+>
+> The remainder of this section is retained as historical context for why sorted matching was explored,
+> but **do not enable it** unless you are explicitly running an ablation with a schedule (e.g., enable only
+> after geometry has already learned).
 
 ### Root Cause Analysis
 
@@ -745,12 +755,15 @@ loss = huber(sorted_pp, sorted_gt_phi)
 ### Config
 
 ```python
-mdl_cfg.USE_SORTED_MATCHING = True  # Default: enabled
+mdl_cfg.USE_SORTED_MATCHING = False  # Default: disabled (recommended)
 ```
 
-### Verification
+### Verification Gate (run before long training)
 
-After pulling, run a short training and check:
-- `[LOSS] Using SORTED matching (breaks symmetric equilibrium)` appears
-- `aux_φ_rmse` should start decreasing within 2-3 epochs
+```bash
+cd ris/MainMusic
+python diagnose_pipeline_smoke.py --device cuda --steps 150
+```
+
+Expect `PASS ✅` and single-batch overfit to **decrease** loss and RMSE.
 

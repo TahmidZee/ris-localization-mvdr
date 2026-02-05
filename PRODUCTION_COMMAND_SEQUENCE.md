@@ -1,6 +1,7 @@
 # Production Command Sequence
 **Date:** 2025-01-13  
-**Status:** ✅ Ready for Production Training
+**Status:** ✅ Ready for training runs (post-smoke-test gate)
+**Updated:** 2026-02-05 (M=64, N=256, L=64 baseline; aux learning stabilized)
 
 ---
 
@@ -22,10 +23,15 @@ This document provides the exact command sequence to achieve best results using 
 cd /home/tahit/ris/MainMusic
 
 # Verify data shards exist
-ls -lh data_shards_M64_L16/{train,val,test}/*.npz | head -5
+# NOTE: val/ is optional; training will reuse train shards if val/ is missing.
+ls -lh data_shards_M64_N256_L64/train/*.npz | head -5
+ls -lh data_shards_M64_N256_L64/test/*.npz | head -5
 
 # Verify environment is activated (if using venv)
 # source env/bin/activate  # if needed
+
+# Gate: pipeline smoke test (must PASS before long runs)
+python diagnose_pipeline_smoke.py --device cuda --steps 150
 ```
 
 ---
@@ -34,7 +40,7 @@ ls -lh data_shards_M64_L16/{train,val,test}/*.npz | head -5
 
 **Goal:** Find promising hyperparameter regions  
 **Time:** ~6-10 hours  
-**Output:** `results_final_L16_12x12/hpo/best.json`
+**Output:** `results_M64_N256_L64/hpo/best.json`
 
 ### Option A: Using the manual script (recommended)
 ```bash
@@ -53,14 +59,14 @@ python -m ris_pytorch_pipeline.ris_pipeline hpo \
 ```
 
 ### Expected Output
-- `results_final_L16_12x12/hpo/best.json` - Best single config
-- `results_final_L16_12x12/hpo/hpo.db` - Full study database
-- `results_final_L16_12x12/hpo/*_trials.csv` - Trial results
+- `results_M64_N256_L64/hpo/best.json` - Best single config
+- `results_M64_N256_L64/hpo/hpo.db` - Full study database
+- `results_M64_N256_L64/hpo/*_trials.csv` - Trial results
 
 ### After Completion
 Review top 5 configs from CSV:
 ```bash
-cat results_final_L16_12x12/hpo/*_trials.csv | sort -t, -k2 -n | head -6
+cat results_M64_N256_L64/hpo/*_trials.csv | sort -t, -k2 -n | head -6
 ```
 
 ---
@@ -69,7 +75,7 @@ cat results_final_L16_12x12/hpo/*_trials.csv | sort -t, -k2 -n | head -6
 
 **Goal:** Train top configs on full dataset  
 **Time:** ~4-6 hours per run  
-**Output:** `results_final_L16_12x12/checkpoints/best.pt`
+**Output:** `results_M64_N256_L64/checkpoints/best.pt`
 
 ### Train Best Config from HPO
 ```bash
@@ -79,7 +85,7 @@ python -m ris_pytorch_pipeline.ris_pipeline train \
     --n_train 160000 \
     --n_val 40000 \
     --use_shards \
-    --from_hpo results_final_L16_12x12/hpo/best.json
+    --from_hpo results_M64_N256_L64/hpo/best.json
 ```
 
 ### Train Top 5 Configs (Manual)
@@ -92,7 +98,7 @@ python -m ris_pytorch_pipeline.ris_pipeline train \
     --n_train 160000 \
     --n_val 40000 \
     --use_shards \
-    --from_hpo results_final_L16_12x12/hpo/best.json
+    --from_hpo results_M64_N256_L64/hpo/best.json
 ```
 
 **Note:** For multiple configs, you may want to:
@@ -103,16 +109,16 @@ python -m ris_pytorch_pipeline.ris_pipeline train \
 ### Monitor Training
 ```bash
 # Watch logs in real-time
-tail -f results_final_L16_12x12/logs/train_*.log
+tail -f results_M64_N256_L64/logs/full_train_*.log
 
 # Check validation metrics
-grep "val_loss\|val_ang_err\|val_rng_err" results_final_L16_12x12/logs/train_*.log | tail -20
+grep "VAL SURROGATE" results_M64_N256_L64/logs/full_train_*.log | tail -20
 ```
 
 ### Expected Output
-- `results_final_L16_12x12/checkpoints/best.pt` - Best model checkpoint
-- `results_final_L16_12x12/checkpoints/swa.pt` - SWA checkpoint (if enabled)
-- `results_final_L16_12x12/checkpoints/run_config.json` - Training config
+- `results_M64_N256_L64/checkpoints/best.pt` - Best model checkpoint
+- `results_M64_N256_L64/checkpoints/swa.pt` - SWA checkpoint (if enabled)
+- `results_M64_N256_L64/checkpoints/run_config.json` - Training config
 
 ---
 
@@ -120,13 +126,13 @@ grep "val_loss\|val_ang_err\|val_rng_err" results_final_L16_12x12/logs/train_*.l
 
 **Goal:** Train CNN refinement head on MVDR spectra (freeze backbone)  
 **Time:** ~1-2 hours  
-**Output:** `results_final_L16_12x12/checkpoints/best.pt` (with refiner weights)
+**Output:** `results_M64_N256_L64/checkpoints/best.pt` (with refiner weights)
 
 ### Train Refiner on Best Backbone
 ```bash
 cd /home/tahit/ris/MainMusic
 python -m ris_pytorch_pipeline.ris_pipeline train-refiner \
-    --backbone_ckpt results_final_L16_12x12/checkpoints/best.pt \
+    --backbone_ckpt results_M64_N256_L64/checkpoints/best.pt \
     --epochs 10 \
     --n_train 160000 \
     --n_val 40000 \
@@ -156,8 +162,11 @@ python -m ris_pytorch_pipeline.ris_pipeline train-refiner \
 ### Evaluate MVDR-Only (Baseline)
 ```bash
 cd /home/tahit/ris/MainMusic
-python -m ris_pytorch_pipeline.ris_pipeline suite \
-    --tag mvdr_baseline
+# Run a fast, hybrid-only pass (no baselines) on a capped subset:
+python -m ris_pytorch_pipeline.ris_pipeline suite --bench B1 --limit 1000 --no-baselines
+
+# Save a copy (suite overwrites the same CSV names on reruns)
+cp results_M64_N256_L64/benches/B1_all_blind.csv results_M64_N256_L64/benches/B1_all_blind_mvdr.csv
 ```
 
 ### Evaluate Refiner-Assisted (If Trained)
@@ -170,23 +179,25 @@ export REFINER_PEAK_THRESH=0.5
 export REFINER_NMS_MIN_SEP=3.0
 
 python -m ris_pytorch_pipeline.ris_pipeline suite \
-    --tag refiner_assisted
+    --bench B1 --limit 1000 --no-baselines
+
+cp results_M64_N256_L64/benches/B1_all_blind.csv results_M64_N256_L64/benches/B1_all_blind_refiner.csv
 ```
 
 ### Compare Results
 ```bash
 # View benchmark results
-ls -lh results_final_L16_12x12/benches/*.csv
+ls -lh results_M64_N256_L64/benches/*.csv
 
 # Compare metrics
 python -c "
 import pandas as pd
-df1 = pd.read_csv('results_final_L16_12x12/benches/mvdr_baseline.csv')
-df2 = pd.read_csv('results_final_L16_12x12/benches/refiner_assisted.csv')
-print('MVDR Baseline:')
-print(df1.describe())
-print('\nRefiner Assisted:')
-print(df2.describe())
+df1 = pd.read_csv('results_M64_N256_L64/benches/B1_all_blind_mvdr.csv')
+df2 = pd.read_csv('results_M64_N256_L64/benches/B1_all_blind_refiner.csv')
+print('MVDR-only (Hybrid):')
+print(df1.groupby('who')[['phi','theta','rng','rmspe','f1']].mean())
+print('\\nRefiner-assisted (Hybrid):')
+print(df2.groupby('who')[['phi','theta','rng','rmspe','f1']].mean())
 "
 ```
 
@@ -236,12 +247,12 @@ python -m ris_pytorch_pipeline.ris_pipeline train \
 ### Checkpoint Loading Issues
 ```bash
 # Verify checkpoint exists
-ls -lh results_final_L16_12x12/checkpoints/best.pt
+ls -lh results_M64_N256_L64/checkpoints/best.pt
 
 # Test loading
 python -c "
 from ris_pytorch_pipeline.infer import load_model
-model = load_model('results_final_L16_12x12/checkpoints', 'best.pt')
+model = load_model('results_M64_N256_L64/checkpoints', 'best.pt')
 print('✅ Checkpoint loaded successfully')
 "
 ```
@@ -272,6 +283,6 @@ print('✅ Checkpoint loaded successfully')
 ## Notes
 
 - All paths assume working directory: `/home/tahit/ris/MainMusic`
-- Data shards should be in: `data_shards_M64_L16/{train,val,test}/`
-- Results will be saved to: `results_final_L16_12x12/`
+- Data shards should be in: `data_shards_M64_N256_L64/{train,val,test}/`
+- Results will be saved to: `results_M64_N256_L64/`
 - For production, consider using `swa.pt` checkpoint (if SWA enabled) instead of `best.pt`

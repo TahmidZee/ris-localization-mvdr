@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** January 25, 2026 (R_samp fixed end-to-end: generation + construction + call-sites + regression test)
+**Last Updated:** February 5, 2026 (Aux geometry learning stabilized: disable sorted matching; Hungarian assignment; smoke-test gate)
 
 ---
 
@@ -46,6 +46,11 @@ This document details all code changes made to transition from a K-head classifi
   - non-finite-grad trials are pruned (`optuna.TrialPruned`) and the run continues
 - ✅ **Fixed full training crash when using `--from_hpo`**:
   - `Trainer.__init__` had an inner `from pathlib import Path` which shadowed the module-level import, causing `UnboundLocalError: local variable 'Path' referenced before assignment`
+- ✅ **Stabilized slot-head aux geometry learning** (2026-02-04):
+  - disabled sorted matching (`mdl_cfg.USE_SORTED_MATCHING=False`) after it caused single-batch overfit to fail
+  - use brute-force optimal assignment (`_perm_invariant_aux_loss`, K_MAX≤5 ⇒ ≤120 permutations)
+  - strengthened slot-query init (`SLOT_QUERY_INIT_STD=1.0`) for faster symmetry breaking
+  - added/updated a smoke-test gate (`diagnose_pipeline_smoke.py`) before long training runs
 
 ---
 
