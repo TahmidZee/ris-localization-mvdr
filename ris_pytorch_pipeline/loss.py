@@ -515,59 +515,6 @@ class UltimateHybridLoss(nn.Module):
         m = mask.reshape(B * Kmax)
         return (ce * m).sum() / (m.sum() + 1e-9)
 
-    def _eigengap_hinge(self, R_hat_c: torch.Tensor, K_true: torch.Tensor) -> torch.Tensor:
-        """
-        Expert-fixed eigengap loss: Batched SVD, no eigenvector phase issue.
-        SVD returns singular values in DESCENDING order (no flip needed).
-        """
-        B, N = R_hat_c.shape[:2]
-        eps = getattr(mdl_cfg, 'EPS_PSD', 1e-4)
-        eye = torch.eye(N, device=R_hat_c.device, dtype=R_hat_c.dtype)
-
-        # Hermitize + load (batched)
-        R = 0.5 * (R_hat_c + R_hat_c.conj().transpose(-2, -1)) + eps * eye
-
-        # Batched SVD (descending singular values)
-        # Use computational dtype for safety
-        U, S, Vh = torch.linalg.svd(R.to(torch.complex64), full_matrices=False)
-        # S is [B, N] in DESCENDING order (no flip needed!)
-
-        gaps = []
-        for b in range(B):
-            k = int(K_true[b].item())
-            if 1 <= k < N:
-                lam_k  = S[b, k-1]   # kth largest
-                lam_k1 = S[b, k]     # (k+1)th largest
-                gap = (lam_k - lam_k1).real
-                gaps.append(F.relu(self.gap_margin - gap))
-            else:
-                gaps.append(torch.zeros((), device=R.device, dtype=R.real.dtype))
-        return torch.stack(gaps).mean()
-
-    def _subspace_margin_regularizer(self, R_hat: torch.Tensor, K_true: torch.Tensor, margin_target: float = 0.02) -> torch.Tensor:
-        """
-        Expert-fixed subspace margin: Uses SVD (batched), avoids eigenvector phase issue.
-        Encourages clear gap between signal and noise subspaces.
-        """
-        B, N, _ = R_hat.shape
-        eps = getattr(mdl_cfg, 'EPS_PSD', 1e-4)
-        eye = torch.eye(N, device=R_hat.device, dtype=R_hat.dtype)
-
-        R = 0.5 * (R_hat + R_hat.conj().transpose(-2, -1)) + eps * eye
-        # Singular values descending
-        S = torch.linalg.svdvals(R)  # [B, N], descending
-
-        margins = []
-        for b in range(B):
-            k = int(K_true[b].item())
-            if 1 <= k < N:
-                # gap between kth and (k+1)th (descending)
-                gap = (S[b, k-1] - S[b, k]).relu()
-                margins.append((margin_target - gap).clamp(min=0))
-            else:
-                margins.append(torch.zeros((), device=R.device, dtype=R.real.dtype))
-        return torch.stack(margins).mean()
-    
     def _angle_chamfer(self, phi_p, theta_p, phi_t, theta_t, mask):
         """
         Chamfer distance on angles (radians).
@@ -870,16 +817,8 @@ class UltimateHybridLoss(nn.Module):
         else:
             loss_cross = torch.tensor(0.0, device=device)
 
-        # Eigengap / margin terms are disabled in this system.
-        # If someone sets non-zero weights, ignore them (do not run SVD-based backward).
-        if (self.lam_gap != 0.0) or (self.lam_margin != 0.0):
-            if not hasattr(self, "_gap_margin_disabled_warned"):
-                print("[WARN] lam_gap/lam_margin are disabled (ignored). Set them to 0.0 for clarity.", flush=True)
-                self._gap_margin_disabled_warned = True
-        loss_gap = torch.tensor(0.0, device=device)
-        loss_margin = torch.tensor(0.0, device=device)
-
         # NOTE: K-loss removed - using MVDR peak detection instead (K-free localization)
+        # NOTE: Eigengap/margin losses removed - they were disabled globally and caused SVD instability
 
         # Aux: wrapped Huber on angles + Huber on log-range
         # Also compute permutation-aware mask BCE if masks are available
@@ -896,28 +835,9 @@ class UltimateHybridLoss(nn.Module):
                 else:
                     mask_for_perm = torch.sigmoid(y_pred["aux_mask_logit"].to(device).float())
             
-            # CRITICAL FIX: Use sorted matching to break symmetric equilibrium
-            use_sorted = bool(getattr(mdl_cfg, "USE_SORTED_MATCHING", True))
-            
-            if use_sorted:
-                # Sorted matching: deterministic, forces slot specialization
-                if mask_for_perm is not None:
-                    aux_l2, loss_mask_bce = _sorted_aux_loss(
-                        phi_p, theta_p, r_p,
-                        phi_t, theta_t, r_t,
-                        K_true,
-                        mask_p=mask_for_perm,
-                    )
-                else:
-                    aux_l2 = _sorted_aux_loss(
-                        phi_p, theta_p, r_p,
-                        phi_t, theta_t, r_t,
-                        K_true,
-                    )
-                if not hasattr(self, "_sorted_match_logged"):
-                    print(f"[LOSS] Using SORTED matching (breaks symmetric equilibrium)", flush=True)
-                    self._sorted_match_logged = True
-            elif mask_for_perm is not None:
+            # Use Hungarian (optimal) matching for permutation-invariant aux loss.
+            # Soft matching is enabled during warmup via set_aux_match() to prevent assignment flips.
+            if mask_for_perm is not None:
                 aux_l2, loss_mask_bce = _perm_invariant_aux_loss(
                     phi_p, theta_p, r_p,
                     phi_t, theta_t, r_t,
@@ -1184,7 +1104,7 @@ class UltimateHybridLoss(nn.Module):
         else:
             cross=0.0
 
-        gap=(self._eigengap_hinge(R_hat,K_true).item() if self.lam_gap>0.0 else 0.0)
+        gap=0.0  # Eigengap loss removed (was always disabled)
 
         phi_p=y_pred.get("phi_soft",torch.zeros_like(phi_t))
         theta_p=y_pred.get("theta_soft",torch.zeros_like(theta_t))
@@ -1195,37 +1115,30 @@ class UltimateHybridLoss(nn.Module):
                 aux=aux.to(device).float()
                 phi_p=aux[:,:cfg.K_MAX]; theta_p=aux[:,cfg.K_MAX:2*cfg.K_MAX]; r_p=aux[:,2*cfg.K_MAX:3*cfg.K_MAX]
 
-        # Keep debug aux consistent with forward (sorted matching when enabled).
-        # NOTE: debug_terms() must ALWAYS define phi_huber_sum/theta_huber_sum/rng_err_log
-        # because train.py expects them for logging. When using sorted matching we compute
-        # approximate by-index scalars (not used for optimization).
-        if bool(getattr(mdl_cfg, "USE_SORTED_MATCHING", True)):
-            aux_l2 = _sorted_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true).item()
-            phi_huber_sum = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
-            theta_huber_sum = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
-            theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE
-            r_p_pos = torch.clamp(r_p, min=1e-6); r_t_pos = torch.clamp(r_t, min=1e-6)
-            rng_err_log = (((torch.log(r_p_pos) - torch.log(r_t_pos)) ** 2) * mask).sum() / (mask.sum() + 1e-9)
-        elif bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
+        # Compute aux metrics (permutation-invariant matching is the default)
+        if bool(getattr(cfg, "AUX_LOSS_PERM_INVARIANT", True)):
             aux_l2 = _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true).item()
-            # Provide rough per-term scalars for logging only (by-index; not used for optimization)
-            phi_huber_sum = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
-            theta_huber_sum = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
-            theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE
-            r_p_pos = torch.clamp(r_p, min=1e-6); r_t_pos = torch.clamp(r_t, min=1e-6)
-            rng_err_log = (((torch.log(r_p_pos) - torch.log(r_t_pos)) ** 2) * mask).sum() / (mask.sum() + 1e-9)
         else:
+            # Index-based fallback (not recommended for multi-source scenes)
             phi_huber_sum=(_wrapped_huber_loss(phi_p,phi_t)*mask).sum()/(mask.sum()+1e-9)
             theta_huber_sum=(_wrapped_huber_loss(theta_p,theta_t)*mask).sum()/(mask.sum()+1e-9)
-            theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE  # Emphasize elevation for better θ accuracy
+            theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE
             ang_err=phi_huber_sum+theta_huber_sum
             r_p_pos=torch.clamp(r_p,min=1e-6); r_t_pos=torch.clamp(r_t,min=1e-6)
             rng_err_log=(((torch.log(r_p_pos)-torch.log(r_t_pos))**2)*mask).sum()/(mask.sum()+1e-9)
             aux_l2=(ang_err+rng_err_log).item()
+        
+        # Compute per-term scalars for logging (approximate, by-index)
+        phi_huber_sum = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
+        theta_huber_sum = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
+        theta_huber_sum *= mdl_cfg.THETA_LOSS_SCALE
+        r_p_pos = torch.clamp(r_p, min=1e-6); r_t_pos = torch.clamp(r_t, min=1e-6)
+        rng_err_log = (((torch.log(r_p_pos) - torch.log(r_t_pos)) ** 2) * mask).sum() / (mask.sum() + 1e-9)
+        
         peak=self._angle_chamfer(phi_p,theta_p,phi_t,theta_t,mask).item()
         
-        # Expert fix: Re-enabled margin and align for logging (now safe with SVD)
-        margin = self._subspace_margin_regularizer(R_true, K_true).item() if self.lam_margin > 0.0 else 0.0
+        # Margin loss removed (was always disabled)
+        margin = 0.0
         align = (self._subspace_align(R_true, phi_p, theta_p, r_p, K_true).item() 
                 if getattr(mdl_cfg, "LAM_ALIGN", 0.0) > 0.0 else 0.0)
         
@@ -1271,68 +1184,3 @@ class UltimateHybridLoss(nn.Module):
 # CRITICAL FIX: Sorted matching to break symmetric equilibrium
 # ==============================================================================
 
-def _sorted_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *,
-                     delta_ang=0.175, delta_logr=0.5, mask_p=None):
-    """
-    Sorted matching: match predictions (by slot index) to sorted GT (by phi).
-    This BREAKS the symmetric equilibrium that traps all slots at the mean.
-    
-    CRITICAL: We do NOT sort predictions! Sorting predictions causes the
-    matching to be random when all predictions are clustered (ties in argsort).
-    Instead, we fix the prediction order by slot index:
-      - Slot 0 → smallest φ_gt
-      - Slot 1 → second smallest φ_gt
-      - etc.
-    
-    This provides a CONSISTENT gradient direction across all batches.
-    
-    Returns (geom_loss, mask_bce_loss) if mask_p is provided, else just geom_loss.
-    """
-    device = phi_p.device
-    B, Kmax = phi_p.shape
-    losses = []
-    mask_bce_losses = [] if mask_p is not None else None
-    
-    for b in range(B):
-        k = int(K_true[b].item())
-        if not (1 <= k <= Kmax):
-            continue
-        
-        # Predictions: use slot-index order (slots 0..k-1)
-        # This is DETERMINISTIC and independent of prediction values!
-        pred_pp = phi_p[b, :k]
-        pred_tp = theta_p[b, :k]
-        pred_rp = r_p[b, :k]
-        
-        # Sort GT by phi (deterministic ordering based on ground truth)
-        gt_order = torch.argsort(phi_t[b, :k])  # [k]
-        sorted_gt_phi = phi_t[b, :k][gt_order]
-        sorted_gt_th = theta_t[b, :k][gt_order]
-        sorted_gt_r = r_t[b, :k][gt_order]
-        
-        # Match: prediction[i] → sorted_GT[i]
-        # Slot 0 learns smallest φ, Slot 1 learns 2nd smallest, etc.
-        phi_loss = _wrapped_huber_loss(pred_pp, sorted_gt_phi, delta=delta_ang).mean()
-        th_loss = _wrapped_huber_loss(pred_tp, sorted_gt_th, delta=delta_ang).mean()
-        th_loss = th_loss * float(getattr(mdl_cfg, "THETA_LOSS_SCALE", 1.0))
-        r_loss = _range_huber_loss(pred_rp, sorted_gt_r, delta=delta_logr).mean()
-        
-        losses.append(phi_loss + th_loss + r_loss)
-        
-        # Mask BCE: first k slots should be active (=1), rest inactive (=0)
-        if mask_p is not None:
-            mask_target = torch.zeros(Kmax, device=device)
-            mask_target[:k] = 1.0  # First k slots are active
-            m = mask_p[b].clamp(min=1e-6, max=1.0 - 1e-6)
-            bce = -(mask_target * torch.log(m) + (1.0 - mask_target) * torch.log(1.0 - m))
-            mask_bce_losses.append(bce.mean())
-    
-    if not losses:
-        zero = torch.tensor(0.0, device=device)
-        return (zero, zero) if mask_p is not None else zero
-    
-    geom_loss = torch.stack(losses).mean()
-    if mask_p is not None:
-        mask_bce = torch.stack(mask_bce_losses).mean() if mask_bce_losses else torch.tensor(0.0, device=device)
-        return geom_loss, mask_bce
-    return geom_loss
