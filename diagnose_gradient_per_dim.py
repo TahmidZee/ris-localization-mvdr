@@ -29,24 +29,40 @@ loss_fn = UltimateHybridLoss()
 loss_fn.lam_aux = 1.0
 loss_fn.lam_cov = 0.0  # Disable cov loss to isolate aux gradient
 
-# Create dummy batch
+# Create dummy batch matching model.forward(y, H_full, codes, snr_db=None, R_samp=None)
 B = 4
-N = cfg.N
-K_true = torch.randint(1, 3, (B,)).to(device)  # K in [1,2]
+M = cfg.M  # BS antennas
+N = cfg.N  # RIS elements
+L = cfg.L  # Number of snapshots
+Kmax = int(cfg.K_MAX)
 
-# Fake covariance input
-H_full = torch.randn(B, N, N, dtype=torch.complex64, device=device)
-R_true = H_full @ H_full.conj().transpose(-1, -2)
+print(f"Config: M={M}, N={N}, L={L}, Kmax={Kmax}")
+
+# Fake inputs (RI format = real/imag as last dim with size 2)
+y = torch.randn(B, L, M, 2, device=device)  # received signal [B, L, M, 2]
+H_full = torch.randn(B, M, N, 2, device=device)  # BS→RIS channel [B, M, N, 2]
+codes = torch.randn(B, L, N, 2, device=device)  # RIS codes [B, L, N, 2]
+# Normalize codes to unit modulus
+codes_complex = torch.complex(codes[..., 0], codes[..., 1])
+codes_complex = codes_complex / codes_complex.abs().clamp(min=1e-6)
+codes = torch.stack([codes_complex.real, codes_complex.imag], dim=-1)
+
+snr_db = torch.rand(B, device=device) * 20 + 5  # SNR in [5, 25] dB
+
+# Create fake R_true for loss (complex covariance)
+R_true = torch.randn(B, N, N, dtype=torch.complex64, device=device)
+R_true = R_true @ R_true.conj().transpose(-1, -2)
 R_true = (R_true + R_true.conj().transpose(-1, -2)) / 2  # Hermitian
 
 # Fake GT (random angles/ranges)
-Kmax = int(cfg.K_MAX)
+K_true = torch.randint(1, 3, (B,)).to(device)  # K in [1,2]
 phi_t = torch.randn(B, Kmax, device=device) * 0.5  # ~±30°
 theta_t = torch.randn(B, Kmax, device=device) * 0.3  # ~±17°
 r_t = torch.rand(B, Kmax, device=device) * 5 + 1  # [1, 6] m
 
 # Forward
-out = model(R_true, None)
+print("\nRunning model forward...")
+out = model(y, H_full, codes, snr_db=snr_db, R_samp=None)
 
 # Extract predictions
 phi_p = out["phi_soft"]
@@ -125,15 +141,18 @@ else:
     print(f"  r_loss     → NO GRADIENT!")
 
 # Now test full aux loss from loss_fn
+print(f"\n=== Full loss function test ===")
+# Need fresh forward pass for clean gradients
 model.zero_grad()
+out2 = model(y, H_full, codes, snr_db=snr_db, R_samp=None)
+
 loss_dict = loss_fn(
-    y_pred=out,
+    y_pred=out2,
     R_true=R_true,
     phi_theta_r_targets=(phi_t, theta_t, r_t),
     K_true=K_true,
 )
 total_loss = loss_dict["total"]
-print(f"\n=== Full loss function test ===")
 print(f"Total loss: {total_loss.item():.6f}")
 total_loss.backward()
 
