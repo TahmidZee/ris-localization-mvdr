@@ -142,6 +142,63 @@ def _perm_invariant_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true, *
         return geom_loss, mask_bce
     return geom_loss
 
+
+def _sorted_canonical_aux_loss(phi_p, theta_p, r_p, phi_t, theta_t, r_t, K_true,
+                               delta_ang=0.175, delta_logr=0.5):
+    """
+    Sorted canonical-order auxiliary loss to break symmetric equilibrium.
+
+    Problem: When all K_MAX slots predict identical values, permutation-invariant
+    matching degenerates — all permutations have equal cost. The argmin picks
+    the same indices every time, and across the batch each slot's gradient
+    averages to the dataset mean → slots stay collapsed forever.
+
+    Solution: Sort both predictions and GT by azimuth angle (phi), then match
+    in sorted order. This gives DETERMINISTIC, CONSISTENT gradients:
+      - sorted_pred[0] always → leftmost GT source
+      - sorted_pred[1] always → second-leftmost GT source
+      - etc.
+
+    Each slot learns the i-th order statistic of the source distribution,
+    which spreads slots across the FOV and breaks symmetric equilibrium.
+    Once slots are differentiated, the permutation-invariant loss provides
+    refined matching for fine-grained optimization.
+    """
+    device = phi_p.device
+    B, Kmax = phi_p.shape
+    losses = []
+
+    for b in range(B):
+        k = int(K_true[b].item())
+        if not (1 <= k <= Kmax):
+            continue
+
+        # Sort GT by phi (deterministic canonical ordering)
+        gt_order = torch.argsort(phi_t[b, :k])
+        gt_phi_s = phi_t[b, gt_order]
+        gt_theta_s = theta_t[b, gt_order]
+        gt_r_s = r_t[b, gt_order]
+
+        # Sort ALL Kmax predictions by phi (stable sort: ties → index order)
+        pred_order = torch.argsort(phi_p[b])
+        # Take first k (leftmost predicted slots → leftmost GT sources)
+        pred_phi_s = phi_p[b, pred_order[:k]]
+        pred_theta_s = theta_p[b, pred_order[:k]]
+        pred_r_s = r_p[b, pred_order[:k]]
+
+        # Direct per-slot wrapped Huber loss (same as perm-invariant)
+        phi_h = _wrapped_huber_loss(pred_phi_s, gt_phi_s, delta=delta_ang).mean()
+        th_h = _wrapped_huber_loss(pred_theta_s, gt_theta_s, delta=delta_ang).mean()
+        th_h = th_h * float(getattr(mdl_cfg, "THETA_LOSS_SCALE", 1.0))
+        r_h = _range_huber_loss(pred_r_s, gt_r_s, delta=delta_logr).mean()
+
+        losses.append(phi_h + th_h + r_h)
+
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
 def _vec2c(v):
     v = v.float()
     xr, xi = v[:, ::2], v[:, 1::2]
@@ -285,17 +342,25 @@ class UltimateHybridLoss(nn.Module):
         B, K = phi_p.shape
         
         # Pairwise angular distances (with wrapping)
+        # CRITICAL: Use sqrt(x²+eps) instead of abs(x) for smooth gradient.
+        # abs(0) has gradient 0 in PyTorch, which means the diversity loss
+        # has ZERO gradient when slots are exactly identical (symmetric equilibrium).
+        # sqrt(x²+eps) ≈ |x| but has gradient ≈ x/sqrt(eps) near 0, which provides
+        # a well-defined repulsive signal to break symmetry.
+        _eps_smooth = 1e-6
+        
         dphi = phi_p.unsqueeze(2) - phi_p.unsqueeze(1)  # [B, K, K]
         dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))  # Wrap to [-π, π]
-        dphi = dphi.abs()  # [B, K, K]
+        dphi = torch.sqrt(dphi ** 2 + _eps_smooth)  # Smooth abs (non-zero gradient at 0)
         
         dtheta = theta_p.unsqueeze(2) - theta_p.unsqueeze(1)
         dtheta = torch.atan2(torch.sin(dtheta), torch.cos(dtheta))
-        dtheta = dtheta.abs()
+        dtheta = torch.sqrt(dtheta ** 2 + _eps_smooth)
         
         # Pairwise range distances (normalized by range span)
         r_span = float(getattr(cfg, "RANGE_R", (0.5, 10.0))[1] - getattr(cfg, "RANGE_R", (0.5, 10.0))[0])
-        dr = (r_p.unsqueeze(2) - r_p.unsqueeze(1)).abs() / r_span  # [B, K, K]
+        dr_raw = (r_p.unsqueeze(2) - r_p.unsqueeze(1)) / r_span  # [B, K, K]
+        dr = torch.sqrt(dr_raw ** 2 + _eps_smooth)
         
         # Combined distance (exclude diagonal)
         dist = dphi + dtheta + dr  # [B, K, K]
@@ -971,9 +1036,29 @@ class UltimateHybridLoss(nn.Module):
             r_span = (cfg.RANGE_R[1] - cfg.RANGE_R[0] + 1e-9)
             range_raw = (((r_p - r_t) / r_span)**2 * mask).sum() / (mask.sum() + 1e-9)
 
+        # CRITICAL FIX (2026-02-06): Sorted canonical aux loss to break symmetric equilibrium.
+        # When all slots predict identical values, permutation-invariant matching degenerates
+        # (all permutations have equal cost → argmin picks arbitrarily → gradient averages
+        # to dataset mean across the batch → slots stay collapsed at ~35° forever).
+        # The sorted loss gives DETERMINISTIC gradients: slot sorted-0 → leftmost GT,
+        # slot sorted-1 → second-leftmost GT, etc. This directly breaks symmetry.
+        loss_aux_sorted = torch.tensor(0.0, device=device)
+        lam_aux_sorted = float(getattr(mdl_cfg, "LAM_AUX_SORTED", 0.0))
+        if lam_aux_sorted > 0.0 and use_perm_aux:
+            loss_aux_sorted = _sorted_canonical_aux_loss(
+                phi_p, theta_p, r_p,
+                phi_t, theta_t, r_t,
+                K_true,
+            )
+            if not hasattr(self, "_sorted_aux_logged"):
+                print(f"[LOSS DEBUG] Sorted canonical aux loss: enabled @ weight={lam_aux_sorted:.3f}", flush=True)
+                self._sorted_aux_logged = True
+        
         # CRITICAL FIX (2026-02-05): Slot diversity loss to prevent collapse.
         # Without this, all slots converge to predict identical values (φ std = 0.04°).
         # The permutation-invariant loss doesn't penalize this symmetric solution.
+        # FIX (2026-02-06): Now uses smooth distance (sqrt(x²+ε)) instead of abs(x)
+        # so gradient is non-zero even when slots are exactly identical.
         loss_diversity = torch.tensor(0.0, device=device)
         lam_diversity = float(getattr(mdl_cfg, "LAM_SLOT_DIVERSITY", 0.1))
         if lam_diversity > 0.0 and use_perm_aux:
@@ -1097,6 +1182,7 @@ class UltimateHybridLoss(nn.Module):
             + self.lam_ortho * loss_ortho
             + self.lam_cross * loss_cross
             + self.lam_aux   * aux_l2
+            + lam_aux_sorted * loss_aux_sorted  # CRITICAL: Sorted canonical loss (breaks symmetry)
             + self.lam_peak  * peak_l2  # Chamfer/peak angle loss
             + 0.02           * range_raw
             + getattr(mdl_cfg, "LAM_ALIGN", 0.0) * loss_align
@@ -1112,9 +1198,13 @@ class UltimateHybridLoss(nn.Module):
         if not hasattr(self, '_loss_breakdown_printed'):
             aux_contrib = self.lam_aux * aux_l2.item() if isinstance(aux_l2, torch.Tensor) else 0
             cov_contrib = self.lam_cov * loss_nmse.item() if isinstance(loss_nmse, torch.Tensor) else 0
+            sorted_contrib = lam_aux_sorted * loss_aux_sorted.item() if isinstance(loss_aux_sorted, torch.Tensor) else 0
+            div_contrib = lam_diversity * loss_diversity.item() if isinstance(loss_diversity, torch.Tensor) else 0
             print(f"[LOSS BREAKDOWN] total={total.item():.4f}")
-            print(f"  lam_cov*nmse    = {self.lam_cov:.3f} * {loss_nmse.item():.4f} = {cov_contrib:.4f}")
-            print(f"  lam_aux*aux_l2  = {self.lam_aux:.3f} * {aux_l2.item():.4f} = {aux_contrib:.4f}")
+            print(f"  lam_cov*nmse        = {self.lam_cov:.3f} * {loss_nmse.item():.4f} = {cov_contrib:.4f}")
+            print(f"  lam_aux*aux_l2      = {self.lam_aux:.3f} * {aux_l2.item():.4f} = {aux_contrib:.4f}")
+            print(f"  lam_sorted*sorted   = {lam_aux_sorted:.3f} * {loss_aux_sorted.item():.4f} = {sorted_contrib:.4f}")
+            print(f"  lam_div*diversity   = {lam_diversity:.3f} * {loss_diversity.item():.4f} = {div_contrib:.4f}")
             self._loss_breakdown_printed = True
         
         return total

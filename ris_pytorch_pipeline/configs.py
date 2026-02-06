@@ -605,7 +605,17 @@ class ModelConfig:
         # 
         # NOTE: Weight must be small relative to aux_l2 (~1.5). With LAM=0.1, diversity 
         # dominated the loss (3.5/5.0 = 70%) causing instability. Use 0.01-0.02.
-        self.LAM_SLOT_DIVERSITY = 0.02  # Reduced from 0.1 → 0.02 (was dominating)
+        self.LAM_SLOT_DIVERSITY = 0.5   # Increased: 0.02 was 75x weaker than aux (1.5) → ineffective
+        
+        # CRITICAL FIX (2026-02-06): Sorted canonical aux loss to break symmetric equilibrium.
+        # When all slots predict the same phi, permutation-invariant matching degenerates:
+        # all permutations have equal cost → argmin picks arbitrarily → across the batch
+        # each slot's gradient averages to the dataset mean → slots stay collapsed at ~35°.
+        # The sorted loss sorts both predictions and GT by phi, then matches in sorted order.
+        # This gives deterministic gradients: sorted-slot-0 → leftmost GT, etc.
+        # Each slot learns the i-th order statistic of the source distribution, which
+        # spreads them across the FOV and breaks symmetric equilibrium within ~2-3 epochs.
+        self.LAM_AUX_SORTED = 1.0  # Same magnitude as lam_aux (1.5)
 
         # Presence/mask supervision
         #
