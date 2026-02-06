@@ -542,3 +542,89 @@ These do NOT affect the current training run:
 
 3. **Dead code** (~800 lines) — 3-phase curriculum, legacy factor helpers, unused functions.
    Already planned in `REFACTOR_PROGRESS.md`.
+
+---
+
+# Round 5: NMSE Gradient Domination Fix (2026-02-06)
+
+## Symptom
+
+After all Round 1–4 fixes, training run showed:
+- `aux_φ_rmse` stuck at **~34.7°** (= dataset mean for ±60° uniform)
+- `aux_θ_rmse` stuck at **~17.5°** (= dataset mean for ±30° uniform)
+- `aux_r_rmse` stuck at **~2.75m** (= dataset mean for [0.5, 10] uniform)
+- Train loss decreased slightly (3.54 → 3.49) but aux metrics were FLAT for 6 epochs
+- Gradients were finite (||g||₂ = 43.2), steps were taken — model appears to learn but doesn't
+
+## Root Cause: NMSE Gradient Dominates Clip Budget
+
+The total gradient norm was **43.2**, and `CLIP_NORM = 1.0`. Gradient clipping scales
+ALL gradients by `1.0 / 43.2 = 0.023` — a **43× reduction**.
+
+The NMSE loss on R_pred generates a massive gradient because:
+- R_pred is [B, 256, 256] complex (65,536 entries per sample)
+- The Jacobian ∂R_pred/∂(phi,theta,r) involves 256-dimensional steering vector derivatives
+- This gradient dominates the total norm
+
+The aux/sorted/diversity gradients operate on [B, 5] tensors and are comparatively tiny.
+After clipping, their effective learning rate is:
+
+```
+effective_head_LR = 1.2e-3 × (1.0 / 43.2) ≈ 2.8e-5
+```
+
+Over 1562 batches/epoch: total parameter change ≈ 0.044. With conflicting gradient directions
+across batches (permutation matching instability), the NET signal for geometry is near zero.
+
+### Why This Wasn't a Problem Before Round 1
+
+In the original code, `GEOM_ONLY_EPOCHS = 5` disabled NMSE for the first 5 epochs.
+But back then, `MASK_LOSS_WARMUP_EPOCHS = 10` also disabled mask losses, leaving only
+aux_l2 — which created a symmetric equilibrium.
+
+Round 1 fixed masks (warmup=0, bias=0.0) but ALSO set `GEOM_ONLY_EPOCHS = 0`,
+reasoning that "NMSE provides a second gradient path." In practice, the NMSE gradient
+is too large and drowns out the symmetry-breaking signals.
+
+## Fix
+
+### Change 1: `GEOM_ONLY_EPOCHS = 3` (was 0)
+
+Force `lam_cov = 0` for the first 3 epochs. Without the 256×256 NMSE gradient:
+- Total gradient norm drops from ~43 to ~5-10
+- Clip scale improves from 1/43 to 1/5–1/10
+- Aux/sorted/diversity get **5-10× more effective learning rate**
+- Slots should break symmetry within 3 epochs
+
+This is safe because mask BCE is active from epoch 0 (unlike the original setup).
+
+### Change 2: `STRUCTURED_COV_WARMUP_EPOCHS = 5` (was 0)
+
+After the geometry-only phase (epoch 3), ramp `lam_cov` from 0 → 1.0 over 5 epochs.
+This prevents the NMSE gradient from suddenly overwhelming the still-young aux signals.
+
+```
+Epoch  1-3:  lam_cov = 0.0  (geometry-only: aux + sorted + diversity + mask)
+Epoch  4:    lam_cov = 0.2  (NMSE starts ramping in)
+Epoch  5:    lam_cov = 0.4
+Epoch  6:    lam_cov = 0.6
+Epoch  7:    lam_cov = 0.8
+Epoch  8+:   lam_cov = 1.0  (full weight)
+```
+
+### Change 3: Fix double-processing bug in surrogate validation
+
+`_validate_surrogate_epoch` was building R_blend with `diag_load=True, apply_shrink=True`,
+then loss.py applied `build_effective_cov_torch` AGAIN with `diag_load=True, apply_shrink=True`.
+This double-processed R_blend and inflated the validation loss (~8.6 vs train ~3.5).
+
+Fixed to match training: `diag_load=False, apply_shrink=False` in the validation R_blend
+construction (loss.py does its own processing).
+
+## Expected Behavior
+
+- **Epochs 1-3**: Slots spread apart (diversity), sorted loss assigns each to different
+  order statistic of GT distribution. `aux_φ_rmse` should start decreasing below 35°.
+- **Epochs 4-8**: NMSE ramps in gradually. Geometry is already differentiated, so NMSE
+  gradient pushes R_pred toward correct per-sample covariance (not dataset average).
+- **Epochs 9+**: Full training with all losses. Expect continued improvement.

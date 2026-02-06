@@ -1804,14 +1804,18 @@ class Trainer:
                     if ("R_pred" in preds) and ("R_blend" not in preds):
                         try:
                             R_pred_val = preds["R_pred"]
+                            Nn = int(R_pred_val.shape[-1])
+                            # Match training: diag_load=False, apply_shrink=False here.
+                            # loss.py forward() applies its own build_effective_cov_torch
+                            # with diag_load=True, apply_shrink=True on R_blend.
                             R_eff = build_effective_cov_torch(
                                 R_pred_val,
-                                snr_db=snr,
+                                snr_db=None,
                                 R_samp=None,
                                 beta=None,
-                                diag_load=True,
-                                apply_shrink=True,
-                                target_trace=float(cfg.N),
+                                diag_load=False,
+                                apply_shrink=False,
+                                target_trace=float(Nn),
                             )
                             preds["R_blend"] = R_eff
                         except Exception:

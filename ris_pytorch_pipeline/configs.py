@@ -453,8 +453,10 @@ class ModelConfig:
 
     # --- Structural-R training stability ---
     # Warm up covariance loss so aux geometry learns first; then cov_nmse ramps in to improve MVDR readiness.
-    # CRITICAL: 5 epochs was too fast; geometry needs ~10-15 epochs to stabilize before cov pressure helps.
-    STRUCTURED_COV_WARMUP_EPOCHS = 0   # No warmup: lam_cov active from epoch 1
+    # CRITICAL (2026-02-06): With GEOM_ONLY=3, geometry breaks symmetry in first 3 epochs.
+    # Then ramp lam_cov over 5 epochs (epochs 4-8) so the 256×256 NMSE gradient doesn't
+    # overwhelm the aux/sorted/diversity signals before slots have differentiated.
+    STRUCTURED_COV_WARMUP_EPOCHS = 5   # Ramp lam_cov from 0→target over 5 epochs after GEOM_ONLY
     DH, DV = 3, 3
 
     def __init__(self):
@@ -556,13 +558,19 @@ class ModelConfig:
         # Geometry-only warmup:
         # For the first GEOM_ONLY_EPOCHS epochs, force lam_cov=0 even in joint mode.
         #
-        # CRITICAL FIX (2026-02-05): Reduced from 5 → 0.
-        # With GEOM_ONLY=5 AND MASK_WARMUP=10, the model gets ZERO covariance gradient
-        # for 5 epochs while mask losses are also off. The only signal is aux_l2, but
-        # perm-invariant matching creates a symmetric equilibrium (all slots → dataset mean).
-        # The NMSE gradient through R_pred actually helps break this by providing a
-        # second gradient path through the structured covariance.
-        self.GEOM_ONLY_EPOCHS = 0
+        # CRITICAL FIX (2026-02-06): Set to 3 (was 0).
+        # With GEOM_ONLY=0, the NMSE gradient through R_pred (256×256 matrix) dominates
+        # the total gradient norm (~43), and CLIP_NORM=1.0 scales ALL gradients by 1/43.
+        # This crushes the aux/sorted/diversity gradients to near-zero effective LR,
+        # preventing symmetry breaking. The slots stay at dataset mean forever.
+        #
+        # With GEOM_ONLY=3: epochs 1-3 have NO NMSE gradient, so the clip budget goes
+        # entirely to aux + sorted + diversity + mask. These can break symmetry in 3 epochs.
+        # After epoch 3, STRUCTURED_COV_WARMUP_EPOCHS=5 ramps NMSE in gradually.
+        #
+        # NOTE: This is safe now because MASK_LOSS_WARMUP_EPOCHS=0 (mask BCE active from
+        # epoch 0), unlike the original GEOM_ONLY=5 which coincided with MASK_WARMUP=10.
+        self.GEOM_ONLY_EPOCHS = 3
 
         # Aux permutation matching stability:
         # Hard argmin assignment can "flip" early, producing a non-smooth loss surface and
