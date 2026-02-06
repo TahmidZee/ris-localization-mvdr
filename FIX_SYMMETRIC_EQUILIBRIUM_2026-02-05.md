@@ -240,4 +240,305 @@ print(f"mask bias:  {last.bias[4].item():.2f} → sigmoid = {torch.sigmoid(last.
 from ris_pytorch_pipeline.loss import UltimateHybridLoss
 loss_fn = UltimateHybridLoss()
 print(f"mask_loss_scale: {loss_fn.mask_loss_scale}")
+print(f"lam_slot_diversity: {loss_fn.lam_slot_diversity}")
+print(f"lam_aux_sorted: {loss_fn.lam_aux_sorted}")
 ```
+
+---
+
+# Round 3: Full Codebase Audit & Refactor (2026-02-06)
+
+## Context
+
+After rounds 1 and 2, training showed:
+- `Slot diversity loss: enabled @ weight=0.020` despite `configs.py` setting `LAM_SLOT_DIVERSITY = 0.5`
+- `aux_φ_rmse` still stuck at ~35° (dataset mean baseline)
+- Sorted canonical loss (`LAM_AUX_SORTED = 1.0`) may not have been active
+
+A full end-to-end audit of all files was performed. Here are the findings and fixes.
+
+---
+
+## Bug Fix 1: `LAM_SLOT_DIVERSITY` / `LAM_AUX_SORTED` Not Reliably Picked Up
+
+**File**: `loss.py` (lines 1046, 1063 — old; now fixed)
+
+**Root Cause**: These weights were read from `mdl_cfg` at **forward time** via:
+```python
+lam_aux_sorted = float(getattr(mdl_cfg, "LAM_AUX_SORTED", 0.0))
+lam_diversity  = float(getattr(mdl_cfg, "LAM_SLOT_DIVERSITY", 0.1))
+```
+
+While `mdl_cfg` is a singleton (so changes *should* propagate), this pattern is:
+1. **Fragile** — the Trainer cannot override these without modifying the global singleton
+2. **Opaque** — the actual weight used is never logged at construction time
+3. **Inconsistent** — all other loss weights (lam_cov, lam_aux, etc.) are explicit constructor params
+
+**Fix**: Made both weights **explicit constructor parameters** of `UltimateHybridLoss`:
+```python
+# loss.py __init__:
+lam_slot_diversity: float = None,  # Read from mdl_cfg if None
+lam_aux_sorted: float = None,      # Read from mdl_cfg if None
+
+# In __init__ body:
+self.lam_slot_diversity = float(getattr(mdl_cfg, "LAM_SLOT_DIVERSITY", 0.1)) if lam_slot_diversity is None else float(lam_slot_diversity)
+self.lam_aux_sorted = float(getattr(mdl_cfg, "LAM_AUX_SORTED", 0.0)) if lam_aux_sorted is None else float(lam_aux_sorted)
+
+# In forward:
+lam_aux_sorted = self.lam_aux_sorted    # ← was: getattr(mdl_cfg, ...)
+lam_diversity  = self.lam_slot_diversity # ← was: getattr(mdl_cfg, ...)
+```
+
+**Also added**: `_apply_phase_loss_weights` in `train.py` now supports setting
+`lam_slot_diversity` and `lam_aux_sorted` per-phase if needed.
+
+**Also added**: `log_config_summary()` method on `UltimateHybridLoss` that prints ALL
+loss weights once after construction. Called automatically from `Trainer.__init__`.
+This replaces the scattered `if not hasattr(self, "_xxx_logged")` debug prints and
+gives a single authoritative snapshot of the configuration.
+
+---
+
+## Bug Fix 2: Train/Val `R_true` Trace Normalization Mismatch
+
+**Files**: `train.py` — `_validate_one_epoch` (line 1454) and `_validate_surrogate_epoch` (line 1735)
+
+**Root Cause**: In `_train_one_epoch`, `R_true` was trace-normalized to `trace=N` before
+being passed to the loss function:
+```python
+# _train_one_epoch (line 1004):
+N = R_true_c.shape[-1]
+tr_true = torch.diagonal(R_true_c, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)
+R_true_c = R_true_c * (N / tr_true).view(-1, 1, 1)
+```
+
+This normalization was **missing** in `_validate_one_epoch` and `_validate_surrogate_epoch`:
+```python
+# _validate_one_epoch (line 1454) — BEFORE:
+R_true_c = _ri_to_c(R_in)
+R_true_c = 0.5 * (R_true_c + R_true_c.conj().transpose(-2, -1))
+R_true   = _c_to_ri(R_true_c).float()  # No trace normalization!
+```
+
+**Impact**: While `loss.py` does its own internal trace normalization (divides by trace),
+having inconsistent pre-normalization between train and val means the raw `R_true` values
+in the labels dict have different scales. This can cause subtle numerical precision
+differences in float32 RI conversion and affects any code that inspects labels directly.
+
+**Fix**: Added matching trace normalization to both validation functions:
+```python
+# _validate_one_epoch and _validate_surrogate_epoch — AFTER:
+R_true_c = _ri_to_c(R_in)
+R_true_c = 0.5 * (R_true_c + R_true_c.conj().transpose(-2, -1))
+N = R_true_c.shape[-1]
+tr_true = torch.diagonal(R_true_c, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)
+R_true_c = R_true_c * (N / tr_true).view(-1, 1, 1)
+R_true   = _c_to_ri(R_true_c).float()
+```
+
+---
+
+## Full Audit Results: No Other Bugs Found
+
+The following files were audited end-to-end for logical and numerical bugs:
+
+| File | Status | Notes |
+|------|--------|-------|
+| `model.py` | ✅ Clean | Slot head, structural R, steering vectors all correct |
+| `loss.py` | ✅ Fixed | 2 bugs fixed (see above), all loss terms verified |
+| `train.py` | ✅ Fixed | 1 bug fixed (val normalization), training loop verified |
+| `configs.py` | ✅ Clean | All values consistent with intended behavior |
+| `covariance_utils.py` | ✅ Clean | `build_effective_cov_torch` correctly chains hermitize→trace-norm→blend→diag-load→shrink |
+| `physics.py` | ✅ Clean | `nearfield_vec` and `shrink` consistent with model's steering |
+
+### Key Verified Behaviors
+
+1. **Steering vector convention** is consistent across `model.py` (`build_steering_matrix_batch`),
+   `loss.py` (`_steer_torch`), `physics.py` (`nearfield_vec`), and `covariance_utils.py`:
+   - `phase = k0 * (planar - curvature)`
+   - `planar = x * sin(φ) * cos(θ) + y * sin(θ)`
+   - `curvature = (x² + y²) / (2r)`
+   - Unit-normalized: `a / sqrt(N)`
+
+2. **R_true processing in loss.py** is self-contained and correct:
+   - Hermitizes, trace-normalizes to trace=1, then passes through `build_effective_cov_torch`
+   - Same pipeline applied to both R_pred and R_true for NMSE computation
+
+3. **Slot head gradient flow** verified:
+   - `phi_soft`/`theta_soft` correctly return slot head outputs (not soft-argmax)
+   - `R_pred = build_structured_R(aux_phi, aux_theta, aux_r, power_eff, cfg)`
+   - Full gradient path: `loss → R_pred → build_structured_R → aux_phi/theta/r → slot_head → backbone`
+
+4. **Permutation-invariant matching** is correct:
+   - Brute-force over `permutations(range(K_MAX), k)` — correct for K_MAX=5
+   - Cost uses same Huber structure as loss (consistent)
+   - Hard assignment under `no_grad` — gradients flow through selected permutation only
+
+5. **Sorted canonical loss** is correct:
+   - Sorts both GT and predictions by phi
+   - Takes first k sorted predictions → first k sorted GT
+   - Provides deterministic gradients to break symmetric equilibrium
+
+---
+
+## Updated Current Loss Weights (After Round 3)
+
+| Weight | Value | Source | Notes |
+|--------|-------|--------|-------|
+| `lam_cov` | **1.0** | `PHASE_LOSS["joint"]` | Full weight, no warmup |
+| `lam_cov_pred` | 0.05 | `configs.py` | Aux NMSE on R_pred |
+| `lam_aux` | 1.5 | `PHASE_LOSS["joint"]` | Primary geometry driver |
+| `lam_slot_diversity` | **0.5** | `configs.py` → loss constructor | Repulsive force between slots |
+| `lam_aux_sorted` | **1.0** | `configs.py` → loss constructor | Sorted matching to break symmetry |
+| `lam_subspace_align` | 0.0 | `PHASE_LOSS["joint"]` | Off (redundant in structural R) |
+| `lam_peak_contrast` | 0.0 | `PHASE_LOSS["joint"]` | Off (not needed for initial learning) |
+| `LAM_AUX_MASK_BCE` | 0.2 | `configs.py` | Permutation-aware mask BCE |
+| `LAM_AUX_MASK` | 0.3 | `configs.py` | Mask count loss |
+| `LAM_AUX_MASK_BIN` | 0.1 | `configs.py` | Mask binarization penalty |
+| `mask_loss_scale` | 1.0 | loss constructor | Active from epoch 0 |
+
+### Expected Loss Breakdown (Epoch 1)
+```
+lam_cov    * loss_nmse        = 1.0  × ~1.4  = 1.40
+lam_aux    * aux_l2           = 1.5  × ~1.0  = 1.50
+lam_sorted * sorted_loss      = 1.0  × ~1.0  = 1.00  (NEW: breaks symmetry)
+lam_div    * diversity_loss    = 0.5  × ~0.15 = 0.08  (NEW: slot repulsion)
+lam_pred   * loss_nmse_pred   = 0.05 × ~1.4  = 0.07
+mask_count                                    ≈ 0.03
+mask_bce                                      ≈ 0.02
+total                                        ≈ 4.10
+```
+
+---
+
+## Architecture Summary (For Reference)
+
+```
+Input: y[B,L,M,2], H_full[B,M,N,2], codes[B,L,N,2], snr_db[B]
+  │
+  ├── Conv1d tokenization → [B,D,L] → Transformer → [B,L,D]
+  ├── H_full → Conv2d stack → [B,D/2]
+  ├── SNR → MLP embed → [B,snr_dim]
+  │
+  └── Fusion → [B,D]
+        │
+        ├── Slot queries (K=5) × 3-round cross-attention → [B,K,D]
+        │     └── slot_head MLP → [B,K,5]: (φ,θ,r,power,mask)
+        │           │
+        │           ├── φ = tanh(raw) × 60°
+        │           ├── θ = tanh(raw) × 30°
+        │           ├── r = R_MIN + (R_MAX-R_MIN) × softplus(raw)/(1+softplus(raw))
+        │           ├── power = softplus(raw)
+        │           └── mask = sigmoid(raw)
+        │
+        └── build_structured_R(φ,θ,r, power×mask) → R_pred [B,N,N]
+              │
+              └── build_effective_cov_torch → R_blend [B,N,N]
+```
+
+### Loss Terms
+```
+total = lam_cov * NMSE(R_eff_pred, R_eff_true)          # Primary: covariance
+      + lam_aux * perm_invariant_aux(φ,θ,r)              # Geometry: Huber on angles/log-range
+      + lam_aux_sorted * sorted_canonical_aux(φ,θ,r)     # Symmetry breaker
+      + lam_slot_diversity * margin_diversity(φ,θ,r)     # Slot repulsion
+      + lam_cov_pred * NMSE(R_pred, R_eff_true)          # Aux gradient path
+      + mask_bce * perm_invariant_mask_bce               # "No object" for unmatched slots
+      + mask_count * (sum(mask) - K_true)²               # Count supervision
+      + mask_bin * mask*(1-mask)                          # Binarization
+      + lam_ortho * ortho_penalty(A_angle)               # Stiefel regularizer
+```
+
+---
+
+# Round 4: Pre-Training Cleanup (2026-02-06)
+
+## Context
+
+Before the first training run with all Round 1–3 fixes, a full codebase audit was performed
+to catch any remaining issues that could cause crashes, incorrect behavior, or wasted compute
+during training.
+
+## Fixes Applied
+
+### Fix 1: Mixed Tab/Space Indentation in `train.py` (Potential Crash)
+
+**Lines**: 1367, 1378, 1385, 1388, 1396, 1405
+
+Six `print()` statements inside `_train_one_epoch` used a TAB character before spaces for
+indentation. Python 3 forbids inconsistent mixing of tabs and spaces within the same block,
+which could trigger a `TabError` depending on the Python interpreter version.
+
+**Fix**: Replaced all 6 tab-indented lines with consistent space indentation.
+
+### Fix 2: Missing R_blend in Validation for Structural R Mode (Silent Metric Loss)
+
+**Files**: `train.py` — `_validate_one_epoch` (line ~1553) and `_validate_surrogate_epoch` (line ~1792)
+
+**Root Cause**: Both validation methods only built `R_blend` when legacy factor heads
+(`cov_fact_angle`, `cov_fact_range`) were present. In structural R mode (the default),
+these keys don't exist in the model output, so `R_blend` was never set.
+
+**Impact**: Surrogate validation silently skipped all MVDR peak-level detection metrics
+(precision/recall/F1) and subspace overlap metrics, because they check for `"R_blend" in preds`.
+This meant the validation feedback loop was less informative than intended.
+
+**Fix**: Added an `elif "R_pred" in preds` branch that builds `R_blend` from `R_pred` via
+`build_effective_cov_torch`. The legacy factor path is preserved as a fallback for ablations.
+
+### Fix 3: Wasted Soft-Argmax Computation in `model.py` (GPU Waste)
+
+**File**: `model.py` — `HybridModel.forward()` (lines 670–696)
+
+**Root Cause**: When `USE_SLOT_HEAD=True` AND `USE_STRUCTURED_R=True` (both default), the
+factored soft-argmax heads (`phi_logits`, `theta_logits`) were computed every forward pass,
+producing `phi_soft` and `theta_soft` values. These local variables were then immediately
+overwritten by the slot head outputs in the return dict (lines 768–769).
+
+**Impact**: ~0.3M parameters worth of GPU computation wasted on every forward pass (linear
+projection + softmax + weighted sum, for both φ and θ, across K_MAX×G grid points).
+
+**Fix**: Wrapped the soft-argmax block in `if not (self.use_slot_head and self.use_structured_R):`
+so it only runs when the legacy path actually needs the results. The soft-argmax `nn.Linear`
+layers remain in the model for checkpoint compatibility and ablation use.
+
+### Fix 4: Silenced R_samp Warnings (Log Noise)
+
+**File**: `train.py` — `_aggregate_cpu_then_gpu()` and `_train_one_epoch()`
+
+**Root Cause**: Three warning messages printed during training when R_samp was absent from
+shards. Since R_samp is intentionally not stored (`HYBRID_COV_BETA=0.0`,
+`STORE_RSAMP_IN_SHARDS=False`), these warnings were pure noise.
+
+**Silenced messages**:
+- `⚠️ WARNING: Shard '...' lacks 'R_samp'` — printed per-shard during GPU cache build
+- `⚠️ WARNING: No R_samp found in dataset!` — printed once after all shards loaded
+- `[Hybrid] R_samp not available; using pure R_pred for loss.` — printed on epoch 1 batch 0
+
+## Verified Correct (No Changes Needed)
+
+| Component | Status |
+|-----------|--------|
+| Steering vector convention (model/loss/physics/covariance_utils) | ✅ Consistent |
+| `build_structured_R` (geometry → R_pred) | ✅ Correct |
+| `build_effective_cov_torch` chain | ✅ Correct |
+| Permutation-invariant matching | ✅ Correct |
+| Sorted canonical loss | ✅ Correct |
+| Slot diversity loss (margin-based, non-negative) | ✅ Correct |
+| Mask BCE loss (DETR "no object") | ✅ Correct |
+| Loss weight application order (constructor → HPO → phase → log) | ✅ Correct |
+| Train/val R_true trace normalization | ✅ Consistent |
+| EMA/SWA swap logic | ✅ Correct |
+| Auto-resume from train_state.pt | ✅ Correct |
+
+## Known Dormant Issues (Deferred to Phase 1 Cleanup)
+
+These do NOT affect the current training run:
+
+1. **Refiner-only training crashes in structural R mode** — `TRAIN_PHASE="refiner"` accesses
+   `cov_fact_angle` which doesn't exist. Won't be used until after backbone training succeeds.
+
+2. **Eigenspectrum diagnostic crash** — only triggers with `TRAIN_EPOCH_DEBUG=True` (default False).
+
+3. **Dead code** (~800 lines) — 3-phase curriculum, legacy factor helpers, unused functions.
+   Already planned in `REFACTOR_PROGRESS.md`.

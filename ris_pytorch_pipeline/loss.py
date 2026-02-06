@@ -281,6 +281,8 @@ class UltimateHybridLoss(nn.Module):
         lam_heatmap: float = 0.0,   # SpectrumRefiner heatmap supervision
         heatmap_sigma_phi: float = 2.0,   # Gaussian blob sigma (grid cells)
         heatmap_sigma_theta: float = 2.0,
+        lam_slot_diversity: float = None,  # Slot diversity loss weight (read from mdl_cfg if None)
+        lam_aux_sorted: float = None,      # Sorted canonical aux loss weight (read from mdl_cfg if None)
     ):
         super().__init__()
         self.lam_cov   = lam_cov   # Covariance NMSE weight (CRITICAL!)
@@ -302,6 +304,15 @@ class UltimateHybridLoss(nn.Module):
         self.lam_heatmap = lam_heatmap
         self.heatmap_sigma_phi = heatmap_sigma_phi
         self.heatmap_sigma_theta = heatmap_sigma_theta
+
+        # CRITICAL FIX (2026-02-06): Read LAM_SLOT_DIVERSITY and LAM_AUX_SORTED
+        # at construction time from mdl_cfg, and store as instance attributes.
+        # Previously these were read from mdl_cfg at forward time via getattr(),
+        # which was fragile (if mdl_cfg was replaced/reloaded, the reference would
+        # break) and made it impossible for the Trainer to override them explicitly.
+        # Now the Trainer can set self.loss_fn.lam_slot_diversity = X directly.
+        self.lam_slot_diversity = float(getattr(mdl_cfg, "LAM_SLOT_DIVERSITY", 0.1)) if lam_slot_diversity is None else float(lam_slot_diversity)
+        self.lam_aux_sorted = float(getattr(mdl_cfg, "LAM_AUX_SORTED", 0.0)) if lam_aux_sorted is None else float(lam_aux_sorted)
         
         # Mask loss scale: controlled by Trainer based on MASK_LOSS_WARMUP_EPOCHS.
         # CRITICAL FIX (2026-02-05): Default to 1.0 (was 0.0).
@@ -314,6 +325,22 @@ class UltimateHybridLoss(nn.Module):
         self.aux_match_soft = False
         self.aux_match_tau = 0.25
     
+    def log_config_summary(self):
+        """Print a one-time summary of all loss weights (call from Trainer after setup)."""
+        if hasattr(self, "_config_summary_logged"):
+            return
+        print(f"[LOSS CONFIG] lam_cov={self.lam_cov:.3f}, lam_cov_pred={self.lam_cov_pred:.3f}, "
+              f"lam_aux={self.lam_aux:.3f}, lam_ortho={self.lam_ortho:.4f}", flush=True)
+        print(f"[LOSS CONFIG] lam_slot_diversity={self.lam_slot_diversity:.3f}, "
+              f"lam_aux_sorted={self.lam_aux_sorted:.3f}", flush=True)
+        print(f"[LOSS CONFIG] lam_subspace_align={self.lam_subspace_align:.3f}, "
+              f"lam_peak_contrast={self.lam_peak_contrast:.3f}, "
+              f"lam_heatmap={self.lam_heatmap:.3f}", flush=True)
+        print(f"[LOSS CONFIG] mask_loss_scale={self.mask_loss_scale:.2f}, "
+              f"mask_bce={float(getattr(mdl_cfg, 'LAM_AUX_MASK_BCE', 0.0)):.3f}, "
+              f"mask_count={float(getattr(mdl_cfg, 'LAM_AUX_MASK', 0.0)):.3f}", flush=True)
+        self._config_summary_logged = True
+
     def set_mask_loss_scale(self, scale: float):
         """Set the mask loss scale (0.0 = disabled, 1.0 = full weight)"""
         self.mask_loss_scale = float(max(0.0, min(1.0, scale)))
@@ -1043,7 +1070,7 @@ class UltimateHybridLoss(nn.Module):
         # The sorted loss gives DETERMINISTIC gradients: slot sorted-0 → leftmost GT,
         # slot sorted-1 → second-leftmost GT, etc. This directly breaks symmetry.
         loss_aux_sorted = torch.tensor(0.0, device=device)
-        lam_aux_sorted = float(getattr(mdl_cfg, "LAM_AUX_SORTED", 0.0))
+        lam_aux_sorted = self.lam_aux_sorted
         if lam_aux_sorted > 0.0 and use_perm_aux:
             loss_aux_sorted = _sorted_canonical_aux_loss(
                 phi_p, theta_p, r_p,
@@ -1060,7 +1087,7 @@ class UltimateHybridLoss(nn.Module):
         # FIX (2026-02-06): Now uses smooth distance (sqrt(x²+ε)) instead of abs(x)
         # so gradient is non-zero even when slots are exactly identical.
         loss_diversity = torch.tensor(0.0, device=device)
-        lam_diversity = float(getattr(mdl_cfg, "LAM_SLOT_DIVERSITY", 0.1))
+        lam_diversity = self.lam_slot_diversity
         if lam_diversity > 0.0 and use_perm_aux:
             loss_diversity = self._slot_diversity_loss(phi_p, theta_p, r_p)
             if not hasattr(self, "_diversity_logged"):

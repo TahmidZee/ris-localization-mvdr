@@ -280,6 +280,9 @@ class Trainer:
         # Apply phase-specific loss weights (overrides defaults/HPO for the chosen phase)
         self._apply_phase_loss_weights(self.phase)
 
+        # Log final loss config after all overrides are applied
+        self.loss_fn.log_config_summary()
+
         # Finalize refiner-only loss setup after all schedules/overrides
         if self.train_refiner_only:
             self.loss_fn.lam_cov = 0.0
@@ -571,6 +574,11 @@ class Trainer:
         # NOTE: lam_K removed - using MVDR peak detection instead
         if "lam_peak_contrast" in weights:
             self.loss_fn.lam_peak_contrast = float(weights["lam_peak_contrast"])
+        # Slot diversity & sorted aux (can be overridden per-phase if needed)
+        if "lam_slot_diversity" in weights:
+            self.loss_fn.lam_slot_diversity = float(weights["lam_slot_diversity"])
+        if "lam_aux_sorted" in weights:
+            self.loss_fn.lam_aux_sorted = float(weights["lam_aux_sorted"])
         # Eigengap/margin disabled globally (ignore any config values).
         self.loss_fn.lam_gap = 0.0
         self.loss_fn.lam_margin = 0.0
@@ -790,11 +798,10 @@ class Trainer:
                         print(f"⚠️  WARNING: Shard '{shard_path}' lacks 'H_full'. Hybrid blending will fail!")
                         H_full = None
                     
-                    # CRITICAL FIX: Load R_samp if present (for hybrid covariance in loss)
+                    # Load R_samp if present (for optional hybrid covariance blending)
                     if "R_samp" in z:
                         R_samp_batch = torch.from_numpy(z["R_samp"][sel])  # (B,N,N,2)
                     else:
-                        print(f"⚠️  WARNING: Shard '{shard_path}' lacks 'R_samp'. Training will use pure R_pred!")
                         R_samp_batch = None
                 except Exception:
                     print(f"[GPU cache][ERROR] slicing shard='{shard_path}' at indices {sel[:3]}..{sel[-3:]} (count={sel.size})")
@@ -837,13 +844,11 @@ class Trainer:
         else:
             print(f"⚠️  WARNING: No H_full found in dataset! Hybrid covariance will be disabled.")
         
-        # CRITICAL FIX: Concatenate R_samp if present (for hybrid loss)
+        # Concatenate R_samp if present (for optional hybrid blending)
         R_samp = None
         if R_samps:
             R_samp = torch.cat(R_samps, 0)
             print(f"[GPU cache] R_samp loaded: shape={R_samp.shape}")
-        else:
-            print(f"⚠️  WARNING: No R_samp found in dataset! Training will use pure R_pred.")
 
         gb = (y.numel()*y.element_size()
             + H.numel()*H.element_size()
@@ -1131,11 +1136,7 @@ class Trainer:
                         Bn, Nn = int(R_pred.shape[0]), int(R_pred.shape[1])
                         assert R_pred.shape == (Bn, Nn, Nn), f"R_pred bad shape: {tuple(R_pred.shape)}"
 
-                        # Optional hybrid blend if offline R_samp exists (currently typically absent).
-                        # NOTE: Offline R_samp is typically absent in current shards; keep this path simple and safe.
-                        # We still attach R_blend for downstream loss plumbing.
-                        if epoch == 1 and bi == 0:
-                            print("[Hybrid] R_samp not available; using pure R_pred for loss.", flush=True)
+                        # Build R_blend from R_pred (R_samp is not used in this pipeline).
                         preds_fp32["R_blend"] = build_effective_cov_torch(
                             R_pred,
                             snr_db=None,
@@ -1356,7 +1357,7 @@ class Trainer:
                 if not ok:
                     if epoch == 1:
                         if _should_log_batch(bi):
-	                            print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
+                            print(f"[STEP] batch={bi} SKIPPED - overflow_hint={overflow_hint} ||g||_2={g_total:.3e}", flush=True)
                     self.opt.zero_grad(set_to_none=True)
                     self.scaler.update()  # Still update scaler state
                 else:
@@ -1367,17 +1368,17 @@ class Trainer:
                     scaler_skipped = (scale_after_step < scale_before_step)
                     self.opt.zero_grad(set_to_none=True)
                     if loopcheck_dbg and _should_log_batch(bi):
-	                        print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
+                        print(f"[LOOP-CHECK] bi={bi} did_step", flush=True)  # Verify loop fix
                     stepped = (not scaler_skipped)
                     
                     # Expert fix: Log when step is actually taken
                     if epoch == 1:
                         if scaler_skipped:
                             if _should_log_batch(bi):
-	                                print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
+                                print(f"[STEP] batch={bi} AMP SKIPPED (scale {scale_before_step:.1f}→{scale_after_step:.1f})", flush=True)
                         else:
                             if _should_log_batch(bi):
-	                                print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
+                                print(f"[STEP] batch={bi} STEP TAKEN - g_total={g_total:.3e}", flush=True)
                     
                     # Expert fix: Track steps taken (only when optimizer step actually applied)
                     if stepped:
@@ -1385,7 +1386,7 @@ class Trainer:
                     if epoch == 1 and bi < 3:
                         lrs = [g['lr'] for g in self.opt.param_groups]
                         if epoch_dbg:
-	                            print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
+                            print(f"[OPT] step {self._steps_taken} / batch {self._batches_seen} LRs={lrs}", flush=True)
                     
                     # Expert fix: Parameter drift probe - measure BEFORE EMA update
                     with torch.no_grad():
@@ -1394,7 +1395,7 @@ class Trainer:
                         delta = (vec_now - getattr(self, "_param_vec_prev", vec_now)).norm().item()
                         self._param_vec_prev = vec_now.detach().clone()
                         if _should_log_batch(bi):
-	                            print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
+                            print(f"[STEP] Δparam ||·||₂ = {delta:.3e}", flush=True)
                     
                     if stepped:
                         self._ema_update()
@@ -1453,6 +1454,10 @@ class Trainer:
 
             R_true_c = _ri_to_c(R_in)
             R_true_c = 0.5 * (R_true_c + R_true_c.conj().transpose(-2, -1))
+            # FIX (2026-02-06): Match _train_one_epoch — trace-normalize R_true to trace=N
+            N = R_true_c.shape[-1]
+            tr_true = torch.diagonal(R_true_c, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)
+            R_true_c = R_true_c * (N / tr_true).view(-1, 1, 1)
             R_true   = _c_to_ri(R_true_c).float()
             labels   = {"R_true": R_true, "ptr": ptr, "K": K, "snr_db": snr}
 
@@ -1537,8 +1542,25 @@ class Trainer:
                         else:
                             labels_fp32[k] = v
 
-                    # TRAIN/VAL ALIGNMENT: build R_blend in validation (same as training) when R_samp is present.
-                    if (R_samp is not None) and ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
+                    # TRAIN/VAL ALIGNMENT: build R_blend in validation (same as training).
+                    # Structural R mode: R_pred is already in preds; wrap it through build_effective_cov_torch.
+                    # Legacy factor mode: build R_pred from factor vecs first.
+                    if "R_pred" in preds and "R_blend" not in preds:
+                        try:
+                            R_pred_val = preds["R_pred"]
+                            Nn = int(R_pred_val.shape[-1])
+                            preds["R_blend"] = build_effective_cov_torch(
+                                R_pred_val,
+                                snr_db=None,
+                                R_samp=None,
+                                beta=None,
+                                diag_load=False,
+                                apply_shrink=False,
+                                target_trace=float(Nn),
+                            )
+                        except Exception:
+                            pass
+                    elif (R_samp is not None) and ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
                         try:
                             R_samp_c = _ri_to_c(R_samp.float())
                             R_samp_c = 0.5 * (R_samp_c + R_samp_c.conj().transpose(-2, -1))
@@ -1734,6 +1756,10 @@ class Trainer:
                 # Prepare labels
                 R_true_c = _ri_to_c(R_in)
                 R_true_c = 0.5 * (R_true_c + R_true_c.conj().transpose(-2, -1))
+                # FIX (2026-02-06): Match _train_one_epoch — trace-normalize R_true to trace=N
+                N_dim = R_true_c.shape[-1]
+                tr_true = torch.diagonal(R_true_c, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)
+                R_true_c = R_true_c * (N_dim / tr_true).view(-1, 1, 1)
                 R_true = _c_to_ri(R_true_c).float()
                 labels = {"R_true": R_true, "ptr": ptr, "K": K, "snr_db": snr}
                 
@@ -1770,10 +1796,27 @@ class Trainer:
                             labels_fp32[k] = v
 
                     # TRAIN/VAL/INFER ALIGNMENT:
-                    # Always build an effective covariance from the factor heads, even when R_samp is absent.
+                    # Always build an effective covariance, even when R_samp is absent.
                     # This enables MVDR-like validation (peak metrics + subspace overlap) and ensures that
                     # "surrogate" metrics actually correlate with MVDR-first performance.
-                    if ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
+                    # Structural R mode: R_pred is already in preds.
+                    # Legacy factor mode: build R_pred from factor vecs first.
+                    if ("R_pred" in preds) and ("R_blend" not in preds):
+                        try:
+                            R_pred_val = preds["R_pred"]
+                            R_eff = build_effective_cov_torch(
+                                R_pred_val,
+                                snr_db=snr,
+                                R_samp=None,
+                                beta=None,
+                                diag_load=True,
+                                apply_shrink=True,
+                                target_trace=float(cfg.N),
+                            )
+                            preds["R_blend"] = R_eff
+                        except Exception:
+                            pass
+                    elif ("cov_fact_angle" in preds) and ("cov_fact_range" in preds):
                         try:
                             lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
                             R_pred = build_R_pred_from_factor_vecs(

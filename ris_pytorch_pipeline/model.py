@@ -668,32 +668,38 @@ class HybridModel(nn.Module):
         feats_final = self.heads_ln(feats_enhanced)
 
         # --- soft-argmax grid head (angles) with enhanced features ---
-        G = self._G
-        
-        if self.use_factored_softargmax and self.phi_logits is not None:
-            # Factored: separate 1D softmax for φ and θ
-            phi_logits_raw = self.phi_logits(feats_final).view(B, cfg.K_MAX, G)    # [B, K, G]
-            theta_logits_raw = self.theta_logits(feats_final).view(B, cfg.K_MAX, G)  # [B, K, G]
-            
-            # Soft-argmax over 1D grids
-            phi_grid = self.soft_argmax.grid_phi  # [G]
-            theta_grid = self.soft_argmax.grid_theta  # [G]
-            tau = max(self.soft_argmax.tau, 1e-2)
-            
-            phi_weights = F.softmax(phi_logits_raw / tau, dim=-1)  # [B, K, G]
-            theta_weights = F.softmax(theta_logits_raw / tau, dim=-1)  # [B, K, G]
-            
-            phi_soft = (phi_weights * phi_grid.view(1, 1, G)).sum(-1)  # [B, K]
-            theta_soft = (theta_weights * theta_grid.view(1, 1, G)).sum(-1)  # [B, K]
-        else:
-            # Legacy: joint 2D grid
-            logits = self.logits_gg(feats_final).view(B, cfg.K_MAX, G, G)  # [B, K, G, G]
-            phi_list, theta_list = [], []
-            for k in range(cfg.K_MAX):
-                phi_k, theta_k = self.soft_argmax(logits[:, k])
-                phi_list.append(phi_k); theta_list.append(theta_k)
-            phi_soft = torch.stack(phi_list, dim=1)  # [B, K]
-            theta_soft = torch.stack(theta_list, dim=1)  # [B, K]
+        # NOTE: When USE_SLOT_HEAD + USE_STRUCTURED_R are both True (default),
+        # the slot head outputs override phi_soft/theta_soft. Skip the expensive
+        # soft-argmax computation in that case to save GPU time (~0.3M params worth).
+        # The soft-argmax heads are only needed in the legacy factor path.
+        phi_soft = None
+        theta_soft = None
+        if not (self.use_slot_head and self.use_structured_R):
+            G = self._G
+            if self.use_factored_softargmax and self.phi_logits is not None:
+                # Factored: separate 1D softmax for φ and θ
+                phi_logits_raw = self.phi_logits(feats_final).view(B, cfg.K_MAX, G)    # [B, K, G]
+                theta_logits_raw = self.theta_logits(feats_final).view(B, cfg.K_MAX, G)  # [B, K, G]
+                
+                # Soft-argmax over 1D grids
+                phi_grid = self.soft_argmax.grid_phi  # [G]
+                theta_grid = self.soft_argmax.grid_theta  # [G]
+                tau = max(self.soft_argmax.tau, 1e-2)
+                
+                phi_weights = F.softmax(phi_logits_raw / tau, dim=-1)  # [B, K, G]
+                theta_weights = F.softmax(theta_logits_raw / tau, dim=-1)  # [B, K, G]
+                
+                phi_soft = (phi_weights * phi_grid.view(1, 1, G)).sum(-1)  # [B, K]
+                theta_soft = (theta_weights * theta_grid.view(1, 1, G)).sum(-1)  # [B, K]
+            else:
+                # Legacy: joint 2D grid
+                logits = self.logits_gg(feats_final).view(B, cfg.K_MAX, G, G)  # [B, K, G, G]
+                phi_list, theta_list = [], []
+                for k in range(cfg.K_MAX):
+                    phi_k, theta_k = self.soft_argmax(logits[:, k])
+                    phi_list.append(phi_k); theta_list.append(theta_k)
+                phi_soft = torch.stack(phi_list, dim=1)  # [B, K]
+                theta_soft = torch.stack(theta_list, dim=1)  # [B, K]
 
         # ------------------------------------------------------------
         # Slot head: per-source (phi, theta, r, power, mask) prediction
