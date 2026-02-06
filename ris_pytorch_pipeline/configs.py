@@ -555,11 +555,16 @@ class ModelConfig:
         self.SLOT_QUERY_INIT_STD = 3.0
         self.SLOT_QUERY_INIT_ORTHO = True
 
-        # Geometry-only warmup (recommended):
+        # Geometry-only warmup:
         # For the first GEOM_ONLY_EPOCHS epochs, force lam_cov=0 even in joint mode.
-        # This lets the slot head lock onto φ/θ/r before covariance NMSE starts pulling
-        # on the structured covariance target.
-        self.GEOM_ONLY_EPOCHS = 5
+        #
+        # CRITICAL FIX (2026-02-05): Reduced from 5 → 0.
+        # With GEOM_ONLY=5 AND MASK_WARMUP=10, the model gets ZERO covariance gradient
+        # for 5 epochs while mask losses are also off. The only signal is aux_l2, but
+        # perm-invariant matching creates a symmetric equilibrium (all slots → dataset mean).
+        # The NMSE gradient through R_pred actually helps break this by providing a
+        # second gradient path through the structured covariance.
+        self.GEOM_ONLY_EPOCHS = 0
 
         # Aux permutation matching stability:
         # Hard argmin assignment can "flip" early, producing a non-smooth loss surface and
@@ -605,13 +610,20 @@ class ModelConfig:
         self.LAM_SLOT_DIVERSITY = 0.02  # Reduced from 0.1 → 0.02 (was dominating)
 
         # Presence/mask supervision
-        # CRITICAL: Mask losses interfere with geometry learning when geometry is still random.
-        # The permutation matching for mask BCE depends on geometry predictions being reasonable.
-        # If geometry is stuck at ~0°, matching is random → gradients cancel → nothing learns.
-        # 
-        # FIX: Disable mask losses for the first MASK_LOSS_WARMUP_EPOCHS epochs.
-        # After that, ramp them up gradually.
-        self.MASK_LOSS_WARMUP_EPOCHS = 10  # Disable mask losses for first 10 epochs
+        #
+        # CRITICAL FIX (2026-02-05): Mask warmup reduced from 10 → 0.
+        # The mask warmup was the PRIMARY cause of the "not learning" bug.
+        # Without mask loss, unmatched slots get NO gradient (unlike DETR which always
+        # pushes unmatched queries toward "no object"). This creates a symmetric equilibrium
+        # where all slots converge to the dataset mean because:
+        #   - Only K of K_MAX slots get geometry gradient per sample
+        #   - Different samples match different slots → average gradient → dataset mean
+        #   - Masks stay at sigmoid(-2)≈0.12 → power_eff≈0.015 → R_pred≈noise → NMSE≈1
+        # Enabling mask BCE from epoch 0 gives ALL slots a gradient signal:
+        #   - Matched slots → mask target = 1 (be active)
+        #   - Unmatched slots → mask target = 0 (turn off)
+        # This is exactly DETR's "no object" mechanism.
+        self.MASK_LOSS_WARMUP_EPOCHS = 0  # No warmup - mask BCE from epoch 0
         self.LAM_AUX_MASK = 0.3        # Count-based loss (moderate)
         self.LAM_AUX_MASK_BIN = 0.1    # Binarization penalty
         self.LAM_AUX_MASK_BCE = 0.2    # Permutation-aware BCE

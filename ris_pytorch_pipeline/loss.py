@@ -246,9 +246,11 @@ class UltimateHybridLoss(nn.Module):
         self.heatmap_sigma_phi = heatmap_sigma_phi
         self.heatmap_sigma_theta = heatmap_sigma_theta
         
-        # Mask loss warmup: scale all mask losses by this factor (0.0 to disable, 1.0 for full)
-        # Set by Trainer based on epoch and MASK_LOSS_WARMUP_EPOCHS
-        self.mask_loss_scale = 0.0  # Start disabled
+        # Mask loss scale: controlled by Trainer based on MASK_LOSS_WARMUP_EPOCHS.
+        # CRITICAL FIX (2026-02-05): Default to 1.0 (was 0.0).
+        # With MASK_LOSS_WARMUP_EPOCHS=0 (no warmup), mask losses should be active
+        # from epoch 0 to provide the "no object" gradient for unmatched slots.
+        self.mask_loss_scale = 1.0  # Active by default
 
         # Aux matching mode (perm-invariant geometry loss):
         # Use soft matching early to avoid assignment flips, then switch to hard.
@@ -815,23 +817,40 @@ class UltimateHybridLoss(nn.Module):
             self._shape_debug_done = True
         loss_nmse = self._nmse_cov(R_eff_pred, R_eff_true).mean()
         
-        # NEW: small auxiliary NMSE on R_pred (constructed from factors) to prevent hiding
-        # Only compute when factor heads are present AND not in pure overfit mode
+        # Auxiliary NMSE on R_pred to provide a second gradient path through geometry.
+        # CRITICAL FIX (2026-02-05): Added structural R mode path.
+        # Previously this only worked with legacy factor heads (cov_fact_angle/range),
+        # which are absent in structural R mode → loss_nmse_pred was always 0.
+        # Now we also compute NMSE directly on R_pred when it's available.
         loss_nmse_pred = torch.tensor(0.0, device=device)
         lam_cov_pred = 0.0 if getattr(mdl_cfg, "OVERFIT_NMSE_PURE", False) else self.lam_cov_pred
-        if lam_cov_pred > 0.0 and ("cov_fact_angle" in y_pred) and ("cov_fact_range" in y_pred):
-            # Rebuild R_pred from factors (same as fallback branch)
-            R_pred_aux = (A_angle @ A_angle.conj().transpose(-2, -1)) + self.lam_range_factor * (A_range @ A_range.conj().transpose(-2, -1))
-            R_pred_aux = build_effective_cov_torch(
-                R_pred_aux,
-                snr_db=y_true.get("snr_db", None),
-                R_samp=None,
-                beta=None,
-                diag_load=True,
-                apply_shrink=("snr_db" in y_true),
-                target_trace=float(cfg.N),
-            )
-            loss_nmse_pred = self._nmse_cov(R_pred_aux, R_eff_true).mean()
+        if lam_cov_pred > 0.0:
+            if "R_pred" in y_pred and "R_blend" not in y_pred:
+                # Structural R mode: compute NMSE directly on R_pred (already available)
+                # This gives a direct gradient path: NMSE → R_pred → build_structured_R → geometry
+                R_pred_eff = build_effective_cov_torch(
+                    y_pred['R_pred'],
+                    snr_db=y_true.get("snr_db", None),
+                    R_samp=None,
+                    beta=None,
+                    diag_load=True,
+                    apply_shrink=("snr_db" in y_true),
+                    target_trace=float(cfg.N),
+                )
+                loss_nmse_pred = self._nmse_cov(R_pred_eff, R_eff_true).mean()
+            elif ("cov_fact_angle" in y_pred) and ("cov_fact_range" in y_pred):
+                # Legacy factor mode: rebuild R_pred from factors
+                R_pred_aux = (A_angle @ A_angle.conj().transpose(-2, -1)) + self.lam_range_factor * (A_range @ A_range.conj().transpose(-2, -1))
+                R_pred_aux = build_effective_cov_torch(
+                    R_pred_aux,
+                    snr_db=y_true.get("snr_db", None),
+                    R_samp=None,
+                    beta=None,
+                    diag_load=True,
+                    apply_shrink=("snr_db" in y_true),
+                    target_trace=float(cfg.N),
+                )
+                loss_nmse_pred = self._nmse_cov(R_pred_aux, R_eff_true).mean()
         
         # Debug logging (once per run)
         if not hasattr(self, '_loss_debug_printed'):

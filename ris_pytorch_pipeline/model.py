@@ -360,20 +360,27 @@ class HybridModel(nn.Module):
                 nn.Linear(slot_hidden, 5),  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
             )
             # ------------------------------------------------------------
-            # Initialization: make early structured-R stable
+            # Initialization: DETR-style balanced start
             # ------------------------------------------------------------
-            # At init, predicting K_max equally-active sources (mask~0.5, power~0.7) creates a
-            # noisy rank-K_max covariance that can hurt early learning. We bias the slot head
-            # to start with *sparse* masks and low effective power, and let the mask-count loss
-            # + aux loss open up the needed slots.
+            # CRITICAL FIX (2026-02-05): Changed mask_logit bias from -2.0 → 0.0.
+            # With bias=-2.0, sigmoid(-2)≈0.12 → all masks start very low.
+            # Combined with mask warmup (now removed), masks never got gradient and
+            # stayed at 0.12 forever, making power_eff≈0.015 and R_pred≈noise.
+            #
+            # With bias=0.0, sigmoid(0)=0.5 → all masks start at 50%. The mask BCE
+            # loss (now active from epoch 0) will push matched slots → 1 and
+            # unmatched slots → 0, exactly like DETR's "no object" class.
+            #
+            # Power bias also changed from -2.0 → 0.0:
+            # softplus(0)≈0.69 gives meaningful initial R_pred signal components.
             try:
                 last = self.slot_head[-1]
                 if isinstance(last, nn.Linear) and last.bias is not None and last.bias.numel() == 5:
                     with torch.no_grad():
-                        # power bias (p_raw): softplus(-2) ~ 0.13  (low)
-                        last.bias[3].fill_(-2.0)
-                        # mask bias (mask_logit): sigmoid(-2) ~ 0.12 (sparse)
-                        last.bias[4].fill_(-2.0)
+                        # power bias (p_raw): softplus(0) ~ 0.69 (reasonable signal)
+                        last.bias[3].fill_(0.0)
+                        # mask bias (mask_logit): sigmoid(0) = 0.5 (balanced start)
+                        last.bias[4].fill_(0.0)
             except Exception:
                 pass
         else:
