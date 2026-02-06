@@ -413,12 +413,10 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                # STRUCTURAL R (2026-02-02): Use BOTH aux + cov, but with a warmup schedule.
-                # R_true uses nearfield_vec()/sqrt(N) and path-loss is a per-source scalar,
-                # so it can be absorbed into aux_power (effective received power). Therefore
-                # cov_nmse is compatible, but it can be too dominant early when geometry is random.
-                # We warm up lam_cov in train.py for stability.
-                "lam_cov": 0.3,              # Target (will be warmed up for structural R)
+                # STRUCTURAL R (2026-02-05 fix): cov_nmse provides the ONLY dense gradient
+                # through the full geometry→R_pred pipeline. aux_l2 alone cannot break the 
+                # symmetric equilibrium. lam_cov=1.0 gives covariance equal weight to aux.
+                "lam_cov": 1.0,              # Full weight from epoch 1 (no warmup)
                 "lam_subspace_align": 0.0,   # keep off unless explicitly enabled later
                 "lam_aux": 1.5,              # primary driver for geometry
                 "lam_peak_contrast": 0.0,    # off for now
@@ -456,7 +454,7 @@ class ModelConfig:
     # --- Structural-R training stability ---
     # Warm up covariance loss so aux geometry learns first; then cov_nmse ramps in to improve MVDR readiness.
     # CRITICAL: 5 epochs was too fast; geometry needs ~10-15 epochs to stabilize before cov pressure helps.
-    STRUCTURED_COV_WARMUP_EPOCHS = 15
+    STRUCTURED_COV_WARMUP_EPOCHS = 0   # No warmup: lam_cov active from epoch 1
     DH, DV = 3, 3
 
     def __init__(self):

@@ -268,18 +268,19 @@ class UltimateHybridLoss(nn.Module):
     
     def _slot_diversity_loss(self, phi_p, theta_p, r_p):
         """
-        Penalize slots that predict too-similar values.
+        Penalize slots that predict too-similar values (margin-based).
         
-        Computes pairwise distances between all K_MAX slot outputs and encourages
-        them to be well-separated. This prevents the symmetric collapse where all
-        slots converge to predict the dataset mean.
+        Uses a margin: when pairwise distance > margin, loss is 0 (slots are 
+        already well-separated). When distance < margin, loss = (margin - dist),
+        penalizing collapse. This is always non-negative, preventing the negative
+        loss bug that was overwhelming other loss terms.
         
         Args:
             phi_p, theta_p: [B, K_MAX] angle predictions (radians)
             r_p: [B, K_MAX] range predictions (meters)
             
         Returns:
-            Loss scalar (minimize when slots are diverse, maximize when slots are identical)
+            Loss scalar >= 0 (0 when slots are well-separated, positive when collapsed)
         """
         B, K = phi_p.shape
         
@@ -301,12 +302,12 @@ class UltimateHybridLoss(nn.Module):
         
         # Mask out diagonal (slot vs itself)
         eye_mask = 1.0 - torch.eye(K, device=dist.device)
-        dist_offdiag = dist * eye_mask
         
-        # Loss: negative mean pairwise distance (encourage slots to be far apart)
-        # Simpler and more stable than exp(-d/tau) which was too sensitive.
-        # Clamp individual distances to avoid extreme values.
-        loss = -(dist_offdiag * eye_mask).sum() / (eye_mask.sum() + 1e-9)
+        # Margin-based: penalize when slots are closer than margin (radians + normalized range)
+        # margin ≈ 0.15 rad (~8.6°) is reasonable given FOV of ±60° azimuth
+        margin = 0.15
+        violation = torch.relu(margin - dist) * eye_mask  # [B, K, K], non-negative
+        loss = violation.sum() / (eye_mask.sum() + 1e-9)
         
         return loss
 
@@ -825,9 +826,11 @@ class UltimateHybridLoss(nn.Module):
         loss_nmse_pred = torch.tensor(0.0, device=device)
         lam_cov_pred = 0.0 if getattr(mdl_cfg, "OVERFIT_NMSE_PURE", False) else self.lam_cov_pred
         if lam_cov_pred > 0.0:
-            if "R_pred" in y_pred and "R_blend" not in y_pred:
+            if "R_pred" in y_pred:
                 # Structural R mode: compute NMSE directly on R_pred (already available)
                 # This gives a direct gradient path: NMSE → R_pred → build_structured_R → geometry
+                # NOTE: R_blend may also exist (train.py wraps R_pred), but we want the RAW R_pred
+                # here for a clean aux gradient, not the trace-normalized R_blend.
                 R_pred_eff = build_effective_cov_torch(
                     y_pred['R_pred'],
                     snr_db=y_true.get("snr_db", None),

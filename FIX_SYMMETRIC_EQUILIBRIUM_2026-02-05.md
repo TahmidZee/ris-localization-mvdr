@@ -39,7 +39,9 @@ With 5 slots and K_true often 1–3:
 This is exactly the **symmetric set prediction problem** that DETR solved by always
 assigning unmatched queries to a "no object" class.
 
-## Fixes Applied
+---
+
+## Round 1 Fixes (Initial Pass)
 
 ### 1. `configs.py` — Remove Warmup Delays
 
@@ -69,51 +71,136 @@ last.bias[4].fill_(0.0)   # mask:  sigmoid(0) = 0.50
 ```
 
 **Rationale**: Starting masks at 0.5 (not 0.12) gives R_pred meaningful signal
-components from the start. The mask BCE loss will push matched slots → 1 and
-unmatched → 0, providing natural differentiation.
+components from the start.
 
 ### 3. `loss.py` — Fix Dead Code Path + Default Scale
 
 ```python
 # mask_loss_scale default: 0.0 → 1.0
 self.mask_loss_scale = 1.0  # Active by default
+```
 
-# loss_nmse_pred: added structural R mode path
-# Previously only worked with legacy factor heads (cov_fact_angle/range)
-# which don't exist in structural R mode → was always 0.0
+---
+
+## Round 2 Fixes (After First Training Still Failed)
+
+The first training run showed the model *still* not learning:
+- `aux_φ_rmse` ≈ 35–38°, validation loss increasing
+- `lam_cov = 0.02` (should be much higher)
+- `loss_nmse_pred = 0.000000` (dead code — not contributing at all)
+- **Training loss was NEGATIVE** (e.g., train = -0.400983)
+
+Investigation uncovered **3 critical bugs**:
+
+### Bug 1: `loss_nmse_pred` Always Zero (Dead Code)
+
+**File**: `loss.py`, line 828
+
+```python
+# BEFORE (BROKEN):
 if "R_pred" in y_pred and "R_blend" not in y_pred:
+    # This branch was NEVER entered because train.py always creates R_blend
+    ...
+
+# AFTER (FIXED):
+if "R_pred" in y_pred:
+    # Now enters correctly for structural R mode
     R_pred_eff = build_effective_cov_torch(y_pred['R_pred'], ...)
     loss_nmse_pred = self._nmse_cov(R_pred_eff, R_eff_true).mean()
 ```
 
-## Expected Training Behavior After Fix
+**Impact**: `lam_cov_pred = 0.05` was multiplied by 0.0 every batch → zero gradient
+from this auxiliary NMSE path. Now provides constant gradient pressure through
+`R_pred → geometry`.
 
-### Epoch 0–5 (Early Training)
-- **Mask BCE**: Matched slots → target=1, unmatched → target=0 (DETR-style)
-- **Masks differentiate**: Some slots → high mask (active), others → low (inactive)
-- **power_eff becomes meaningful**: Active slots have power_eff ≈ 0.7 × 0.8 = 0.56
-- **R_pred has signal**: Rank-K structure emerges
-- **lam_cov** ramps from 0.02 → 0.10 (STRUCTURED_COV_WARMUP over 15 epochs)
-- **lam_aux = 1.5** drives geometry learning with symmetry broken by mask signals
+### Bug 2: Diversity Loss Returning NEGATIVE Values → Negative Total Loss
 
-### Epoch 5–15 (Refinement)
-- **lam_cov** reaches 0.3 — NMSE provides strong gradient for R_pred alignment
-- **Masks stabilize**: K slots active, K_MAX−K inactive
-- **Geometry improves**: aux_φ_rmse should decrease significantly (target: <10°)
-- **lam_cov_pred = 0.05** provides constant additional NMSE pressure
+**File**: `loss.py`, `_slot_diversity_loss()`
 
-## Current Loss Weights (No Changes Needed)
+```python
+# BEFORE (BROKEN):
+return -(dist_offdiag * eye_mask).sum() / (eye_mask.sum() + 1e-9)
+# This was NEGATIVE, which when added to total loss, REWARDED slot spread
+# instead of penalizing slot collapse
+
+# AFTER (FIXED):
+# Replaced with margin-based violation loss (always non-negative)
+violation = torch.relu(margin - dist) * eye_mask
+loss = violation.sum() / (eye_mask.sum() + 1e-9)
+return loss  # Positive: penalizes slots closer than margin
+```
+
+**Impact**: The old negative return made the total training loss negative (-0.40 to
+-0.46). The optimizer was minimizing a negative loss, which meant it was trying to
+MAXIMIZE slot spread while IGNORING accuracy. This is why the model diverged.
+
+### Bug 3: `STRUCTURED_COV_WARMUP_EPOCHS = 15` Keeping `lam_cov` at 0.02
+
+**File**: `configs.py`
+
+```python
+# BEFORE (BROKEN):
+STRUCTURED_COV_WARMUP_EPOCHS = 15  # Ramp lam_cov from 0 → 0.3 over 15 epochs
+# At epoch 1: lam_cov = 0.3 × (1/15) = 0.02 ← almost zero!
+
+PHASE_LOSS["joint"]["lam_cov"] = 0.3  # Target was only 0.3 even after warmup
+
+# AFTER (FIXED):
+STRUCTURED_COV_WARMUP_EPOCHS = 0   # No warmup: lam_cov = 1.0 from epoch 1
+
+PHASE_LOSS["joint"]["lam_cov"] = 1.0  # Full weight, equal to aux
+```
+
+**Impact**: With `lam_cov = 0.02`, the covariance NMSE (≈1.4) contributed only
+`0.02 × 1.4 = 0.028` to the loss, vs `1.5 × 1.02 = 1.53` from aux_l2. The NMSE
+was effectively silenced. At `lam_cov = 1.0`, NMSE contributes `1.0 × 1.4 = 1.4`,
+giving it comparable weight to aux_l2 and providing real gradient pressure.
+
+---
+
+## Summary of All Changes
+
+| File | Change | Round |
+|------|--------|-------|
+| `configs.py` | `GEOM_ONLY_EPOCHS` 5 → 0 | Round 1 |
+| `configs.py` | `MASK_LOSS_WARMUP_EPOCHS` 10 → 0 | Round 1 |
+| `configs.py` | `STRUCTURED_COV_WARMUP_EPOCHS` 15 → 0 | Round 2 |
+| `configs.py` | `PHASE_LOSS["joint"]["lam_cov"]` 0.3 → 1.0 | Round 2 |
+| `model.py` | `mask_logit` bias -2.0 → 0.0 | Round 1 |
+| `model.py` | `power` bias -2.0 → 0.0 | Round 1 |
+| `loss.py` | `mask_loss_scale` default 0.0 → 1.0 | Round 1 |
+| `loss.py` | `loss_nmse_pred` condition: remove `R_blend not in` guard | Round 2 |
+| `loss.py` | `_slot_diversity_loss` sign fix: negative → positive | Round 2 |
+
+## Current Loss Weights (After All Fixes)
 
 | Weight | Value | Status | Notes |
 |--------|-------|--------|-------|
-| `lam_cov` | 0.3 (warmed up over 15 ep) | ✅ OK | Meaningful now that R_pred has signal |
-| `lam_cov_pred` | 0.05 | ✅ OK | Provides constant NMSE floor |
+| `lam_cov` | **1.0** (no warmup) | ✅ Fixed | Full weight from epoch 1 |
+| `lam_cov_pred` | 0.05 | ✅ Fixed | Now actually computes NMSE |
 | `lam_aux` | 1.5 | ✅ OK | Primary geometry driver |
-| `lam_subspace_align` | 0.0 | ✅ OK | **Redundant** in structural R mode — subspace is correct by construction |
-| `lam_peak_contrast` | 0.0 | ✅ OK | Useful for fine-tuning, not needed for initial learning |
-| `LAM_SLOT_DIVERSITY` | 0.02 | ✅ OK | Prevents slot collapse, small relative to aux |
-| `LAM_AUX_MASK_BCE` | 0.2 | ✅ OK | Permutation-aware mask supervision |
-| `LAM_AUX_MASK` | 0.3 | ✅ OK | Count-based mask loss |
+| `lam_subspace_align` | 0.0 | ✅ OK | Redundant in structural R mode |
+| `lam_peak_contrast` | 0.0 | ✅ OK | Not needed for initial learning |
+| `LAM_SLOT_DIVERSITY` | 0.02 | ✅ Fixed | Now correctly positive |
+| `LAM_AUX_MASK_BCE` | 0.2 | ✅ OK | Active from epoch 0 |
+| `LAM_AUX_MASK` | 0.3 | ✅ OK | Active from epoch 0 |
+
+## Expected Training Behavior After All Fixes
+
+### Loss Breakdown (Epoch 1)
+```
+lam_cov  * loss_nmse     = 1.0  × ~1.0  = 1.00  (was 0.02 × 1.4 = 0.03)
+lam_aux  * aux_l2        = 1.5  × ~1.0  = 1.50
+lam_pred * loss_nmse_pred= 0.05 × ~1.0  = 0.05  (was 0.05 × 0.0 = 0.00)
+diversity                                = 0.00+ (was NEGATIVE)
+total                                   ≈ 2.55+ (was going negative!)
+```
+
+### What Should Improve
+1. **NMSE gradient flows** through `R_pred → build_structured_R → geometry`
+2. **Masks differentiate** via BCE from epoch 0 (matched → 1, unmatched → 0)
+3. **Total loss is positive** and monotonically decreasing
+4. **aux_φ_rmse should decrease** below 35° (dataset mean) within first 5 epochs
 
 ### Why Subspace Alignment Is Not Needed
 
@@ -124,16 +211,7 @@ R_pred = Σ_k power_k · a(φ_k, θ_k, r_k) · a(φ_k, θ_k, r_k)^H + σ²I
 ```
 
 The signal subspace is **steering vectors by construction**. If the geometry (φ, θ, r)
-is correct, the subspace is automatically correct. Subspace alignment loss is only
-useful in legacy mode where the covariance is learned as free-form factors.
-
-## Files Changed
-
-| File | Changes |
-|------|---------|
-| `ris_pytorch_pipeline/configs.py` | `GEOM_ONLY_EPOCHS` 5→0, `MASK_LOSS_WARMUP_EPOCHS` 10→0 |
-| `ris_pytorch_pipeline/model.py` | mask_logit bias -2→0, power bias -2→0 |
-| `ris_pytorch_pipeline/loss.py` | `mask_loss_scale` default 0→1, added R_pred path to `loss_nmse_pred` |
+is correct, the subspace is automatically correct.
 
 ## Prior Fixes (2026-02-03)
 
