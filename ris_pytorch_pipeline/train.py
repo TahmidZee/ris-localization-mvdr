@@ -2803,8 +2803,12 @@ class Trainer:
                 geom_only = max(0, geom_only)
                 if geom_only > 0 and ep < geom_only:
                     if ep == start_ep:
-                        print(f"[Loss Schedule] GEOM_ONLY: forcing lam_cov=0 for first {geom_only} epochs", flush=True)
+                        print(f"[Loss Schedule] GEOM_ONLY: forcing lam_cov=0, lam_cov_pred=0 for first {geom_only} epochs", flush=True)
                     self.loss_fn.lam_cov = 0.0
+                    self.loss_fn.lam_cov_pred = 0.0  # Also disable aux NMSE (pushes toward E[R_true], reinforces equilibrium)
+                elif geom_only > 0 and ep == geom_only:
+                    # Restore lam_cov_pred after GEOM_ONLY ends
+                    self.loss_fn.lam_cov_pred = float(getattr(cfg, "LAM_COV_PRED", 0.05))
 
                 # AUX MATCH WARMUP: use soft permutation matching early to avoid assignment flips.
                 aux_soft_epochs = int(getattr(mdl_cfg, "AUX_MATCH_SOFT_EPOCHS", 0))

@@ -440,7 +440,12 @@ class ModelConfig:
     # global misc
     WARMUP_FRAC = 0.10
     EMA_DECAY = 0.999
-    CLIP_NORM = 1.0
+    # CRITICAL FIX (2026-02-07): Increased from 1.0 → 5.0.
+    # With 10.5M params and structural R, the total gradient norm is ~36 even WITHOUT NMSE.
+    # At CLIP_NORM=1.0, all gradients are scaled by 1/36, giving the slot head an effective
+    # LR of 3.4e-5 instead of the intended 1.2e-3. This prevents symmetry breaking entirely.
+    # At CLIP_NORM=5.0, the scale is 5/36 ≈ 0.14, giving effective head LR ≈ 1.7e-4.
+    CLIP_NORM = 5.0
     USE_SWA = True  # Enable SWA for last 20% epochs to improve generalization
     SWA_START_FRAC = 0.8  # Start SWA at 80% through training (last 20% epochs)
     SWA_LR_FACTOR = 0.1  # SWA learning rate = initial_lr * SWA_LR_FACTOR

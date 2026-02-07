@@ -628,3 +628,58 @@ construction (loss.py does its own processing).
 - **Epochs 4-8**: NMSE ramps in gradually. Geometry is already differentiated, so NMSE
   gradient pushes R_pred toward correct per-sample covariance (not dataset average).
 - **Epochs 9+**: Full training with all losses. Expect continued improvement.
+
+---
+
+# Round 6: Gradient Clipping Too Aggressive (2026-02-07)
+
+## Symptom
+
+After Round 5 (GEOM_ONLY=3), training STILL showed flat aux metrics:
+- `aux_φ_rmse = 36.7°`, `aux_θ_rmse = 17.6°`, `aux_r_rmse = 2.79m` (all = dataset mean)
+- Total gradient norm was **36.3** — barely reduced from the pre-GEOM_ONLY norm of 43.2
+
+## Root Cause: CLIP_NORM=1.0 Is Catastrophically Low
+
+The gradient norm of 36 comes from the **backbone transformer** (8.6M params, L=64 tokens,
+D=512), not just from NMSE. Even pure geometry losses (aux + sorted + diversity + mask)
+generate a large total gradient when backpropagated through a deep transformer encoder.
+
+With `CLIP_NORM = 1.0` and `||g|| = 36`, every gradient is scaled by `1/36 = 0.028`:
+
+| Parameter Group | Intended LR | Effective LR (clip=1.0) | Effective LR (clip=5.0) |
+|----------------|-------------|------------------------|------------------------|
+| Backbone (8.6M) | 3.0e-4 | 8.3e-6 | 4.2e-5 |
+| Head (1.9M) | 1.2e-3 | 3.4e-5 | 1.7e-4 |
+
+At effective head LR = 3.4e-5, over 1562 batches/epoch:
+- Total parameter change ≈ 0.05 per epoch
+- With conflicting gradient directions (permutation matching noise), NET signal ≈ 0
+- Slots can NEVER break the symmetric equilibrium
+
+Additionally, `lam_cov_pred = 0.05` was still active during GEOM_ONLY. Even at 0.05 weight,
+the NMSE gradient through R_pred→geometry pushes toward E[R_true] (dataset-average covariance),
+which REINFORCES the equilibrium rather than breaking it.
+
+## Fixes
+
+### Change 1: `CLIP_NORM = 5.0` (was 1.0)
+
+This gives the head 5× more effective learning rate (1.7e-4 vs 3.4e-5). With 1562
+batches/epoch, the total parameter change per epoch increases from 0.05 to 0.27.
+The diversity loss can now push slots apart, creating a stable sort order for the
+sorted canonical loss.
+
+### Change 2: Zero `lam_cov_pred` during GEOM_ONLY
+
+During the first 3 geometry-only epochs, `lam_cov_pred` is now set to 0 (was 0.05).
+This removes the residual NMSE gradient that reinforces the symmetric equilibrium.
+After GEOM_ONLY ends (epoch 4), `lam_cov_pred` is restored to its configured value.
+
+## Expected Behavior
+
+With 5× more effective learning rate during GEOM_ONLY:
+1. Diversity loss pushes slots apart → stable sort order within 1-2 epochs
+2. Sorted loss assigns each slot to a consistent order statistic → slot specialization
+3. Aux loss refines each slot toward its assigned GT sources
+4. `aux_φ_rmse` should start dropping below 35° by epoch 2-3
