@@ -360,29 +360,36 @@ class HybridModel(nn.Module):
                 nn.Linear(slot_hidden, 5),  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
             )
             # ------------------------------------------------------------
-            # Initialization: DETR-style balanced start
+            # Per-slot output bias: BREAKS SYMMETRIC EQUILIBRIUM
             # ------------------------------------------------------------
-            # CRITICAL FIX (2026-02-05): Changed mask_logit bias from -2.0 → 0.0.
-            # With bias=-2.0, sigmoid(-2)≈0.12 → all masks start very low.
-            # Combined with mask warmup (now removed), masks never got gradient and
-            # stayed at 0.12 forever, making power_eff≈0.015 and R_pred≈noise.
+            # CRITICAL FIX (2026-02-07): Added per-slot bias to give each slot a
+            # different initial φ prediction. Without this, all 5 slots predict φ≈0°,
+            # and the permutation-invariant matching assigns each slot to random GT
+            # sources across samples → average gradient is exactly zero → NO learning.
             #
-            # With bias=0.0, sigmoid(0)=0.5 → all masks start at 50%. The mask BCE
-            # loss (now active from epoch 0) will push matched slots → 1 and
-            # unmatched slots → 0, exactly like DETR's "no object" class.
+            # With per-slot bias, slot 0 starts at φ=-48°, slot 4 at φ=+48°. The
+            # sorted canonical loss immediately provides consistent gradients:
+            #   slot 0 (leftmost) → leftmost GT source
+            #   slot 4 (rightmost) → rightmost GT source
+            # This breaks symmetry from epoch 1.
             #
-            # Power bias also changed from -2.0 → 0.0:
-            # softplus(0)≈0.69 gives meaningful initial R_pred signal components.
-            try:
-                last = self.slot_head[-1]
-                if isinstance(last, nn.Linear) and last.bias is not None and last.bias.numel() == 5:
-                    with torch.no_grad():
-                        # power bias (p_raw): softplus(0) ~ 0.69 (reasonable signal)
-                        last.bias[3].fill_(0.0)
-                        # mask bias (mask_logit): sigmoid(0) = 0.5 (balanced start)
-                        last.bias[4].fill_(0.0)
-            except Exception:
-                pass
+            # The bias is a learnable [K, 5] parameter that adjusts during training.
+            PHI_SCALE_INIT = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))
+            self.slot_output_bias = nn.Parameter(torch.zeros(Kmax, 5))
+            with torch.no_grad():
+                for k_idx in range(Kmax):
+                    # Spread slots evenly across 80% of the FOV: -48° to +48° for ±60° FOV
+                    target_phi_deg = -48.0 + 96.0 * k_idx / max(1, Kmax - 1)
+                    target_phi_rad = target_phi_deg * math.pi / 180.0
+                    # Inverse of tanh scaling: phi_raw = atanh(target / PHI_SCALE)
+                    ratio = target_phi_rad / PHI_SCALE_INIT
+                    ratio = max(-0.99, min(0.99, ratio))  # clamp for atanh safety
+                    self.slot_output_bias.data[k_idx, 0] = math.atanh(ratio)
+                # power bias: softplus(0) ≈ 0.69 (reasonable signal)
+                # mask bias: sigmoid(0) = 0.5 (balanced start)
+                # theta, r biases: 0 (centered)
+            print(f"[MODEL] Slot output bias initialized: φ targets = "
+                  f"{[f'{-48 + 96*k/(Kmax-1):.0f}°' for k in range(Kmax)]}", flush=True)
         else:
             self.slot_queries = None
             self.slot_attn = None
@@ -723,6 +730,9 @@ class HybridModel(nn.Module):
             slot = self.slot_heads_ln(slot)
 
             out = self.slot_head(slot)  # [B,K,5]
+            # Add per-slot bias (breaks symmetric equilibrium — see init comment)
+            if hasattr(self, 'slot_output_bias') and self.slot_output_bias is not None:
+                out = out + self.slot_output_bias.unsqueeze(0)  # [B,K,5] + [1,K,5]
             phi_raw = out[..., 0]
             theta_raw = out[..., 1]
             r_raw = out[..., 2]

@@ -683,3 +683,60 @@ With 5× more effective learning rate during GEOM_ONLY:
 2. Sorted loss assigns each slot to a consistent order statistic → slot specialization
 3. Aux loss refines each slot toward its assigned GT sources
 4. `aux_φ_rmse` should start dropping below 35° by epoch 2-3
+
+---
+
+# Round 7: Per-Slot Output Bias — Breaks Symmetry by Construction (2026-02-07)
+
+## Symptom
+
+After Rounds 5+6 (GEOM_ONLY=3, CLIP_NORM=5.0, zero lam_cov_pred), training STILL showed
+completely flat aux metrics for 7 epochs:
+- `aux_φ_rmse ≈ 35°` (dataset mean, no improvement)
+
+## Root Cause: The Symmetric Equilibrium Is a Gradient Fixed Point
+
+The problem is NOT about learning rate — it's about **gradient direction**.
+
+When all 5 slots predict φ ≈ 0°:
+1. The permutation-invariant matching assigns each slot to a random GT source (all costs equal)
+2. Across the dataset, each slot sees gradients toward different GT sources in different samples
+3. The **average gradient for each slot is exactly toward 0°** (the dataset mean)
+4. No learning rate can fix a zero-direction gradient
+
+The sorted canonical loss was supposed to fix this, but:
+- When all slots predict the same thing, `torch.argsort` gives an ordering based on tiny
+  numerical noise that flips randomly between samples
+- The net gradient from sorted loss is ALSO approximately zero
+
+The diversity loss pushes slots apart, but:
+- Its gradient is ~50× weaker than aux_l2
+- The push direction is random (Brownian motion, not directional)
+- After gradient clipping, the diversity signal is negligible
+
+## Fix: Per-Slot Output Bias
+
+Added a learnable `slot_output_bias` parameter [K_MAX, 5] to the model that's added to the
+slot head output. This biases each slot to predict a different initial φ:
+
+```
+Slot 0: φ = -48°  (leftmost)
+Slot 1: φ = -24°
+Slot 2: φ =   0°  (center)
+Slot 3: φ = +24°
+Slot 4: φ = +48°  (rightmost)
+```
+
+**Why this works**:
+- The sorted canonical loss immediately has a stable sort order (slot 0 is always leftmost)
+- Each slot gets **consistent** gradients: slot 0 → leftmost GT, slot 4 → rightmost GT
+- The gradients no longer average to zero — each slot learns a different order statistic
+- The bias is learnable, so slots can adjust their positions during training
+
+**Implementation**:
+- `model.py`: Added `self.slot_output_bias = nn.Parameter(torch.zeros(Kmax, 5))` initialized
+  with `atanh(target_phi / PHI_SCALE)` values for even spacing across 80% of FOV
+- `model.py forward()`: `out = self.slot_head(slot) + self.slot_output_bias.unsqueeze(0)`
+
+**Verification**: At init, slots predict φ ∈ {-50°, -31°, -2°, +27°, +47°} with std = 40°
+(was std ≈ 3° without the bias).
