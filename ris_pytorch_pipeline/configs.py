@@ -575,7 +575,7 @@ class ModelConfig:
         #
         # NOTE: This is safe now because MASK_LOSS_WARMUP_EPOCHS=0 (mask BCE active from
         # epoch 0), unlike the original GEOM_ONLY=5 which coincided with MASK_WARMUP=10.
-        self.GEOM_ONLY_EPOCHS = 3
+        self.GEOM_ONLY_EPOCHS = 8
 
         # Aux permutation matching stability:
         # Hard argmin assignment can "flip" early, producing a non-smooth loss surface and
