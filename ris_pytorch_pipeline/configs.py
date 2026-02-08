@@ -462,8 +462,9 @@ class ModelConfig:
 
     # --- Structural-R training stability ---
     # Warm up covariance loss so aux geometry learns first; then cov_nmse ramps in to improve MVDR readiness.
-    # CRITICAL (2026-02-06): With GEOM_ONLY=3, geometry breaks symmetry in first 3 epochs.
-    # Then ramp lam_cov over 5 epochs (epochs 4-8) so the 256×256 NMSE gradient doesn't
+    # CRITICAL (2026-02-08): With GEOM_ONLY=8, geometry has a dedicated window to break symmetry
+    # and stabilize before any 256×256 NMSE gradient is introduced.
+    # Then ramp lam_cov over 5 epochs (epochs 9-13) so the NMSE term doesn't
     # overwhelm the aux/sorted/diversity signals before slots have differentiated.
     STRUCTURED_COV_WARMUP_EPOCHS = 5   # Ramp lam_cov from 0→target over 5 epochs after GEOM_ONLY
     DH, DV = 3, 3
@@ -567,15 +568,16 @@ class ModelConfig:
         # Geometry-only warmup:
         # For the first GEOM_ONLY_EPOCHS epochs, force lam_cov=0 even in joint mode.
         #
-        # CRITICAL FIX (2026-02-06): Set to 3 (was 0).
+        # CRITICAL FIX (2026-02-08): Set to 8 (was 3).
         # With GEOM_ONLY=0, the NMSE gradient through R_pred (256×256 matrix) dominates
         # the total gradient norm (~43), and CLIP_NORM=1.0 scales ALL gradients by 1/43.
         # This crushes the aux/sorted/diversity gradients to near-zero effective LR,
         # preventing symmetry breaking. The slots stay at dataset mean forever.
         #
-        # With GEOM_ONLY=3: epochs 1-3 have NO NMSE gradient, so the clip budget goes
-        # entirely to aux + sorted + diversity + mask. These can break symmetry in 3 epochs.
-        # After epoch 3, STRUCTURED_COV_WARMUP_EPOCHS=5 ramps NMSE in gradually.
+        # With GEOM_ONLY=8: epochs 1-8 have NO NMSE gradient (and train.py also zeros lam_cov_pred),
+        # so the clip budget goes entirely to aux + sorted + diversity + mask. This is the
+        # most reliable way to break the symmetric equilibrium in DETR-style slot heads.
+        # After epoch 8, STRUCTURED_COV_WARMUP_EPOCHS=5 ramps NMSE in gradually (epochs 9-13).
         #
         # NOTE: This is safe now because MASK_LOSS_WARMUP_EPOCHS=0 (mask BCE active from
         # epoch 0), unlike the original GEOM_ONLY=5 which coincided with MASK_WARMUP=10.

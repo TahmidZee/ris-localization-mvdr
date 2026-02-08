@@ -1064,31 +1064,64 @@ class Trainer:
                 if self.train_refiner_only:
                     assert self.refiner is not None, "Refiner module missing in refiner-only phase"
 
-                    # Convert flat factors to complex [B, N, K]
-                    Bc = preds_fp32["cov_fact_angle"].shape[0]
+                    # Build MVDR spectrum (max over range planes) per sample, then train refiner on it.
+                    # Supports BOTH:
+                    #  - legacy factor mode: cov_fact_angle/cov_fact_range
+                    #  - structural-R mode: slot head geometry + gated power (phi/theta/r, aux_power_eff)
+                    Bc = int(labels_fp32["K"].shape[0])
                     N = int(cfg.N)
                     Kmax = int(cfg.K_MAX)
-                    flat_ang = preds_fp32["cov_fact_angle"].contiguous().float()
-                    flat_rng = preds_fp32["cov_fact_range"].contiguous().float()
+                    delta_scale = float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2))
 
-                    def _vec2c(v):
-                        xr, xi = v[:, ::2], v[:, 1::2]
-                        return torch.complex(xr.view(Bc, N, Kmax), xi.view(Bc, N, Kmax))
-
-                    A_ang = _vec2c(flat_ang).to(torch.complex64)
-                    A_rng = _vec2c(flat_rng).to(torch.complex64)
-
-                    lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                    # Build low-rank factors F_b per sample for Woodbury MVDR: R ≈ F F^H + δI.
                     F_list = []
-                    # Build low-rank factor concatenation: [N, 2*Kmax]
-                    for bi2 in range(Bc):
-                        F_b = torch.cat([A_ang[bi2], (lam_range ** 0.5) * A_rng[bi2]], dim=1).contiguous()
-                        F_list.append(F_b)
+                    if ("cov_fact_angle" in preds_fp32) and ("cov_fact_range" in preds_fp32):
+                        flat_ang = preds_fp32["cov_fact_angle"].contiguous().float()
+                        flat_rng = preds_fp32["cov_fact_range"].contiguous().float()
+
+                        def _vec2c(v):
+                            xr, xi = v[:, ::2], v[:, 1::2]
+                            return torch.complex(xr.view(Bc, N, Kmax), xi.view(Bc, N, Kmax)).to(torch.complex64)
+
+                        A_ang = _vec2c(flat_ang)
+                        A_rng = _vec2c(flat_rng)
+
+                        lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                        for bi2 in range(Bc):
+                            F_b = torch.cat([A_ang[bi2], (lam_range ** 0.5) * A_rng[bi2]], dim=1).contiguous()
+                            F_list.append(F_b)
+                    else:
+                        # Structural-R / slot-head mode: rebuild factors from predicted geometry + power gating.
+                        aux_ptr = preds_fp32.get("phi_theta_r", None)
+                        if aux_ptr is None:
+                            raise KeyError("Refiner-only stage needs preds['phi_theta_r'] (geometry outputs) in structural-R mode.")
+                        aux_ptr = aux_ptr.float()
+                        phi_p = aux_ptr[:, :Kmax]
+                        th_p = aux_ptr[:, Kmax:2 * Kmax]
+                        r_p = aux_ptr[:, 2 * Kmax:3 * Kmax]
+
+                        power_eff = preds_fp32.get("aux_power_eff", None)
+                        if power_eff is None:
+                            p = preds_fp32.get("aux_power", None)
+                            m = preds_fp32.get("aux_mask", None)
+                            if (m is None) and ("aux_mask_logit" in preds_fp32):
+                                m = torch.sigmoid(preds_fp32["aux_mask_logit"].float())
+                            if (p is not None) and (m is not None):
+                                power_eff = (p.float() * m.float())
+                            elif p is not None:
+                                power_eff = p.float()
+                        if power_eff is None:
+                            power_eff = torch.ones_like(phi_p)
+
+                        from .model import build_steering_matrix_batch
+                        A = build_steering_matrix_batch(phi_p, th_p, r_p, cfg)  # [B,N,K] complex64
+                        F_struct = A * torch.sqrt(power_eff.clamp(min=1e-8)).unsqueeze(1)  # [B,N,K]
+                        for bi2 in range(Bc):
+                            F_list.append(F_struct[bi2].contiguous().to(torch.complex64))
 
                     # Compute MVDR spectrum max over range planes (low-rank Woodbury) per sample
                     specs = []
-                    delta_scale = float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2))
-                    for bi2, F_b in enumerate(F_list):
+                    for F_b in F_list:
                         S_b = self._mvdr_est.mvdr_spectrum_max_2_5d_lowrank(
                             F_b,
                             self._refiner_phi_grid,
@@ -1477,24 +1510,58 @@ class Trainer:
                         else:
                             labels_fp32[k] = v
 
-                    # Cast factors to FP32 then convert to complex
-                    flat_ang = preds_half["cov_fact_angle"].float()
-                    flat_rng = preds_half["cov_fact_range"].float()
-                    Bc = flat_ang.shape[0]
+                    Bc = int(K.shape[0])
                     N = int(cfg.N)
                     Kmax = int(cfg.K_MAX)
-
-                    def _vec2c(v):
-                        xr, xi = v[:, ::2], v[:, 1::2]
-                        return torch.complex(xr.view(Bc, N, Kmax), xi.view(Bc, N, Kmax)).to(torch.complex64)
-
-                    A_ang = _vec2c(flat_ang)
-                    A_rng = _vec2c(flat_rng)
-                    lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
-                    specs = []
                     delta_scale = float(getattr(cfg, "MVDR_DELTA_SCALE", 1e-2))
-                    for bi2 in range(Bc):
-                        F_b = torch.cat([A_ang[bi2], (lam_range ** 0.5) * A_rng[bi2]], dim=1).contiguous()
+
+                    # Build low-rank factors per sample for MVDR (supports structural-R too).
+                    F_list = []
+                    if ("cov_fact_angle" in preds_half) and ("cov_fact_range" in preds_half):
+                        flat_ang = preds_half["cov_fact_angle"].float()
+                        flat_rng = preds_half["cov_fact_range"].float()
+
+                        def _vec2c(v):
+                            xr, xi = v[:, ::2], v[:, 1::2]
+                            return torch.complex(xr.view(Bc, N, Kmax), xi.view(Bc, N, Kmax)).to(torch.complex64)
+
+                        A_ang = _vec2c(flat_ang)
+                        A_rng = _vec2c(flat_rng)
+                        lam_range = float(getattr(mdl_cfg, "LAM_RANGE_FACTOR", 0.3))
+                        for bi2 in range(Bc):
+                            F_b = torch.cat([A_ang[bi2], (lam_range ** 0.5) * A_rng[bi2]], dim=1).contiguous()
+                            F_list.append(F_b)
+                    else:
+                        # Structural-R / slot-head mode: rebuild factors from predicted geometry + power gating.
+                        aux_ptr = preds_half.get("phi_theta_r", None)
+                        if aux_ptr is None:
+                            raise KeyError("Refiner-only validation needs preds['phi_theta_r'] (geometry outputs) in structural-R mode.")
+                        aux_ptr = aux_ptr.float()
+                        phi_p = aux_ptr[:, :Kmax]
+                        th_p = aux_ptr[:, Kmax:2 * Kmax]
+                        r_p = aux_ptr[:, 2 * Kmax:3 * Kmax]
+
+                        power_eff = preds_half.get("aux_power_eff", None)
+                        if power_eff is None:
+                            p = preds_half.get("aux_power", None)
+                            m = preds_half.get("aux_mask", None)
+                            if (m is None) and ("aux_mask_logit" in preds_half):
+                                m = torch.sigmoid(preds_half["aux_mask_logit"].float())
+                            if (p is not None) and (m is not None):
+                                power_eff = (p.float() * m.float())
+                            elif p is not None:
+                                power_eff = p.float()
+                        if power_eff is None:
+                            power_eff = torch.ones_like(phi_p)
+
+                        from .model import build_steering_matrix_batch
+                        A = build_steering_matrix_batch(phi_p, th_p, r_p, cfg)  # [B,N,K] complex64
+                        F_struct = A * torch.sqrt(power_eff.clamp(min=1e-8)).unsqueeze(1)  # [B,N,K]
+                        for bi2 in range(Bc):
+                            F_list.append(F_struct[bi2].contiguous().to(torch.complex64))
+
+                    specs = []
+                    for F_b in F_list:
                         S_b = self._mvdr_est.mvdr_spectrum_max_2_5d_lowrank(
                             F_b,
                             self._refiner_phi_grid,
@@ -2810,7 +2877,7 @@ class Trainer:
                         self.loss_fn.lam_cov = target
                     # Restore lam_cov_pred when NMSE enters
                     self.loss_fn.lam_cov_pred = float(getattr(cfg, "LAM_COV_PRED", 0.05))
-                    if ep == geom_only:
+                    if geom_only > 0 and ep == geom_only:
                         print(f"[Loss Schedule] GEOM_ONLY ended. Starting NMSE warmup: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
                     if ep == geom_only + warm - 1 and warm > 0:
                         print(f"[Loss Schedule] NMSE warmup complete: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
@@ -3166,11 +3233,15 @@ class Trainer:
                         
                         preds_val = self.model(y=y_val, H_full=H_full_val, codes=codes_val, snr_db=snr_val)
                         
-                        # Form R_hat from first sample
-                        cf_ang = preds_val["cov_fact_angle"][0].detach().cpu().numpy()  # [N*K_MAX*2]
-                        N = N_H * N_V
-                        cf_ang_complex = cf_ang[:N * cfg.K_MAX].reshape(N, cfg.K_MAX) + 1j * cf_ang[N * cfg.K_MAX:].reshape(N, cfg.K_MAX)
-                        R_hat = cf_ang_complex @ cf_ang_complex.conj().T  # [N, N]
+                        # Form R_hat from first sample (structural-R: use R_pred; legacy: cov_fact_angle)
+                        if "R_pred" in preds_val:
+                            R_hat = preds_val["R_pred"][0].detach().cpu().numpy()  # [N,N] complex
+                            N = int(R_hat.shape[0])
+                        else:
+                            cf_ang = preds_val["cov_fact_angle"][0].detach().cpu().numpy()  # [N*K_MAX*2]
+                            N = N_H * N_V
+                            cf_ang_complex = cf_ang[:N * cfg.K_MAX].reshape(N, cfg.K_MAX) + 1j * cf_ang[N * cfg.K_MAX:].reshape(N, cfg.K_MAX)
+                            R_hat = cf_ang_complex @ cf_ang_complex.conj().T  # [N, N]
                         
                         # Trace-normalize
                         trace_R = np.real(np.trace(R_hat))
@@ -3216,13 +3287,20 @@ class Trainer:
                                 
                                 # Extract snapshots from first sample
                                 y_i = y_val[0].detach().cpu().numpy()  # [L, M_BS, 2]
-                                # Use H_full if available, otherwise fall back to old H (for backward compat)
-                                if 'H_full' in batch_val and batch_val['H_full'] is not None:
-                                    H_full_i = batch_val['H_full'][0].detach().cpu().numpy()  # [M_BS, N, 2]
+                                # Prefer unpacked H_full_val (works for both dict and tuple batches).
+                                if H_full_val is not None:
+                                    H_full_i = H_full_val[0].detach().cpu().numpy()  # [M_BS, N, 2]
                                     H_cplx = H_full_i[:, :, 0] + 1j * H_full_i[:, :, 1]  # [M_BS, N]
                                 else:
-                                    # Fallback: old behavior (will produce rank-1 Phi, but at least won't crash)
-                                    H_i = H_val[0].detach().cpu().numpy()  # [L, M_BS, 2]
+                                    # Fallback: old behavior using H_eff (approx; backward compatibility only).
+                                    H_src = None
+                                    if isinstance(batch_val, dict):
+                                        H_src = batch_val.get("H", None)
+                                    elif isinstance(batch_val, (list, tuple)) and len(batch_val) > 1:
+                                        H_src = batch_val[1]
+                                    if H_src is None:
+                                        raise RuntimeError("Hybrid diagnostic needs H_full or H in the batch.")
+                                    H_i = H_src[0].detach().cpu().numpy()  # [L, M_BS, 2] (H_eff)
                                     # Assume first snapshot as proxy (not physically correct, but backward compat)
                                     H_cplx = (H_i[0, :, 0] + 1j * H_i[0, :, 1])[:, np.newaxis]  # [M_BS, 1]
                                     H_cplx = np.tile(H_cplx, (1, cfg.N))  # [M_BS, N] filled with same values

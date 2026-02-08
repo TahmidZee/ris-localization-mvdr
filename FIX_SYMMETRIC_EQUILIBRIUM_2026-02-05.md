@@ -535,12 +535,7 @@ shards. Since R_samp is intentionally not stored (`HYBRID_COV_BETA=0.0`,
 
 These do NOT affect the current training run:
 
-1. **Refiner-only training crashes in structural R mode** — `TRAIN_PHASE="refiner"` accesses
-   `cov_fact_angle` which doesn't exist. Won't be used until after backbone training succeeds.
-
-2. **Eigenspectrum diagnostic crash** — only triggers with `TRAIN_EPOCH_DEBUG=True` (default False).
-
-3. **Dead code** (~800 lines) — 3-phase curriculum, legacy factor helpers, unused functions.
+1. **Dead code** (~800 lines) — 3-phase curriculum, legacy factor helpers, unused functions.
    Already planned in `REFACTOR_PROGRESS.md`.
 
 ---
@@ -740,3 +735,81 @@ Slot 4: φ = +48°  (rightmost)
 
 **Verification**: At init, slots predict φ ∈ {-50°, -31°, -2°, +27°, +47°} with std = 40°
 (was std ≈ 3° without the bias).
+
+---
+
+# Round 8: Increase GEOM_ONLY Window (2026-02-08)
+
+## Change
+
+- `configs.py`: `GEOM_ONLY_EPOCHS = 8` (was 3)
+
+## Rationale
+
+Even after symmetry-breaking fixes, DETR-style slot heads often need a longer period where
+the only gradients are **geometry-supervision** (aux + sorted + diversity + mask), before
+introducing the dense 256×256 NMSE gradient. This gives geometry time to stabilize and
+prevents early NMSE from pulling predictions toward dataset-average behavior.
+
+---
+
+# Round 9: Fix Surrogate Score (Stop Early-Stopping on “Loss Jump”) (2026-02-08)
+
+## Symptom
+
+When NMSE enters, the raw validation loss increases (by design), which used to dominate
+the surrogate score and trigger early stopping even when aux RMSE was stable/improving.
+
+## Changes
+
+- `configs.py`: Rebalanced `SURROGATE_METRIC_WEIGHTS` so aux metrics dominate:
+  - `w_loss: 0.1` (was 1.0)
+  - `w_aux_ang: 1.0` (was tiny)
+  - `w_aux_r: 0.5`
+- `configs.py`: Increased training budget:
+  - `EPOCHS: 60` (was 30)
+  - `PATIENCE: 20` (was 10)
+
+## Rationale
+
+For this system, **aux geometry quality** is the best fast proxy for eventual MVDR-first
+localization. The score should track aux RMSE, not be dominated by a phase-dependent NMSE term.
+
+---
+
+# Round 10: Fix NMSE Warmup Start (Must Begin AFTER GEOM_ONLY) (2026-02-08)
+
+## Symptom
+
+With `GEOM_ONLY_EPOCHS > STRUCTURED_COV_WARMUP_EPOCHS`, the old warmup math saturated
+*before* GEOM_ONLY ended. When GEOM_ONLY ended, `lam_cov` jumped from 0 → 1.0 instantly.
+
+## Fix
+
+- `train.py`: NMSE warmup is now computed relative to the end of GEOM_ONLY:
+
+```
+Epochs  1-8:   lam_cov=0.0   lam_cov_pred=0.0
+Epoch   9:     lam_cov=0.2
+Epoch  10:     lam_cov=0.4
+Epoch  11:     lam_cov=0.6
+Epoch  12:     lam_cov=0.8
+Epoch  13+:    lam_cov=1.0
+```
+
+This prevents a disruptive NMSE “step function” right when geometry starts to become meaningful.
+
+---
+
+# Round 11: Structural-R Compatibility for Dormant Paths (2026-02-08)
+
+These fixes are not required for backbone training, but they prevent crashes when using
+optional phases/debug flags:
+
+1. **Refiner-only stage (Option B)**:
+   - `train.py`: Now supports structural-R by building low-rank MVDR factors from predicted
+     `(φ, θ, r)` + gated power (`aux_power_eff`) instead of assuming `cov_fact_angle/range`.
+
+2. **Epoch-0 eigenspectrum diagnostic**:
+   - `train.py`: Uses `R_pred` directly when present (structural-R mode), and falls back
+     to `cov_fact_angle` only in legacy factor mode.
