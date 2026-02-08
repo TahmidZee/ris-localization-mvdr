@@ -368,10 +368,14 @@ class SysConfig:
         
         # Weights for surrogate validation score (when VAL_PRIMARY="surrogate")
         # NOTE: K-head removed. Surrogate score is now based on loss + aux errors only.
+        # CRITICAL FIX (2026-02-08): Rebalanced so aux metrics dominate the score.
+        # Previously w_loss=1.0 dominated (99% of score), so when NMSE enters (epoch 9+)
+        # and adds ~1.0 to loss, the score permanently worsens → early stopping triggers
+        # even though aux RMSE is stable/improving. Now aux metrics drive model selection.
         self.SURROGATE_METRIC_WEIGHTS = {
-            "w_loss": 1.0,        # Weight for validation loss (minimize)
-            "w_aux_ang": 0.01,    # Penalty for aux angle RMSE (deg)
-            "w_aux_r": 0.01,      # Penalty for aux range RMSE (m)
+            "w_loss": 0.1,        # Small weight for loss (comparable across phases)
+            "w_aux_ang": 1.0,     # Primary: angle RMSE (deg) — what we actually care about
+            "w_aux_r": 0.5,       # Secondary: range RMSE (m)
         }
 
         # --- Permutation-invariant aux training loss ---
@@ -477,7 +481,7 @@ class ModelConfig:
         self.BATCH_SIZE = 64
         self.EPOCHS = 60
         self.LR_INIT = 3e-4
-        self.PATIENCE = 15
+        self.PATIENCE = 20  # Increased: DETR-style models need time; NMSE entry causes score dip
         # Disable AMP by default for numerical stability (covariance / MVDR-adjacent training is sensitive).
         # You can re-enable for speed once training is stable (few/no nonfinite grad skips).
         self.AMP = False
