@@ -2785,30 +2785,35 @@ class Trainer:
             use_structured_R = bool(getattr(mdl_cfg, "USE_STRUCTURED_R", True))
             phase_name = str(getattr(cfg, "TRAIN_PHASE", "geom")).lower()
             if use_structured_R and phase_name == "joint":
+                # GEOMETRY-ONLY WARMUP: force lam_cov=0 for the first geom_only epochs.
+                # Then ramp lam_cov over warm epochs AFTER geom_only ends.
+                geom_only = int(getattr(mdl_cfg, "GEOM_ONLY_EPOCHS", 0))
+                geom_only = max(0, geom_only)
                 warm = int(getattr(mdl_cfg, "STRUCTURED_COV_WARMUP_EPOCHS", 5))
                 warm = max(0, warm)
                 target = float(getattr(self, "_phase_lam_cov_target", float(getattr(self.loss_fn, "lam_cov", 0.0))))
-                if warm > 0:
-                    frac = min(1.0, float(ep + 1) / float(warm))
-                    self.loss_fn.lam_cov = target * frac
-                    if ep == start_ep:
-                        print(f"[Loss Schedule] STRUCTURED_R: warmup lam_cov 0→{target:.3f} over {warm} epochs", flush=True)
-                    if (ep + 1) in (1, warm):
-                        print(f"[Loss Schedule] STRUCTURED_R: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
 
-                # GEOMETRY-ONLY WARMUP: override lam_cov to 0 for the first few epochs.
-                # Rationale: early structured covariance gradients can pull the model toward
-                # a trivial/average solution before φ/θ/r have meaning. Let aux lock geometry first.
-                geom_only = int(getattr(mdl_cfg, "GEOM_ONLY_EPOCHS", 0))
-                geom_only = max(0, geom_only)
                 if geom_only > 0 and ep < geom_only:
+                    # Phase 1: geometry-only (no NMSE at all)
                     if ep == start_ep:
-                        print(f"[Loss Schedule] GEOM_ONLY: forcing lam_cov=0, lam_cov_pred=0 for first {geom_only} epochs", flush=True)
+                        print(f"[Loss Schedule] GEOM_ONLY: lam_cov=0, lam_cov_pred=0 for first {geom_only} epochs", flush=True)
+                        print(f"[Loss Schedule] Then warmup lam_cov 0→{target:.3f} over {warm} epochs (epochs {geom_only+1}-{geom_only+warm})", flush=True)
                     self.loss_fn.lam_cov = 0.0
-                    self.loss_fn.lam_cov_pred = 0.0  # Also disable aux NMSE (pushes toward E[R_true], reinforces equilibrium)
-                elif geom_only > 0 and ep == geom_only:
-                    # Restore lam_cov_pred after GEOM_ONLY ends
+                    self.loss_fn.lam_cov_pred = 0.0
+                else:
+                    # Phase 2: ramp NMSE in gradually AFTER geom_only
+                    if warm > 0:
+                        epochs_since_geom = ep - geom_only  # 0-indexed from when NMSE starts
+                        frac = min(1.0, float(epochs_since_geom + 1) / float(warm))
+                        self.loss_fn.lam_cov = target * frac
+                    else:
+                        self.loss_fn.lam_cov = target
+                    # Restore lam_cov_pred when NMSE enters
                     self.loss_fn.lam_cov_pred = float(getattr(cfg, "LAM_COV_PRED", 0.05))
+                    if ep == geom_only:
+                        print(f"[Loss Schedule] GEOM_ONLY ended. Starting NMSE warmup: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
+                    if ep == geom_only + warm - 1 and warm > 0:
+                        print(f"[Loss Schedule] NMSE warmup complete: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
 
                 # AUX MATCH WARMUP: use soft permutation matching early to avoid assignment flips.
                 aux_soft_epochs = int(getattr(mdl_cfg, "AUX_MATCH_SOFT_EPOCHS", 0))
