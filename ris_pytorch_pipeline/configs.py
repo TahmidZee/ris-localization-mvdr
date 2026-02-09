@@ -417,12 +417,14 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                # STRUCTURAL R (2026-02-05 fix): cov_nmse provides the ONLY dense gradient
-                # through the full geometry→R_pred pipeline. aux_l2 alone cannot break the 
-                # symmetric equilibrium. lam_cov=1.0 gives covariance equal weight to aux.
-                "lam_cov": 1.0,              # Full weight from epoch 1 (no warmup)
+                # CRITICAL FIX (2026-02-09): lam_aux=0 to disable perm-invariant geometry loss.
+                # With per-slot bias, perm-invariant and sorted losses assign DIFFERENT slots
+                # to the same GT source (perm-inv picks closest, sorted picks leftmost).
+                # Their gradients on the shared backbone CANCEL OUT → backbone never learns.
+                # Only sorted canonical loss (lam_aux_sorted) provides geometry supervision.
+                "lam_cov": 1.0,              # Full weight (after GEOM_ONLY + warmup)
                 "lam_subspace_align": 0.0,   # keep off unless explicitly enabled later
-                "lam_aux": 1.5,              # primary driver for geometry
+                "lam_aux": 0.0,              # DISABLED: conflicts with sorted loss assignments
                 "lam_peak_contrast": 0.0,    # off for now
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
@@ -635,7 +637,10 @@ class ModelConfig:
         # This gives deterministic gradients: sorted-slot-0 → leftmost GT, etc.
         # Each slot learns the i-th order statistic of the source distribution, which
         # spreads them across the FOV and breaks symmetric equilibrium within ~2-3 epochs.
-        self.LAM_AUX_SORTED = 1.0  # Same magnitude as lam_aux (1.5)
+        # CRITICAL FIX (2026-02-09): Increased from 1.0 to 2.5.
+        # This is now the ONLY geometry loss (lam_aux=0, perm-invariant disabled).
+        # Provides consistent per-slot gradients aligned with the per-slot bias ordering.
+        self.LAM_AUX_SORTED = 2.5
 
         # Presence/mask supervision
         #
@@ -652,9 +657,14 @@ class ModelConfig:
         #   - Unmatched slots → mask target = 0 (turn off)
         # This is exactly DETR's "no object" mechanism.
         self.MASK_LOSS_WARMUP_EPOCHS = 0  # No warmup - mask BCE from epoch 0
-        self.LAM_AUX_MASK = 0.3        # Count-based loss (moderate)
-        self.LAM_AUX_MASK_BIN = 0.1    # Binarization penalty
-        self.LAM_AUX_MASK_BCE = 0.2    # Permutation-aware BCE
+        self.LAM_AUX_MASK = 0.3        # Count-based loss (assignment-agnostic: sum(masks) ≈ K_true)
+        self.LAM_AUX_MASK_BIN = 0.1    # Binarization penalty (push masks toward {0,1})
+        # CRITICAL FIX (2026-02-09): Disabled mask BCE (was 0.2).
+        # Mask BCE uses perm-invariant matching for targets (matched → 1, unmatched → 0).
+        # With sorted-only geometry, this creates a CONFLICT: sorted says "slot 0 is active"
+        # but perm-invariant matching says "slot 2 is active". Disable to avoid conflicting
+        # mask targets. Count loss + binarization handle mask supervision without assignments.
+        self.LAM_AUX_MASK_BCE = 0.0    # DISABLED: conflicts with sorted-only geometry
 
         # Legacy aux MLP capacity knob (unused when USE_SLOT_HEAD=True; kept for ablations)
         self.AUX_HEAD_HIDDEN_DIM = 256
