@@ -1331,9 +1331,11 @@ class Trainer:
                 
                 # Gradient clipping (AFTER sanitization, BEFORE step)
                 if self.clip_norm and self.clip_norm > 0:
-                    grad_norm_clipped = torch.nn.utils.clip_grad_norm_(train_params, self.clip_norm)
+                    grad_norm_pre = torch.nn.utils.clip_grad_norm_(train_params, self.clip_norm)
                     if epoch == 1 and bi == 0:
-                        print(f"[GRAD CLIP] After clipping: ||g||_2={grad_norm_clipped:.3e}", flush=True)
+                        clipped = grad_norm_pre > self.clip_norm
+                        print(f"[GRAD CLIP] pre_norm={grad_norm_pre:.3e}, max_norm={self.clip_norm:.1f}"
+                              f"{' → CLIPPED' if clipped else ' (no clip needed)'}", flush=True)
                 
                 # Expert fix: Improved gradient flow instrumentation
                 import math
@@ -2919,8 +2921,8 @@ class Trainer:
                 else:
                     self.loss_fn.set_mask_loss_scale(1.0)  # No warmup, full mask loss
 
-            # 3-phase schedule (if enabled)
-            if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', True):
+            # 3-phase schedule (if enabled — default OFF since ModelConfig sets it False)
+            if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', False):
                 phase = 0 if ep < max(1, epochs // 3) else (1 if ep < max(2, 2 * epochs // 3) else 2)
                 self._apply_phase_weights(phase, epoch=ep, total_epochs=epochs)
             else:
@@ -2987,8 +2989,8 @@ class Trainer:
             # mdl_cfg.SOFTMAX_TAU = tau
             # self.model.set_tau(tau)  # Actually update the model
             
-            # Apply curriculum learning (if enabled)
-            if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', True):
+            # Apply curriculum learning (if enabled — default OFF)
+            if getattr(mdl_cfg, 'USE_3_PHASE_CURRICULUM', False):
                 self._apply_curriculum(ep, epochs)
 
             if bool(getattr(cfg, "TRAIN_EPOCH_DEBUG", False)):
