@@ -462,10 +462,7 @@ class ModelConfig:
 
     # --- Structural-R training stability ---
     # Warm up covariance loss so aux geometry learns first; then cov_nmse ramps in to improve MVDR readiness.
-    # CRITICAL (2026-02-08): With GEOM_ONLY=8, geometry has a dedicated window to break symmetry
-    # and stabilize before any 256×256 NMSE gradient is introduced.
-    # Then ramp lam_cov over 5 epochs (epochs 9-13) so the NMSE term doesn't
-    # overwhelm the aux/sorted/diversity signals before slots have differentiated.
+    # With GEOM_ONLY=2, NMSE starts ramping at epoch 3 over 5 epochs (epochs 3-7).
     STRUCTURED_COV_WARMUP_EPOCHS = 5   # Ramp lam_cov from 0→target over 5 epochs after GEOM_ONLY
     DH, DV = 3, 3
 
@@ -568,20 +565,24 @@ class ModelConfig:
         # Geometry-only warmup:
         # For the first GEOM_ONLY_EPOCHS epochs, force lam_cov=0 even in joint mode.
         #
-        # CRITICAL FIX (2026-02-08): Set to 8 (was 3).
-        # With GEOM_ONLY=0, the NMSE gradient through R_pred (256×256 matrix) dominates
-        # the total gradient norm (~43), and CLIP_NORM=1.0 scales ALL gradients by 1/43.
-        # This crushes the aux/sorted/diversity gradients to near-zero effective LR,
-        # preventing symmetry breaking. The slots stay at dataset mean forever.
+        # HISTORY:
+        #   Round 1 (02-05): 0 → NMSE from epoch 1 (dominated clip budget).
+        #   Round 5 (02-06): 3 → aux couldn't learn (NMSE still too strong via lam_cov_pred).
+        #   Round 8 (02-08): 8 → plenty of geometry-only time.
+        #   Round 12 (02-09): 2 → per-slot bias makes long GEOM_ONLY counterproductive.
         #
-        # With GEOM_ONLY=8: epochs 1-8 have NO NMSE gradient (and train.py also zeros lam_cov_pred),
-        # so the clip budget goes entirely to aux + sorted + diversity + mask. This is the
-        # most reliable way to break the symmetric equilibrium in DETR-style slot heads.
-        # After epoch 8, STRUCTURED_COV_WARMUP_EPOCHS=5 ramps NMSE in gradually (epochs 9-13).
+        # With per-slot output bias (Round 7), symmetry is broken at init: slots start
+        # at {-48°, -24°, 0°, +24°, +48°}. Long GEOM_ONLY (8 epochs) lets the model
+        # converge to a BIAS-ONLY local minimum where the backbone contributes NOTHING:
+        #   - φ RMSE ≈ 19° (= RMSE of fixed order statistics vs random GT)
+        #   - aux metrics completely flat for all 8 epochs
+        # When NMSE enters later, the model is stuck and can't escape.
         #
-        # NOTE: This is safe now because MASK_LOSS_WARMUP_EPOCHS=0 (mask BCE active from
-        # epoch 0), unlike the original GEOM_ONLY=5 which coincided with MASK_WARMUP=10.
-        self.GEOM_ONLY_EPOCHS = 8
+        # With GEOM_ONLY=2: 2 quick epochs let optimizer/LR warm up, then NMSE ramps
+        # in while the model is still in a high-curvature region of the loss landscape.
+        # NMSE forces INPUT-DEPENDENT predictions (R_true varies per sample), preventing
+        # the bias-only collapse.
+        self.GEOM_ONLY_EPOCHS = 2
 
         # Aux permutation matching stability:
         # Hard argmin assignment can "flip" early, producing a non-smooth loss surface and

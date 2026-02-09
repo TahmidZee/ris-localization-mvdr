@@ -2668,12 +2668,17 @@ class Trainer:
             max_val_batches:   Optional[int] = None,
             gpu_cache: Optional[bool] = None,
             grad_accumulation: int = 1,
-            early_stop_patience: int = 10,
+            early_stop_patience: int = None,
             val_every: int = 1,
             skip_music_val: bool = False):
 
         if not use_shards:
             raise RuntimeError("This pipeline requires pregenerated shards.")
+
+        # Resolve early_stop_patience: caller > mdl_cfg.PATIENCE > default 20
+        if early_stop_patience is None:
+            early_stop_patience = int(getattr(mdl_cfg, "PATIENCE", 20))
+        early_stop_patience = max(0, int(early_stop_patience))
 
         # Guardrail: SWA is not meaningful (and can be actively misleading) for very short runs.
         # With epochs=5 and SWA_START_FRAC=0.8, SWA begins at epoch 4; BN stats are not finalized,
