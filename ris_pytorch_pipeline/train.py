@@ -101,9 +101,11 @@ def _resolve_shards_train_val() -> Tuple[Path, Path]:
     """
     Resolve (train_dir, val_dir).
     Supports:
-      - <DATA_SHARDS_DIR>/{train,val}/*.npz   (preferred)
-      - flat <DATA_SHARDS_DIR>/*.npz          (fallback; rely on n_train/n_val caps)
-      - optional cfg.DATA_SHARDS_TRAIN/VAL constants if you’ve defined them
+      - <DATA_SHARDS_DIR>/{train,val}/*.npz   (preferred, strict split)
+    REVIEWER-PROOF FIX (2026-02-09): Previously fell back to returning the SAME
+    directory for both train and val when separate subdirs didn't exist. This
+    creates a data leakage risk because _subset() with the same seed would
+    produce overlapping index sets. Now we FAIL FAST if proper splits are missing.
     """
     root = Path(getattr(cfg, "DATA_SHARDS_DIR", Path("results_final/data/shards")))
     t_hint = Path(getattr(cfg, "DATA_SHARDS_TRAIN", root / "train"))
@@ -112,10 +114,15 @@ def _resolve_shards_train_val() -> Tuple[Path, Path]:
     if t_hint.exists() and list(t_hint.glob("*.npz")):
         if v_hint.exists() and list(v_hint.glob("*.npz")):
             return t_hint, v_hint
-        return t_hint, t_hint  # flat split by caps
-    if root.exists() and list(root.glob("*.npz")):
-        return root, root
-    raise FileNotFoundError(f"No shards found under {root}. Expected {t_hint} / {v_hint} or flat {root}.")
+        raise FileNotFoundError(
+            f"Train shards found at {t_hint} but NO separate val shards at {v_hint}. "
+            f"Refusing to use the same directory for both (data leakage). "
+            f"Run `pregen-split` to create proper train/val/test splits."
+        )
+    raise FileNotFoundError(
+        f"No shards found under {root}. Expected {t_hint}/*.npz and {v_hint}/*.npz. "
+        f"Run `pregen-split` to create proper train/val/test splits."
+    )
 
 # ----------------------------
 # Trainer
@@ -2552,9 +2559,15 @@ class Trainer:
                         if getattr(cfg, "MUSIC_DEBUG", False):
                             print(f"[MDL] baseline failed: {e}")
                     
-                    # NOTE: K-head removed - use GT K for validation metrics
-                    # At inference, use MDL/MVDR for K estimation
-                    k_hat = int(min(max(1, k_true), cfg.K_MAX))
+                    # REVIEWER-PROOF FIX (2026-02-09): Use BLIND K (MDL) as primary
+                    # for validation metrics, not GT K. Using GT K is an oracle
+                    # shortcut that inflates success_rate and makes results
+                    # non-reproducible at inference time. k_mdl was already
+                    # computed above; use it as k_hat for fair evaluation.
+                    try:
+                        k_hat = int(np.clip(k_mdl, 1, cfg.K_MAX))
+                    except Exception:
+                        k_hat = int(min(max(1, k_true), cfg.K_MAX))  # fallback only if MDL crashed
                     k_true_all.append(k_true)
                     k_hat_all.append(k_hat)
                     
@@ -2638,10 +2651,17 @@ class Trainer:
                 print(f"  {label:15s} (N={n:4d}): φ={np.median(phi_err[mask]):.3f}°, "
                       f"θ={np.median(theta_err[mask]):.3f}°, r={np.median(r_err[mask]):.3f}m")
         
-        # NOTE: K-head removed. We only report localization metrics + success_rate.
+        # K estimation metrics (blind K via MDL — reviewer-proof)
         k_true_all = np.array(k_true_all, dtype=np.int32)
+        k_hat_all = np.array(k_hat_all, dtype=np.int32)
         n_scenes = int(k_true_all.size)
         success_rate = float(success_count / n_scenes) if n_scenes > 0 else 0.0
+        k_acc_blind = float(np.mean(k_true_all == k_hat_all)) if n_scenes > 0 else 0.0
+        k_mdl_acc = float(k_mdl_correct / n_scenes) if n_scenes > 0 else 0.0
+        
+        print(f"\n📊 K Estimation (blind MDL):")
+        print(f"  K accuracy (MDL, primary): {k_mdl_acc:.3f}")
+        print(f"  K accuracy (blind k_hat):  {k_acc_blind:.3f}")
         
         # Return metrics for composite score calculation
         return {
@@ -2654,6 +2674,8 @@ class Trainer:
             "rmse_theta_mean": rmse_theta_mean,
             "rmse_r_mean": rmse_r_mean,
             "success_rate": success_rate,
+            "k_mdl_acc": k_mdl_acc,
+            "k_acc_blind": k_acc_blind,
         }
     
     # NOTE: calibrate_k_logits removed - K-head removed, using MDL/MVDR for K estimation
