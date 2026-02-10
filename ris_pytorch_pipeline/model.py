@@ -353,11 +353,27 @@ class HybridModel(nn.Module):
             self.slot_fusion = nn.Linear(D + (D // 2) + self.snr_dim, D)
             self.slot_heads_ln = nn.LayerNorm(D)
             slot_hidden = int(getattr(mdl_cfg, "SLOT_HEAD_HIDDEN_DIM", D // 2))
+            _slot_last_linear = nn.Linear(slot_hidden, 5)  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
+            # -----------------------------------------------------------
+            # CRITICAL FIX (2026-02-10): Zero-init the last linear layer.
+            # Standard practice in DETR and all set-prediction transformers.
+            # Without this, the MLP's random init (std≈0.19) adds noise to
+            # each slot's output that is ~17% of the bias magnitude. This
+            # means predictions at init are bias ± noise, NOT clean bias.
+            # The backbone can't learn because:
+            #   1. The noise makes Hungarian matching unstable
+            #   2. The bias absorbs the average position (order statistics)
+            #   3. Per-sample backbone corrections are drowned by MLP noise
+            # With zero-init: predictions = exactly the bias at epoch 0,
+            # and the MLP gradually learns input-dependent corrections.
+            # -----------------------------------------------------------
+            nn.init.zeros_(_slot_last_linear.weight)
+            nn.init.zeros_(_slot_last_linear.bias)
             self.slot_head = nn.Sequential(
                 nn.Linear(D, slot_hidden),
                 nn.GELU(),
                 nn.Dropout(float(getattr(mdl_cfg, 'DROPOUT', 0.1)) * 0.5),
-                nn.Linear(slot_hidden, 5),  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
+                _slot_last_linear,
             )
             # ------------------------------------------------------------
             # Per-slot output bias: BREAKS SYMMETRIC EQUILIBRIUM

@@ -417,14 +417,17 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                # CRITICAL FIX (2026-02-09): lam_aux=0 to disable perm-invariant geometry loss.
-                # With per-slot bias, perm-invariant and sorted losses assign DIFFERENT slots
-                # to the same GT source (perm-inv picks closest, sorted picks leftmost).
-                # Their gradients on the shared backbone CANCEL OUT → backbone never learns.
-                # Only sorted canonical loss (lam_aux_sorted) provides geometry supervision.
+                # FIX (2026-02-10): Re-enabled perm-invariant loss (lam_aux=1.0).
+                # Previous theory (conflicting assignments) was wrong — the real issue
+                # was MLP init noise drowning the bias signal, preventing backbone learning.
+                # With zero-init last layer, predictions start at clean bias positions,
+                # and BOTH losses provide useful geometry gradients:
+                #   - sorted (lam_aux_sorted=1.5): deterministic slot→GT assignment
+                #   - perm-invariant (lam_aux=1.0): optimal (closest) slot→GT assignment
+                # Together they give 2× geometry gradient budget to the backbone.
                 "lam_cov": 1.0,              # Full weight (after GEOM_ONLY + warmup)
                 "lam_subspace_align": 0.0,   # keep off unless explicitly enabled later
-                "lam_aux": 0.0,              # DISABLED: conflicts with sorted loss assignments
+                "lam_aux": 1.0,              # Re-enabled: perm-invariant geometry
                 "lam_peak_contrast": 0.0,    # off for now
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
@@ -637,10 +640,10 @@ class ModelConfig:
         # This gives deterministic gradients: sorted-slot-0 → leftmost GT, etc.
         # Each slot learns the i-th order statistic of the source distribution, which
         # spreads them across the FOV and breaks symmetric equilibrium within ~2-3 epochs.
-        # CRITICAL FIX (2026-02-09): Increased from 1.0 to 2.5.
-        # This is now the ONLY geometry loss (lam_aux=0, perm-invariant disabled).
-        # Provides consistent per-slot gradients aligned with the per-slot bias ordering.
-        self.LAM_AUX_SORTED = 2.5
+        # FIX (2026-02-10): Reduced from 2.5 to 1.5 now that perm-invariant is re-enabled.
+        # Both losses provide geometry gradients; sorted gives deterministic slot ordering,
+        # perm-invariant gives optimal matching. Together: 1.0 + 1.5 = 2.5 total geometry budget.
+        self.LAM_AUX_SORTED = 1.5
 
         # Presence/mask supervision
         #
@@ -659,12 +662,11 @@ class ModelConfig:
         self.MASK_LOSS_WARMUP_EPOCHS = 0  # No warmup - mask BCE from epoch 0
         self.LAM_AUX_MASK = 0.3        # Count-based loss (assignment-agnostic: sum(masks) ≈ K_true)
         self.LAM_AUX_MASK_BIN = 0.1    # Binarization penalty (push masks toward {0,1})
-        # CRITICAL FIX (2026-02-09): Disabled mask BCE (was 0.2).
-        # Mask BCE uses perm-invariant matching for targets (matched → 1, unmatched → 0).
-        # With sorted-only geometry, this creates a CONFLICT: sorted says "slot 0 is active"
-        # but perm-invariant matching says "slot 2 is active". Disable to avoid conflicting
-        # mask targets. Count loss + binarization handle mask supervision without assignments.
-        self.LAM_AUX_MASK_BCE = 0.0    # DISABLED: conflicts with sorted-only geometry
+        # FIX (2026-02-10): Re-enabled mask BCE (was disabled when sorted-only was active).
+        # With zero-init MLP + clean bias positions, perm-invariant matching is now stable:
+        # slot 2 (bias=0°) reliably matches GT near 0°, etc. So mask BCE targets from
+        # perm-invariant matching are consistent and provide useful "no-object" gradient.
+        self.LAM_AUX_MASK_BCE = 0.2    # Re-enabled: perm-invariant mask supervision
 
         # Legacy aux MLP capacity knob (unused when USE_SLOT_HEAD=True; kept for ablations)
         self.AUX_HEAD_HIDDEN_DIM = 256
