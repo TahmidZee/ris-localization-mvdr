@@ -1016,6 +1016,13 @@ class UltimateHybridLoss(nn.Module):
                     soft_tau=float(getattr(self, "aux_match_tau", 0.25)),
                 )
         else:
+            if lam_mask_bce > 0.0 and not hasattr(self, "_mask_bce_disabled_logged"):
+                print(
+                    f"[LOSS DEBUG] Permutation-aware mask BCE disabled because AUX_LOSS_PERM_INVARIANT=False "
+                    f"(requested weight={lam_mask_bce:.3g}).",
+                    flush=True,
+                )
+                self._mask_bce_disabled_logged = True
             phi_huber = (_wrapped_huber_loss(phi_p, phi_t) * mask).sum() / (mask.sum() + 1e-9)
             theta_huber = (_wrapped_huber_loss(theta_p, theta_t) * mask).sum() / (mask.sum() + 1e-9)
             theta_huber *= mdl_cfg.THETA_LOSS_SCALE  # Emphasize elevation for better θ accuracy
@@ -1080,6 +1087,13 @@ class UltimateHybridLoss(nn.Module):
             if not hasattr(self, "_sorted_aux_logged"):
                 print(f"[LOSS DEBUG] Sorted canonical aux loss: enabled @ weight={lam_aux_sorted:.3f}", flush=True)
                 self._sorted_aux_logged = True
+        elif lam_aux_sorted > 0.0 and (not use_perm_aux) and (not hasattr(self, "_sorted_aux_disabled_logged")):
+            print(
+                f"[LOSS DEBUG] Sorted canonical aux loss disabled because AUX_LOSS_PERM_INVARIANT=False "
+                f"(requested weight={lam_aux_sorted:.3g}).",
+                flush=True,
+            )
+            self._sorted_aux_disabled_logged = True
         
         # CRITICAL FIX (2026-02-05): Slot diversity loss to prevent collapse.
         # Without this, all slots converge to predict identical values (φ std = 0.04°).
@@ -1093,6 +1107,13 @@ class UltimateHybridLoss(nn.Module):
             if not hasattr(self, "_diversity_logged"):
                 print(f"[LOSS DEBUG] Slot diversity loss: enabled @ weight={lam_diversity:.3f}", flush=True)
                 self._diversity_logged = True
+        elif lam_diversity > 0.0 and (not use_perm_aux) and (not hasattr(self, "_diversity_disabled_logged")):
+            print(
+                f"[LOSS DEBUG] Slot diversity loss disabled because AUX_LOSS_PERM_INVARIANT=False "
+                f"(requested weight={lam_diversity:.3g}).",
+                flush=True,
+            )
+            self._diversity_disabled_logged = True
         
         loss_align = torch.tensor(0.0, device=device)
         if getattr(mdl_cfg, "LAM_ALIGN", 0.0) > 0.0:

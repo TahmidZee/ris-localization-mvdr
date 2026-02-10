@@ -353,19 +353,21 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
         R_pred = (A_ang @ A_ang.conj().T) + lam_range_factor * (A_rng @ A_rng.conj().T)
 
     # --- optional R_samp (hybrid blending) ---
-    R_samp = None
-    if sample.get("R_samp") is not None:
-        R_samp = _ri_to_c_np(sample.get("R_samp"))
-    else:
-        # Build R_samp from snapshots using H_full (already loaded above)
-        try:
-            from .angle_pipeline import build_sample_covariance_from_snapshots
-            # build_sample_covariance_from_snapshots accepts [M,N] directly (no need to repeat)
-            R_samp = build_sample_covariance_from_snapshots(y_c, H_full_c, C_c, cfg, tikhonov_alpha=1e-3)
-        except Exception:
-            R_samp = None
-
+    # IMPORTANT: If beta=0, R_samp is unused — skip computing it to save time/memory.
     beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.0))
+    want_hybrid = bool(getattr(cfg, "HYBRID_COV_BLEND", True)) and (beta > 0.0)
+    R_samp = None
+    if want_hybrid:
+        if sample.get("R_samp") is not None:
+            R_samp = _ri_to_c_np(sample.get("R_samp"))
+        else:
+            # Build R_samp from snapshots using H_full (already loaded above)
+            try:
+                from .angle_pipeline import build_sample_covariance_from_snapshots
+                # build_sample_covariance_from_snapshots accepts [M,N] directly (no need to repeat)
+                R_samp = build_sample_covariance_from_snapshots(y_c, H_full_c, C_c, cfg, tikhonov_alpha=1e-3)
+            except Exception:
+                R_samp = None
     R_eff = build_effective_cov_np(
         R_pred,
         R_samp=R_samp,
@@ -383,8 +385,10 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
     has_refiner = hasattr(model, "_spectrum_refiner") and (getattr(model, "_spectrum_refiner", None) is not None)
     allow_fallback = bool(getattr(cfg, "REFINER_GUARD_FALLBACK_TO_MVDR", True))
     # Structural mode: refiner path currently relies on low-rank factors; force MVDR fallback.
+    refiner_disable_reason = None
     if (A_ang is None) or (A_rng is None):
         use_refiner_cfg = False
+        refiner_disable_reason = "Structural-R: SpectrumRefiner requires low-rank factors"
 
     # Helper: raw MVDR fallback path (K-free, uses robust thresholding).
     def _mvdr_fallback():
@@ -426,7 +430,7 @@ def hybrid_estimate_final(model, sample, force_K=None, k_policy="mdl",
             else:
                 nlog = int(getattr(cfg, "REFINER_REJECT_LOG_EVERY", 1))
             if nlog != 0 and ((_REFINER_FALLBACK_COUNT - 1) % max(1, nlog) == 0):
-                _log_refiner_fallback_once("Refiner unavailable/disabled")
+                _log_refiner_fallback_once(refiner_disable_reason or "Refiner unavailable/disabled")
             return _mvdr_fallback()
         raise ValueError(
             "SpectrumRefiner is required for inference but was not attached to the model and fallback is disabled. "

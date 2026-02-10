@@ -367,7 +367,8 @@ class SysConfig:
         self.USE_MUSIC_METRICS_IN_VAL = False
         
         # Weights for surrogate validation score (when VAL_PRIMARY="surrogate")
-        # NOTE: K-head removed. Surrogate score is now based on loss + aux errors only.
+        # NOTE: K-head removed. Surrogate score is based on loss + aux errors, plus optional
+        # MVDR proxies (peak-level F1/FP and subspace overlap) when enabled.
         # CRITICAL FIX (2026-02-08): Rebalanced so aux metrics dominate the score.
         # Previously w_loss=1.0 dominated (99% of score), so when NMSE enters (epoch 9+)
         # and adds ~1.0 to loss, the score permanently worsens → early stopping triggers
@@ -376,7 +377,13 @@ class SysConfig:
             "w_loss": 0.1,        # Small weight for loss (comparable across phases)
             "w_aux_ang": 1.0,     # Primary: angle RMSE (deg) — what we actually care about
             "w_aux_r": 0.5,       # Secondary: range RMSE (m)
+            # Optional MVDR-peak proxy (only used when SURROGATE_PEAK_METRICS=True)
+            "w_peak_f1": 2.0,
+            "w_peak_fp": 0.1,
+            "w_peak_pssr": 0.0,
         }
+        # Optional MVDR subspace proxy (only used when SURROGATE_SUBSPACE_METRICS=True)
+        self.SURROGATE_SUBSPACE_WEIGHT = 1.0
 
         # --- Permutation-invariant aux training loss ---
         # Dataset sources are unordered; training aux (phi/theta/r) "by index" is ill-posed and

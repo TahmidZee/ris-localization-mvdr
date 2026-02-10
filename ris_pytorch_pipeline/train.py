@@ -2122,7 +2122,9 @@ class Trainer:
         #
         # NOTE: During HPO we want a surrogate that correlates with MVDR-first inference quality.
         # If SURROGATE_PEAK_METRICS is enabled, incorporate peak-level detection F1 and FP/scene.
-        w = getattr(cfg, "SURROGATE_METRIC_WEIGHTS", None) or {
+        #
+        # IMPORTANT: Merge defaults with cfg overrides so missing keys don't silently disable MVDR proxies.
+        w_default = {
             "w_loss": 1.0,
             "w_aux_ang": 0.01,
             "w_aux_r": 0.01,
@@ -2131,6 +2133,11 @@ class Trainer:
             "w_peak_fp": 0.1,
             "w_peak_pssr": 0.0,
         }
+        w_cfg = getattr(cfg, "SURROGATE_METRIC_WEIGHTS", None)
+        if isinstance(w_cfg, dict):
+            w = {**w_default, **w_cfg}
+        else:
+            w = w_default
         score = (
             - float(w.get("w_loss", 1.0)) * avg_loss
             - float(w.get("w_aux_ang", 0.01)) * (phi_rmse + theta_rmse) / 2.0
@@ -2746,7 +2753,16 @@ class Trainer:
         
         # Set beta warmup based on total epochs (20% warmup)
         self.beta_warmup_epochs = max(2, int(0.2 * epochs))
-        print(f"[Beta Warmup] Annealing β from {self.beta_start:.2f} → {self.beta_final:.2f} over {self.beta_warmup_epochs} epochs")
+        if float(self.beta_final) <= 0.0:
+            print(
+                f"[Beta Warmup] β_final={self.beta_final:.2f} (hybrid covariance disabled; using R_pred-only)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Beta Warmup] Annealing β from {self.beta_start:.2f} → {self.beta_final:.2f} over {self.beta_warmup_epochs} epochs",
+                flush=True,
+            )
 
         # decide cache mode (auto → try GPU cache if it fits in VRAM budget)
         want_cache = bool(getattr(mdl_cfg, "TRAIN_USE_GPU_CACHE", True)) if gpu_cache is None else bool(gpu_cache)
