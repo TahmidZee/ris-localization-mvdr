@@ -469,6 +469,11 @@ class ModelConfig:
     # Warm up covariance loss so aux geometry learns first; then cov_nmse ramps in to improve MVDR readiness.
     # With GEOM_ONLY=2, NMSE starts ramping at epoch 3 over 5 epochs (epochs 3-7).
     STRUCTURED_COV_WARMUP_EPOCHS = 5   # Ramp lam_cov from 0→target over 5 epochs after GEOM_ONLY
+    # Conditional NMSE ramp: only start when aux_φ_rmse improves below threshold
+    NMSE_RAMP_AUX_PHI_THRESHOLD = 25.0  # Start NMSE ramp when aux_φ < 25° (prevents premature NMSE entry)
+    # Bias LR warmup: keep slot_output_bias at low LR for first few epochs
+    BIAS_LR_MULTIPLIER = 0.1  # Bias LR = backbone LR × 0.1 (prevents absorbing dataset mean)
+    BIAS_LR_WARMUP_EPOCHS = 5  # Ramp bias LR to full head LR after this many epochs
     DH, DV = 3, 3
 
     def __init__(self):

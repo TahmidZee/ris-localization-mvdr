@@ -324,6 +324,7 @@ class Trainer:
         # Robust parameter grouping by name prefix
         backbone_params = []
         head_params = []
+        bias_params = []  # Separate group for slot_output_bias (lower LR to prevent absorbing dataset mean)
         # Head keys used for optimizer grouping (head gets higher LR than backbone).
         # NOTE: K-head components removed - using MVDR peak detection instead
         # Include all prediction heads for higher LR (structural R needs aux_power too)
@@ -346,8 +347,13 @@ class Trainer:
             for n, p in self.model.named_parameters():
                 if not p.requires_grad:
                     continue
+                # CRITICAL FIX: Separate slot_output_bias into its own group with lower LR.
+                # The bias can absorb dataset-average structure if it learns too fast,
+                # preventing the backbone from learning input-dependent features.
+                if 'slot_output_bias' in n:
+                    bias_params.append(p)
                 # Classify by module name
-                if any(k in n for k in HEAD_KEYS):
+                elif any(k in n for k in HEAD_KEYS):
                     head_params.append(p)
                 else:
                     backbone_params.append(p)
@@ -355,6 +361,7 @@ class Trainer:
         # Calculate parameter counts
         n_back = sum(p.numel() for p in backbone_params)
         n_head = sum(p.numel() for p in head_params)
+        n_bias = sum(p.numel() for p in bias_params)
         n_tot_model = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         n_tot_refiner = sum(p.numel() for p in self.refiner.parameters() if p.requires_grad) if self.refiner is not None else 0
         n_tot = n_tot_model + n_tot_refiner
@@ -362,10 +369,16 @@ class Trainer:
         # Head LR multiplier (3-5× backbone LR)
         head_lr_multiplier = float(getattr(mdl_cfg, "HEAD_LR_MULTIPLIER", 4.0))  # 4× by default
         head_lr = lr_init * head_lr_multiplier
+        # Bias LR: much lower to prevent absorbing dataset mean early (0.1× backbone for first few epochs)
+        bias_lr_multiplier = float(getattr(mdl_cfg, "BIAS_LR_MULTIPLIER", 0.1))  # 0.1× by default
+        bias_lr = lr_init * bias_lr_multiplier
+        self.bias_lr_warmup_epochs = int(getattr(mdl_cfg, "BIAS_LR_WARMUP_EPOCHS", 5))  # Ramp to full LR after this
         
         print(f"🔧 Optimizer setup:")
         print(f"   Backbone: {n_back:,} params ({n_back/1e6:.1f}M) @ LR={lr_init:.2e}")
         print(f"   Head: {n_head:,} params ({n_head/1e6:.1f}M) @ LR={head_lr:.2e} ({head_lr_multiplier}×)")
+        if n_bias > 0:
+            print(f"   Bias: {n_bias:,} params @ LR={bias_lr:.2e} ({bias_lr_multiplier}×, warmup={self.bias_lr_warmup_epochs} epochs)")
         print(f"   Total trainable: {n_tot:,}")
         
         # CRITICAL ASSERTS - catch dead groups immediately (relaxed for frozen phases)
@@ -375,14 +388,17 @@ class Trainer:
             if self.phase != "k_only":
                 assert n_back > 1_000_000, f"❌ Backbone param count too small: {n_back:,}"
             assert n_head > 0, f"❌ Head param count too small: {n_head:,}"
-        assert n_back + n_head == n_tot, f"❌ Group sum ({n_back + n_head:,}) != total ({n_tot:,})"
+        assert n_back + n_head + n_bias == n_tot, f"❌ Group sum ({n_back + n_head + n_bias:,}) != total ({n_tot:,})"
         print("   ✅ Parameter grouping verified!")
         
         if opt_name == "adamw":
-            self.opt = torch.optim.AdamW([
+            param_groups = [
                 {'params': backbone_params, 'lr': lr_init, 'weight_decay': wd},
                 {'params': head_params, 'lr': head_lr, 'weight_decay': wd}
-            ])
+            ]
+            if n_bias > 0:
+                param_groups.append({'params': bias_params, 'lr': bias_lr, 'weight_decay': wd})
+            self.opt = torch.optim.AdamW(param_groups)
         elif opt_name == "adam":
             self.opt = torch.optim.Adam([
                 {'params': backbone_params, 'lr': lr_init, 'weight_decay': wd},
@@ -2872,7 +2888,27 @@ class Trainer:
             return float(best_val) if val_primary != "surrogate" else float(best_score)
 
         print(f"[Training] Starting {epochs} epochs at ep={start_ep+1} (train batches={len(tr_loader)}, val batches={len(va_loader)})...", flush=True)
+        
+        # Track best aux_φ_rmse for conditional NMSE ramp
+        # Initialize to a high value (will be updated from first validation)
+        best_aux_phi_rmse = 90.0  # Start high, will be updated from validation
+        nmse_ramp_started = False
+        _nmse_ramp_start_epoch = None
+        
         for ep in range(start_ep, epochs):
+            # ----------------------------
+            # Bias LR warmup: ramp from low LR to full LR after warmup epochs
+            # ----------------------------
+            if hasattr(self, 'bias_lr_warmup_epochs') and len(self.opt.param_groups) > 2:
+                bias_group = self.opt.param_groups[-1]  # Bias is last group
+                if ep < self.bias_lr_warmup_epochs:
+                    # Keep at low LR during warmup
+                    pass  # Already set at init
+                elif ep == self.bias_lr_warmup_epochs:
+                    # Ramp to full head LR after warmup
+                    bias_group['lr'] = head_lr
+                    print(f"[LR Schedule] Bias LR warmup complete: epoch={ep+1}, LR={bias_group['lr']:.2e} (full head LR)", flush=True)
+            
             # ----------------------------
             # Structural-R stability schedule: warm up covariance loss
             # ----------------------------
@@ -2883,32 +2919,48 @@ class Trainer:
             if use_structured_R and phase_name == "joint":
                 # GEOMETRY-ONLY WARMUP: force lam_cov=0 for the first geom_only epochs.
                 # Then ramp lam_cov over warm epochs AFTER geom_only ends.
+                # CRITICAL FIX: Delay NMSE ramp until aux geometry improves (conditional ramp).
                 geom_only = int(getattr(mdl_cfg, "GEOM_ONLY_EPOCHS", 0))
                 geom_only = max(0, geom_only)
                 warm = int(getattr(mdl_cfg, "STRUCTURED_COV_WARMUP_EPOCHS", 5))
                 warm = max(0, warm)
                 target = float(getattr(self, "_phase_lam_cov_target", float(getattr(self.loss_fn, "lam_cov", 0.0))))
+                # Conditional ramp: only start when aux_φ_rmse improves below threshold
+                aux_phi_threshold = float(getattr(mdl_cfg, "NMSE_RAMP_AUX_PHI_THRESHOLD", 25.0))  # Start ramp when aux_φ < 25°
 
                 if geom_only > 0 and ep < geom_only:
                     # Phase 1: geometry-only (no NMSE at all)
                     if ep == start_ep:
                         print(f"[Loss Schedule] GEOM_ONLY: lam_cov=0, lam_cov_pred=0 for first {geom_only} epochs", flush=True)
-                        print(f"[Loss Schedule] Then warmup lam_cov 0→{target:.3f} over {warm} epochs (epochs {geom_only+1}-{geom_only+warm})", flush=True)
+                        print(f"[Loss Schedule] Then conditional warmup: lam_cov 0→{target:.3f} when aux_φ < {aux_phi_threshold}° (max {warm} epochs)", flush=True)
                     self.loss_fn.lam_cov = 0.0
                     self.loss_fn.lam_cov_pred = 0.0
                 else:
-                    # Phase 2: ramp NMSE in gradually AFTER geom_only
+                    # Phase 2: conditional ramp NMSE based on geometry improvement
+                    # Only start ramp when aux_φ_rmse improves below threshold
+                    if not nmse_ramp_started:
+                        if best_aux_phi_rmse < aux_phi_threshold:
+                            nmse_ramp_started = True
+                            _nmse_ramp_start_epoch = ep
+                            print(f"[Loss Schedule] GEOM_ONLY ended. Starting conditional NMSE warmup: epoch={ep+1}, aux_φ={best_aux_phi_rmse:.2f}° < {aux_phi_threshold}°", flush=True)
+                        else:
+                            # Still waiting for geometry to improve
+                            self.loss_fn.lam_cov = 0.0
+                            self.loss_fn.lam_cov_pred = 0.0
+                            if ep == geom_only:
+                                print(f"[Loss Schedule] GEOM_ONLY ended. Waiting for aux_φ < {aux_phi_threshold}° before NMSE ramp (current: {best_aux_phi_rmse:.2f}°)", flush=True)
+                            continue  # Skip NMSE ramp logic
+                    
+                    # Ramp NMSE in gradually after geometry threshold is met
                     if warm > 0:
-                        epochs_since_geom = ep - geom_only  # 0-indexed from when NMSE starts
-                        frac = min(1.0, float(epochs_since_geom + 1) / float(warm))
+                        epochs_since_start = ep - _nmse_ramp_start_epoch  # 0-indexed from when NMSE starts
+                        frac = min(1.0, float(epochs_since_start + 1) / float(warm))
                         self.loss_fn.lam_cov = target * frac
                     else:
                         self.loss_fn.lam_cov = target
                     # Restore lam_cov_pred when NMSE enters
                     self.loss_fn.lam_cov_pred = float(getattr(cfg, "LAM_COV_PRED", 0.05))
-                    if geom_only > 0 and ep == geom_only:
-                        print(f"[Loss Schedule] GEOM_ONLY ended. Starting NMSE warmup: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
-                    if ep == geom_only + warm - 1 and warm > 0:
+                    if _nmse_ramp_start_epoch is not None and ep == _nmse_ramp_start_epoch + warm - 1 and warm > 0:
                         print(f"[Loss Schedule] NMSE warmup complete: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
 
                 # AUX MATCH WARMUP: use soft permutation matching early to avoid assignment flips.
@@ -3069,6 +3121,12 @@ class Trainer:
                         # Surrogate score: higher is better
                         metrics = metrics or {}
                         val_score = float(metrics.get("score", 0.0))
+                        # Track best aux_φ_rmse for conditional NMSE ramp (used in next epoch)
+                        aux_phi_rmse = metrics.get("aux_phi_rmse")
+                        if aux_phi_rmse is not None:
+                            aux_phi_rmse = float(aux_phi_rmse)
+                            if aux_phi_rmse < best_aux_phi_rmse:
+                                best_aux_phi_rmse = aux_phi_rmse
                     except Exception as e:
                         print(f"[VAL SURROGATE] Error: {e}", flush=True)
                         import traceback; traceback.print_exc()
