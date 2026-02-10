@@ -480,7 +480,8 @@ class ModelConfig:
     NMSE_RAMP_AUX_PHI_THRESHOLD = 25.0  # Start NMSE ramp when aux_φ < 25° (prevents premature NMSE entry)
     # Bias LR warmup: keep slot_output_bias at low LR for first few epochs
     BIAS_LR_MULTIPLIER = 0.1  # Bias LR = backbone LR × 0.1 (prevents absorbing dataset mean)
-    BIAS_LR_WARMUP_EPOCHS = 5  # Ramp bias LR to full head LR after this many epochs
+    BIAS_LR_FINAL_MULTIPLIER = 1.0  # After warmup: bias LR = backbone LR × this (NOT head LR by default)
+    BIAS_LR_WARMUP_EPOCHS = 5  # First N epochs use BIAS_LR_MULTIPLIER, then switch to BIAS_LR_FINAL_MULTIPLIER
     DH, DV = 3, 3
 
     def __init__(self):

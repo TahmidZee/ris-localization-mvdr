@@ -2925,20 +2925,21 @@ class Trainer:
             # Bias LR warmup: ramp from low LR to full LR after warmup epochs
             # ----------------------------
             if hasattr(self, 'bias_lr_warmup_epochs') and len(self.opt.param_groups) > 2:
-                bias_group = self.opt.param_groups[-1]  # Bias is last group
-                backbone_lr = float(self.opt.param_groups[0]["lr"])
-                bias_mult = (
-                    float(getattr(self, "bias_lr_multiplier", 0.1))
-                    if ep < self.bias_lr_warmup_epochs
-                    else float(getattr(self, "head_lr_multiplier", 4.0))
-                )
-                bias_group['lr'] = backbone_lr * bias_mult
-                if ep == self.bias_lr_warmup_epochs:
-                    print(
-                        f"[LR Schedule] Bias LR warmup complete: epoch={ep+1}, "
-                        f"LR={bias_group['lr']:.2e} ({bias_mult:.1f}× backbone)",
-                        flush=True,
-                    )
+                # Find groups by name to avoid relying on ordering.
+                bias_group = next((g for g in self.opt.param_groups if g.get("name") == "bias"), None)
+                backbone_group = next((g for g in self.opt.param_groups if g.get("name") == "backbone"), None)
+                if (bias_group is not None) and (backbone_group is not None):
+                    backbone_lr = float(backbone_group["lr"])
+                    mult_start = float(getattr(self, "bias_lr_multiplier", 0.1))
+                    mult_final = float(getattr(mdl_cfg, "BIAS_LR_FINAL_MULTIPLIER", 1.0))
+                    bias_mult = mult_start if ep < int(self.bias_lr_warmup_epochs) else mult_final
+                    bias_group["lr"] = backbone_lr * bias_mult
+                    if int(self.bias_lr_warmup_epochs) > 0 and ep == int(self.bias_lr_warmup_epochs):
+                        print(
+                            f"[LR Schedule] Bias LR warmup complete: epoch={ep+1}, "
+                            f"LR={bias_group['lr']:.2e} ({bias_mult:.2f}× backbone)",
+                            flush=True,
+                        )
             
             # ----------------------------
             # Structural-R stability schedule: warm up covariance loss
