@@ -160,6 +160,8 @@ class Trainer:
 
         # 1) Apply HPO overrides (before model build)
         best_path = None
+        # May be populated by _apply_hpo_to_mdl_cfg() before model/loss are built.
+        self._hpo_loss_weights = {}
         if isinstance(from_hpo, str):
             best_path = Path(from_hpo)
         elif from_hpo:
@@ -273,9 +275,6 @@ class Trainer:
             self.loss_fn.lam_peak_contrast = 0.0
             self.loss_fn.lam_heatmap = float(getattr(mdl_cfg, "LAM_HEATMAP", 0.1))
         
-        # Always initialize _hpo_loss_weights (may be populated later by HPO config loading)
-        self._hpo_loss_weights = {}
-        
         # Beta annealing: start low (trust network), gradually blend in R_samp
         self.beta_start = 0.0
         self.beta_final = getattr(cfg, 'HYBRID_COV_BETA', 0.30)
@@ -373,6 +372,9 @@ class Trainer:
         bias_lr_multiplier = float(getattr(mdl_cfg, "BIAS_LR_MULTIPLIER", 0.1))  # 0.1× by default
         bias_lr = lr_init * bias_lr_multiplier
         self.bias_lr_warmup_epochs = int(getattr(mdl_cfg, "BIAS_LR_WARMUP_EPOCHS", 5))  # Ramp to full LR after this
+        self.backbone_lr_init = lr_init
+        self.head_lr_multiplier = head_lr_multiplier
+        self.bias_lr_multiplier = bias_lr_multiplier
         
         print(f"🔧 Optimizer setup:")
         print(f"   Backbone: {n_back:,} params ({n_back/1e6:.1f}M) @ LR={lr_init:.2e}")
@@ -391,24 +393,17 @@ class Trainer:
         assert n_back + n_head + n_bias == n_tot, f"❌ Group sum ({n_back + n_head + n_bias:,}) != total ({n_tot:,})"
         print("   ✅ Parameter grouping verified!")
         
-        if opt_name == "adamw":
-            param_groups = [
-                {'params': backbone_params, 'lr': lr_init, 'weight_decay': wd},
-                {'params': head_params, 'lr': head_lr, 'weight_decay': wd}
-            ]
-            if n_bias > 0:
-                param_groups.append({'params': bias_params, 'lr': bias_lr, 'weight_decay': wd})
-            self.opt = torch.optim.AdamW(param_groups)
-        elif opt_name == "adam":
-            self.opt = torch.optim.Adam([
-                {'params': backbone_params, 'lr': lr_init, 'weight_decay': wd},
-                {'params': head_params, 'lr': head_lr, 'weight_decay': wd}
-            ])
+        param_groups = [
+            {'name': 'backbone', 'params': backbone_params, 'lr': lr_init, 'weight_decay': wd},
+            {'name': 'head', 'params': head_params, 'lr': head_lr, 'weight_decay': wd},
+        ]
+        if n_bias > 0:
+            param_groups.append({'name': 'bias', 'params': bias_params, 'lr': bias_lr, 'weight_decay': wd})
+
+        if opt_name == "adam":
+            self.opt = torch.optim.Adam(param_groups)
         else:
-            self.opt = torch.optim.AdamW([
-                {'params': backbone_params, 'lr': lr_init, 'weight_decay': wd},
-                {'params': head_params, 'lr': head_lr, 'weight_decay': wd}
-            ])
+            self.opt = torch.optim.AdamW(param_groups)
 
         # Expert fix: Optimizer wiring sanity check
         opt_ids = {id(p) for g in self.opt.param_groups for p in g['params']}
@@ -1002,7 +997,8 @@ class Trainer:
         
         # Expert debug: Print LR every epoch
         lrs = [g['lr'] for g in self.opt.param_groups]
-        print(f"[LR] epoch={epoch} groups={['backbone','head']} lr={lrs}", flush=True)
+        group_names = [str(g.get("name", f"group{i}")) for i, g in enumerate(self.opt.param_groups)]
+        print(f"[LR] epoch={epoch} groups={group_names} lr={lrs}", flush=True)
         if epoch_dbg:
             print(f"[EPOCH DEBUG] epoch={epoch} iters={iters} len(loader)={len(loader)}", flush=True)
             print(f"[EPOCH DEBUG] entering for loop over loader...", flush=True)
@@ -2423,16 +2419,34 @@ class Trainer:
                     theta_all_deg = _to_deg_safe(theta_all).copy()  # Ensure numpy array
                     r_all_np = r_all.detach().cpu().numpy() if isinstance(r_all, torch.Tensor) else np.array(r_all)
                     
-                    # Inference-like evaluation: always use unified angle pipeline when factors available
+                    # Inference-like evaluation: always use unified angle pipeline when covariance is available
                     # Use GPU MUSIC if available for 10-20x speedup
-                    if "cov_fact_angle" in preds:
+                    if ("cov_fact_angle" in preds) or ("R_pred" in preds):
                         # Debug: print first sample to verify MUSIC is being called
                         if i == 0 and bi == 0:
                             print(f"[VAL MUSIC] Entering MUSIC block for sample 0, batch 0", flush=True)
                         try:
                             from .angle_pipeline import angle_pipeline, angle_pipeline_gpu, _GPU_MUSIC_AVAILABLE
                             
-                            cf_ang = preds["cov_fact_angle"][i].detach().cpu().numpy()  # [N*K_MAX*2]
+                            cov_music_input = None
+                            if "cov_fact_angle" in preds:
+                                cf_ang = preds["cov_fact_angle"][i].detach().cpu().numpy()  # [N*K_MAX*2]
+                                # Convert covariance factor to complex
+                                N = cfg.N_H * cfg.N_V
+                                cf_ang_real = cf_ang[:N * cfg.K_MAX].reshape(N, cfg.K_MAX)
+                                cf_ang_imag = cf_ang[N * cfg.K_MAX:].reshape(N, cfg.K_MAX)
+                                cov_music_input = (cf_ang_real + 1j * cf_ang_imag).astype(np.complex64)
+                            elif "R_pred" in preds:
+                                R_i = preds["R_pred"][i]
+                                if isinstance(R_i, torch.Tensor):
+                                    R_i = R_i.detach().cpu().numpy()
+                                if isinstance(R_i, np.ndarray) and R_i.ndim == 3 and R_i.shape[-1] == 2:
+                                    R_i = R_i[..., 0] + 1j * R_i[..., 1]
+                                cov_music_input = np.asarray(R_i, dtype=np.complex64)
+
+                            if cov_music_input is None:
+                                raise RuntimeError("No covariance input found for MUSIC block.")
+
                             # NOTE: K-head removed - use GT K for validation MUSIC
                             # At inference, use MDL/MVDR for K estimation
                             K_nn = int(min(max(1, k_true), cfg.K_MAX))
@@ -2464,12 +2478,6 @@ class Trainer:
                                 y_snaps = y_i[:, :, 0] + 1j * y_i[:, :, 1]
                                 codes_snaps = C_i[:, :, 0] + 1j * C_i[:, :, 1]
                                 blend_beta = getattr(cfg, "HYBRID_COV_BETA", 0.2)
-                            
-                            # Convert covariance factor to complex
-                            N = cfg.N_H * cfg.N_V
-                            cf_ang_real = cf_ang[:N * cfg.K_MAX].reshape(N, cfg.K_MAX)
-                            cf_ang_imag = cf_ang[N * cfg.K_MAX:].reshape(N, cfg.K_MAX)
-                            cf_ang_complex = cf_ang_real + 1j * cf_ang_imag
                             
                             # MDL baseline for gating (measurement-domain Ryy, like inference)
                             try:
@@ -2507,7 +2515,7 @@ class Trainer:
                                 # This ensures K-head and MUSIC see the SAME R_eff
                                 hybrid_beta = float(getattr(cfg, "HYBRID_COV_BETA", 0.3))
                                 phi_music, theta_music, info_music = angle_pipeline_gpu(
-                                    cf_ang_complex, K_hat, cfg,
+                                    cov_music_input, K_hat, cfg,
                                     use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
                                     use_2_5d=True,  # Enable 2.5D so range is estimated for gating
                                     r_planes=getattr(cfg, "MUSIC_R_PLANES", None),
@@ -2521,7 +2529,7 @@ class Trainer:
                             else:
                                 # CPU fallback with full pipeline
                                 phi_music, theta_music, _ = angle_pipeline(
-                                    cf_ang_complex, K_hat, cfg,
+                                    cov_music_input, K_hat, cfg,
                                     use_fba=getattr(cfg, "MUSIC_USE_FBA", True),
                                     use_adaptive_shrink=True,
                                     use_parabolic=getattr(cfg, "MUSIC_PEAK_REFINE", True),
@@ -2894,6 +2902,7 @@ class Trainer:
         best_aux_phi_rmse = 90.0  # Start high, will be updated from validation
         nmse_ramp_started = False
         _nmse_ramp_start_epoch = None
+        _nmse_wait_logged = False
         
         for ep in range(start_ep, epochs):
             # ----------------------------
@@ -2901,13 +2910,19 @@ class Trainer:
             # ----------------------------
             if hasattr(self, 'bias_lr_warmup_epochs') and len(self.opt.param_groups) > 2:
                 bias_group = self.opt.param_groups[-1]  # Bias is last group
-                if ep < self.bias_lr_warmup_epochs:
-                    # Keep at low LR during warmup
-                    pass  # Already set at init
-                elif ep == self.bias_lr_warmup_epochs:
-                    # Ramp to full head LR after warmup
-                    bias_group['lr'] = head_lr
-                    print(f"[LR Schedule] Bias LR warmup complete: epoch={ep+1}, LR={bias_group['lr']:.2e} (full head LR)", flush=True)
+                backbone_lr = float(self.opt.param_groups[0]["lr"])
+                bias_mult = (
+                    float(getattr(self, "bias_lr_multiplier", 0.1))
+                    if ep < self.bias_lr_warmup_epochs
+                    else float(getattr(self, "head_lr_multiplier", 4.0))
+                )
+                bias_group['lr'] = backbone_lr * bias_mult
+                if ep == self.bias_lr_warmup_epochs:
+                    print(
+                        f"[LR Schedule] Bias LR warmup complete: epoch={ep+1}, "
+                        f"LR={bias_group['lr']:.2e} ({bias_mult:.1f}× backbone)",
+                        flush=True,
+                    )
             
             # ----------------------------
             # Structural-R stability schedule: warm up covariance loss
@@ -2943,25 +2958,30 @@ class Trainer:
                             nmse_ramp_started = True
                             _nmse_ramp_start_epoch = ep
                             print(f"[Loss Schedule] GEOM_ONLY ended. Starting conditional NMSE warmup: epoch={ep+1}, aux_φ={best_aux_phi_rmse:.2f}° < {aux_phi_threshold}°", flush=True)
+                            _nmse_wait_logged = False
                         else:
                             # Still waiting for geometry to improve
                             self.loss_fn.lam_cov = 0.0
                             self.loss_fn.lam_cov_pred = 0.0
-                            if ep == geom_only:
-                                print(f"[Loss Schedule] GEOM_ONLY ended. Waiting for aux_φ < {aux_phi_threshold}° before NMSE ramp (current: {best_aux_phi_rmse:.2f}°)", flush=True)
-                            continue  # Skip NMSE ramp logic
-                    
-                    # Ramp NMSE in gradually after geometry threshold is met
-                    if warm > 0:
-                        epochs_since_start = ep - _nmse_ramp_start_epoch  # 0-indexed from when NMSE starts
-                        frac = min(1.0, float(epochs_since_start + 1) / float(warm))
-                        self.loss_fn.lam_cov = target * frac
-                    else:
-                        self.loss_fn.lam_cov = target
-                    # Restore lam_cov_pred when NMSE enters
-                    self.loss_fn.lam_cov_pred = float(getattr(cfg, "LAM_COV_PRED", 0.05))
-                    if _nmse_ramp_start_epoch is not None and ep == _nmse_ramp_start_epoch + warm - 1 and warm > 0:
-                        print(f"[Loss Schedule] NMSE warmup complete: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
+                            if (not _nmse_wait_logged) or ((ep - geom_only) % 5 == 0):
+                                print(
+                                    f"[Loss Schedule] GEOM_ONLY ended. Waiting for aux_φ < {aux_phi_threshold}° "
+                                    f"before NMSE ramp (current best: {best_aux_phi_rmse:.2f}°)",
+                                    flush=True,
+                                )
+                                _nmse_wait_logged = True
+                    if nmse_ramp_started:
+                        # Ramp NMSE in gradually after geometry threshold is met
+                        if warm > 0:
+                            epochs_since_start = ep - _nmse_ramp_start_epoch  # 0-indexed from when NMSE starts
+                            frac = min(1.0, float(epochs_since_start + 1) / float(warm))
+                            self.loss_fn.lam_cov = target * frac
+                        else:
+                            self.loss_fn.lam_cov = target
+                        # Restore lam_cov_pred when NMSE enters
+                        self.loss_fn.lam_cov_pred = float(getattr(cfg, "LAM_COV_PRED", 0.05))
+                        if _nmse_ramp_start_epoch is not None and ep == _nmse_ramp_start_epoch + warm - 1 and warm > 0:
+                            print(f"[Loss Schedule] NMSE warmup complete: epoch={ep+1} lam_cov={self.loss_fn.lam_cov:.3f}", flush=True)
 
                 # AUX MATCH WARMUP: use soft permutation matching early to avoid assignment flips.
                 aux_soft_epochs = int(getattr(mdl_cfg, "AUX_MATCH_SOFT_EPOCHS", 0))
