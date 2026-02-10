@@ -355,20 +355,22 @@ class HybridModel(nn.Module):
             slot_hidden = int(getattr(mdl_cfg, "SLOT_HEAD_HIDDEN_DIM", D // 2))
             _slot_last_linear = nn.Linear(slot_hidden, 5)  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
             # -----------------------------------------------------------
-            # CRITICAL FIX (2026-02-10): Zero-init the last linear layer.
-            # Standard practice in DETR and all set-prediction transformers.
-            # Without this, the MLP's random init (std≈0.19) adds noise to
-            # each slot's output that is ~17% of the bias magnitude. This
-            # means predictions at init are bias ± noise, NOT clean bias.
-            # The backbone can't learn because:
-            #   1. The noise makes Hungarian matching unstable
-            #   2. The bias absorbs the average position (order statistics)
-            #   3. Per-sample backbone corrections are drowned by MLP noise
-            # With zero-init: predictions = exactly the bias at epoch 0,
-            # and the MLP gradually learns input-dependent corrections.
+            # CRITICAL FIX (2026-02-10): Small-init the last linear layer (not zero!).
+            # Zero-init blocks gradients: if slot features are small, then
+            # out = W @ slot + b ≈ b (zero weights → zero gradient through W).
+            # This causes d<R_blend>/d(head_param) = 0, preventing backbone learning.
+            #
+            # Solution: Use very small random init (std=0.01) instead of zero.
+            # This ensures:
+            #   1. Predictions start near bias (small weights → small corrections)
+            #   2. Gradients can flow (non-zero weights → non-zero dL/dW)
+            #   3. MLP can learn input-dependent corrections from epoch 1
+            #
+            # Without small-init: random init (std≈0.19) adds ~17% noise to bias,
+            # making Hungarian matching unstable and drowning backbone signals.
             # -----------------------------------------------------------
-            nn.init.zeros_(_slot_last_linear.weight)
-            nn.init.zeros_(_slot_last_linear.bias)
+            nn.init.normal_(_slot_last_linear.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(_slot_last_linear.bias)  # Bias stays zero (predictions = bias + small correction)
             self.slot_head = nn.Sequential(
                 nn.Linear(D, slot_hidden),
                 nn.GELU(),
