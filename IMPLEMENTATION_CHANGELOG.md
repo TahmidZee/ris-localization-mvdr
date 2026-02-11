@@ -2,7 +2,7 @@
 
 **Date:** January 16, 2026  
 **Reference:** `MVDR_LOCALIZATION_PLAN.md`  
-**Last Updated:** February 5, 2026 (Aux geometry learning stabilized: disable sorted matching; Hungarian assignment; smoke-test gate)
+**Last Updated:** February 11, 2026 (Training schedule fixes: geometry plateau resolved, dead parameter audit)
 
 ---
 
@@ -948,3 +948,100 @@ objective = (rmse_xyz_all / xyz_norm) + f1_weight * (1 - F1)
 **Files:**
 - `ris_pytorch_pipeline/configs.py`
 - `ris_pytorch_pipeline/loss.py`
+
+---
+
+## 15) Gradient blockage fix: zero-init → small random init (2026-02-10)
+
+**Why:** Zero-initializing the `slot_head` last linear layer (commit `8015e12`) blocked ALL gradients through the slot head. When `W=0`, the output `out = W @ slot + b ≈ b` regardless of input, so `d(out)/d(slot) = 0` and the backbone never learns input-dependent features. The `GRADPATH` probe confirmed `d<R_blend>/d(head_param) = 0`.
+
+**Fix:** Replace zero-init with small random init (`std=0.01`) for weights, keeping bias at zero. This ensures:
+1. Predictions start near the per-slot bias (small corrections)
+2. Gradients can flow (`d(out)/d(slot) ≠ 0`)
+3. The MLP can learn input-dependent corrections from epoch 1
+
+**Commits:** `eece046`, `7e0cd1c`
+
+**Files:**
+- `ris_pytorch_pipeline/model.py` — `_slot_last_linear` init changed
+
+---
+
+## 16) Bias LR safeguards + conditional NMSE ramp (2026-02-10)
+
+**Why:** Two compounding issues caused `aux_φ_rmse` to regress after initial improvement:
+1. **Bias LR jump**: At epoch `BIAS_LR_WARMUP_EPOCHS` (5), the bias LR jumped from `0.1×` to `HEAD_LR_MULTIPLIER×` (4.0×) backbone LR — a 40× increase that destabilized learned geometry.
+2. **NMSE ramp too aggressive**: With `NMSE_RAMP_AUX_PHI_THRESHOLD=25°`, the ramp started trivially (model init ≈ 18°), allowing NMSE to dominate before geometry had time to learn.
+
+**Fixes:**
+- Added `BIAS_LR_FINAL_MULTIPLIER=0.1`: bias stays at 0.1× backbone LR the entire run.
+- Added conditional NMSE ramp: `lam_cov` only starts ramping when `best_aux_phi_rmse < NMSE_RAMP_AUX_PHI_THRESHOLD` (15°).
+- Separate optimizer param group for `slot_output_bias`.
+
+**Commits:** `7e0cd1c`, `f276909`
+
+**Files:**
+- `ris_pytorch_pipeline/train.py` — bias param group, conditional ramp logic
+- `ris_pytorch_pipeline/configs.py` — `BIAS_LR_MULTIPLIER`, `BIAS_LR_FINAL_MULTIPLIER`, `NMSE_RAMP_AUX_PHI_THRESHOLD`
+
+---
+
+## 17) Reviewer-proof audit fixes (2026-02-10)
+
+**Why:** Comprehensive audit identified several issues that would undermine experimental rigor.
+
+**Fixes:**
+1. **Train/val leakage guard**: `_resolve_shards_train_val()` raises error if train and val resolve to same path.
+2. **Blind-K evaluation**: `eval_music_final.py` now uses MDL K estimation as primary, oracle K as secondary.
+3. **Test split enforcement**: `eval_music_final.py` defaults to `--split test` (not val).
+4. **Surrogate score includes MVDR peak metrics**: Merged default `SURROGATE_METRIC_WEIGHTS` with config overrides so `w_peak_f1`, `w_peak_fp`, `w_peak_pssr` are never silently zero.
+5. **Loss gating warnings**: One-time warnings in `loss.py` if `AUX_LOSS_PERM_INVARIANT=False` would silently disable sorted/diversity/mask losses.
+6. **Inference skip R_samp when beta=0**: `infer.py` no longer wastes compute building `R_samp` when `HYBRID_COV_BETA=0`.
+
+**Commits:** `d2f09b1`, `a7e4470`, `e16bb39`
+
+**Files:**
+- `ris_pytorch_pipeline/train.py`, `configs.py`, `loss.py`, `infer.py`, `eval_music_final.py`
+
+---
+
+## 18) Training schedule tuned from log analysis (2026-02-11)
+
+**Why:** Training log showed `aux_φ_rmse` reaching 17.68° at epoch 3 (lam_cov=0.2) but degrading to 21°+ as NMSE ramped to 1.0 and bias LR jumped 10×. The model CAN learn geometry, but NMSE overwhelms it too quickly.
+
+**Fixes (commit `6fbce84`):**
+- `GEOM_ONLY_EPOCHS`: 2 → 10 (give geometry 10 full epochs before any NMSE)
+- `PHASE_LOSS["joint"]["lam_cov"]`: 1.0 → 0.3 (cap NMSE as gentle regularizer)
+- `PHASE_LOSS["joint"]["lam_aux"]`: 1.0 → 0.0 (disable perm-invariant loss; sorted-only)
+- `LAM_AUX_SORTED`: 1.5 → 2.0 (sole geometry loss, needs higher weight)
+- `NMSE_RAMP_AUX_PHI_THRESHOLD`: 25° → 15° (require genuine learning before NMSE)
+- `BIAS_LR_FINAL_MULTIPLIER`: 1.0 → 0.1 (keep bias slow entire run)
+- `EMA_EVAL_WARMUP_EPOCHS`: 5 → 999 (disable EMA to see raw model performance)
+
+**Expected behavior:**
+- Epochs 1–10: geometry-only, sorted canonical loss + diversity. φ should improve steadily.
+- Epoch 11+: NMSE ramp begins only if φ < 15° (conditional gate).
+- NMSE capped at 0.3× to prevent drowning geometry.
+
+**Files:**
+- `ris_pytorch_pipeline/configs.py`
+
+---
+
+## Known Issue: Dead Parameters (~774K, 7% of total)
+
+**Status:** Documented, cleanup deferred to Phase 1 refactoring.
+
+When `USE_STRUCTURED_R=True` and `USE_SLOT_HEAD=True` (current default), the following modules are created but never contribute to the loss gradient:
+
+| Module | Params | Reason |
+|--------|--------|--------|
+| `cov_ln` (LayerNorm) | 1,024 | `feats_cov` computed but `cf_ang=None` → never used |
+| `heads_ln` (LayerNorm) | 1,024 | `feats_final` computed but soft-argmax gated off |
+| `phi_logits` (Linear 512→305) | 156,465 | Soft-argmax gated off by `use_slot_head + use_structured_R` |
+| `theta_logits` (Linear 512→305) | 156,465 | Same |
+| `antidiag_pool.proj` (Linear 1022→128) | 130,944 | `cf_ang=None` → antidiag path never entered |
+| `fusion_with_antidiag` (Linear 640→512) | 328,192 | Same |
+| **Total** | **~774K** | **7.3% of 10.5M total** |
+
+These parameters receive no gradient but still consume memory and have weight decay applied. They will be removed in the Phase 1 refactor (see `REFACTOR_PROGRESS.md` §6).

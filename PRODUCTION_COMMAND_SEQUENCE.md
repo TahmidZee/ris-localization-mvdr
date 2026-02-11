@@ -1,7 +1,7 @@
 # Production Command Sequence
 **Date:** 2025-01-13  
 **Status:** ✅ Ready for training runs (post-smoke-test gate)
-**Updated:** 2026-02-05 (M=64, N=256, L=64 baseline; aux learning stabilized)
+**Updated:** 2026-02-11 (Training schedule tuned: GEOM_ONLY=10, lam_cov capped 0.3, sorted-only geometry, bias LR slow)
 
 ---
 
@@ -77,34 +77,36 @@ cat results_M64_N256_L64/hpo/*_trials.csv | sort -t, -k2 -n | head -6
 **Time:** ~4-6 hours per run  
 **Output:** `results_M64_N256_L64/checkpoints/best.pt`
 
-### Train Best Config from HPO
+### Train with Default Config (Recommended — 2026-02-11)
 ```bash
 cd /home/tahit/ris/MainMusic
 python -m ris_pytorch_pipeline.ris_pipeline train \
-    --epochs 50 \
-    --n_train 160000 \
-    --n_val 40000 \
-    --use_shards \
-    --from_hpo results_M64_N256_L64/hpo/best.json
+    --epochs 60 \
+    --n_train 100000 \
+    --n_val 10000 \
+    --use_shards
 ```
 
-### Train Top 5 Configs (Manual)
-If you want to train multiple top configs, extract them from the HPO CSV and run:
+**What to watch for in the first 10 epochs (geometry-only):**
+- `aux_φ_rmse` should decrease from ~20° toward 15°
+- If φ stalls at 20°+ for 10 epochs → model is stuck (investigate)
+- `GRADPATH` probe should show non-zero gradient (confirms slot head is learning)
 
+**Epoch 11+ (NMSE ramp conditional):**
+- NMSE only ramps in if `best_aux_phi_rmse < 15°`
+- If φ hasn't reached 15° → stays geometry-only indefinitely
+- Capped at `lam_cov=0.3` (won't drown geometry)
+
+### Train from HPO Config (Optional)
 ```bash
-# Example: Train config #2 (modify hyperparameters manually)
+cd /home/tahit/ris/MainMusic
 python -m ris_pytorch_pipeline.ris_pipeline train \
-    --epochs 50 \
-    --n_train 160000 \
-    --n_val 40000 \
+    --epochs 60 \
+    --n_train 100000 \
+    --n_val 10000 \
     --use_shards \
     --from_hpo results_M64_N256_L64/hpo/best.json
 ```
-
-**Note:** For multiple configs, you may want to:
-1. Copy `best.json` to `best_1.json`, `best_2.json`, etc.
-2. Manually edit each JSON with different hyperparameters
-3. Run training for each, saving to different checkpoint directories
 
 ### Monitor Training
 ```bash
@@ -221,9 +223,15 @@ Located in `ris_pytorch_pipeline/configs.py`:
 - `REFINER_GRID_THETA = 41` - Refiner input grid (elevation)
 
 ### Training Parameters
-- `EPOCHS = 50` - Full training epochs
-- `EARLY_STOP_PATIENCE = 10` - Early stopping patience
+- `EPOCHS = 60` - Full training epochs
+- `EARLY_STOP_PATIENCE = 20` - Patience increased for DETR-style models + NMSE ramp
 - `BATCH_SIZE = 64` - Batch size (adjust based on GPU memory)
+- `GEOM_ONLY_EPOCHS = 10` - First 10 epochs: geometry-only (no NMSE)
+- `LAM_AUX_SORTED = 2.0` - Sorted canonical is the sole geometry loss
+- `PHASE_LOSS["joint"]["lam_cov"] = 0.3` - NMSE capped low (gentle regularizer)
+- `NMSE_RAMP_AUX_PHI_THRESHOLD = 15.0` - NMSE ramp delayed until φ < 15°
+- `BIAS_LR_FINAL_MULTIPLIER = 0.1` - Bias stays slow the entire run
+- `EMA_EVAL_WARMUP_EPOCHS = 999` - EMA disabled for debugging (re-enable later)
 
 ---
 

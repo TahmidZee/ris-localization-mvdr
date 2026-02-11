@@ -54,10 +54,29 @@ Call sites to remove (in `fit()`):
 - Merge overlapping logic in 3 validation methods
 - Remove duplicate batch loops
 
-### 6. model.py Unused Heads (~200 lines)
-- Remove soft-argmax grid head when `USE_SLOT_HEAD=True`
-- Remove factor heads when `USE_STRUCTURED_R=True`
-- Remove disabled AntiDiagPool path
+### 6. model.py Dead Parameters & Unused Heads (~774K params, ~200 lines)
+⚠️ **HIGH PRIORITY** — These are dead parameters receiving no gradient but consuming memory and weight decay.
+
+When `USE_STRUCTURED_R=True` + `USE_SLOT_HEAD=True` (current default), the following are dead:
+
+| Module | Params | Why Dead |
+|--------|--------|----------|
+| `cov_ln` | 1,024 | `feats_cov` computed but `cf_ang=None` |
+| `heads_ln` | 1,024 | `feats_final` computed but soft-argmax gated off |
+| `phi_logits` | 156,465 | Soft-argmax gated off |
+| `theta_logits` | 156,465 | Soft-argmax gated off |
+| `antidiag_pool.proj` | 130,944 | `cf_ang=None` → antidiag path never entered |
+| `fusion_with_antidiag` | 328,192 | `cf_ang=None` → never called |
+| **Total** | **~774K (7.3%)** | |
+
+**Cleanup tasks:**
+- Remove `cov_ln`, `heads_ln` when structural-R is default
+- Remove `phi_logits`, `theta_logits`, `soft_argmax`, `logits_gg` (soft-argmax path)
+- Remove `antidiag_pool`, `fusion_with_antidiag` (AntiDiagPool path)
+- Remove `cov_fact_angle`, `cov_fact_range` stubs (already None)
+- Remove `_apply_psd_parameterization` method (legacy path only)
+- Remove `_whiten_covariance` method (only used in dead antidiag path)
+- Guard: keep behind `if not self.use_structured_R:` for ablation compatibility
 
 ### 7. Final Testing
 - Run smoke tests
@@ -72,8 +91,10 @@ Call sites to remove (in `fit()`):
 |------|--------|---------------|-----------|
 | train.py | 3,420 | ~2,600 | -820 (-24%) |
 | loss.py | 1,338 | ~1,050 | -288 (-22%) |
-| model.py | 1,111 | ~900 | -211 (-19%) |
-| **Total** | **5,869** | **~4,550** | **-1,319 (-22%)** |
+| model.py | 1,111 | ~750 | -361 (-32%) |
+| **Total** | **5,869** | **~4,400** | **-1,469 (-25%)** |
+
+> **Note:** model.py reduction increased due to dead parameter cleanup (~774K params, ~150 lines).
 
 ---
 
