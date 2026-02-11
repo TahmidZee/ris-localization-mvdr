@@ -424,17 +424,14 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                # FIX (2026-02-10): Re-enabled perm-invariant loss (lam_aux=1.0).
-                # Previous theory (conflicting assignments) was wrong — the real issue
-                # was MLP init noise drowning the bias signal, preventing backbone learning.
-                # With zero-init last layer, predictions start at clean bias positions,
-                # and BOTH losses provide useful geometry gradients:
-                #   - sorted (lam_aux_sorted=1.5): deterministic slot→GT assignment
-                #   - perm-invariant (lam_aux=1.0): optimal (closest) slot→GT assignment
-                # Together they give 2× geometry gradient budget to the backbone.
-                "lam_cov": 1.0,              # Full weight (after GEOM_ONLY + warmup)
+                # FIX (2026-02-11): Based on training log analysis:
+                #   epoch 3 (lam_cov=0.2): φ=17.68° ← BEST (low NMSE helps!)
+                #   epoch 7+ (lam_cov=1.0): φ→19.44° ← NMSE drowns geometry
+                # → Cap lam_cov at 0.3 (gentle regularizer, not dominant)
+                # → Disable perm-invariant (sorted-only avoids conflicting assignments)
+                "lam_cov": 0.3,              # Was 1.0 — capped low so NMSE doesn't drown geometry
                 "lam_subspace_align": 0.0,   # keep off unless explicitly enabled later
-                "lam_aux": 1.0,              # Re-enabled: perm-invariant geometry
+                "lam_aux": 0.0,              # Disabled: sorted canonical is sole geometry loss
                 "lam_peak_contrast": 0.0,    # off for now
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
@@ -477,10 +474,10 @@ class ModelConfig:
     # With GEOM_ONLY=2, NMSE starts ramping at epoch 3 over 5 epochs (epochs 3-7).
     STRUCTURED_COV_WARMUP_EPOCHS = 5   # Ramp lam_cov from 0→target over 5 epochs after GEOM_ONLY
     # Conditional NMSE ramp: only start when aux_φ_rmse improves below threshold
-    NMSE_RAMP_AUX_PHI_THRESHOLD = 25.0  # Start NMSE ramp when aux_φ < 25° (prevents premature NMSE entry)
+    NMSE_RAMP_AUX_PHI_THRESHOLD = 15.0  # FIX: Was 25° (model starts at ~18° from bias, so 25° was trivially met). 15° requires genuine learning.
     # Bias LR warmup: keep slot_output_bias at low LR for first few epochs
     BIAS_LR_MULTIPLIER = 0.1  # Bias LR = backbone LR × 0.1 (prevents absorbing dataset mean)
-    BIAS_LR_FINAL_MULTIPLIER = 1.0  # After warmup: bias LR = backbone LR × this (NOT head LR by default)
+    BIAS_LR_FINAL_MULTIPLIER = 0.1  # FIX: Keep bias slow the ENTIRE run (was 1.0, caused 10× LR jump at epoch 6 → φ regression)
     BIAS_LR_WARMUP_EPOCHS = 5  # First N epochs use BIAS_LR_MULTIPLIER, then switch to BIAS_LR_FINAL_MULTIPLIER
     DH, DV = 3, 3
 
@@ -508,8 +505,11 @@ class ModelConfig:
         # --- EMA validation policy ---
         # EMA (decay~0.999) is great for final metrics, but in the first few epochs it can
         # mask real learning because the EMA weights stay extremely close to initialization.
-        # Validate on raw weights for the first N epochs, then switch to EMA for stability.
-        self.EMA_EVAL_WARMUP_EPOCHS = 5
+        # FIX (2026-02-11): Disable EMA for validation (was 5 → 999).
+        # EMA smooths weights and can MASK whether the raw model is actually improving.
+        # For debugging the φ plateau, we need to see real/unsmoothed performance.
+        # Re-enable (set to 5) once we confirm the model is learning.
+        self.EMA_EVAL_WARMUP_EPOCHS = 999
 
         # --- inference / loss knobs ---
         self.PHASE_BITS = 3
@@ -596,11 +596,12 @@ class ModelConfig:
         #   - aux metrics completely flat for all 8 epochs
         # When NMSE enters later, the model is stuck and can't escape.
         #
-        # With GEOM_ONLY=2: 2 quick epochs let optimizer/LR warm up, then NMSE ramps
-        # in while the model is still in a high-curvature region of the loss landscape.
-        # NMSE forces INPUT-DEPENDENT predictions (R_true varies per sample), preventing
-        # the bias-only collapse.
-        self.GEOM_ONLY_EPOCHS = 2
+        # FIX (2026-02-10): Changed from 2 → 10 based on training log analysis.
+        # With GEOM_ONLY=2, NMSE ramps in before geometry has time to learn.
+        # Log showed: φ=17.68° at epoch 3 (lam_cov=0.2) → 19.44° by epoch 12 (lam_cov=1.0).
+        # The model CAN learn φ, but NMSE overwhelms it too quickly.
+        # 10 epochs gives geometry losses time to push φ below 15° before NMSE enters.
+        self.GEOM_ONLY_EPOCHS = 10
 
         # Aux permutation matching stability:
         # Hard argmin assignment can "flip" early, producing a non-smooth loss surface and
@@ -654,9 +655,10 @@ class ModelConfig:
         # Each slot learns the i-th order statistic of the source distribution, which
         # spreads them across the FOV and breaks symmetric equilibrium within ~2-3 epochs.
         # FIX (2026-02-10): Reduced from 2.5 to 1.5 now that perm-invariant is re-enabled.
-        # Both losses provide geometry gradients; sorted gives deterministic slot ordering,
-        # perm-invariant gives optimal matching. Together: 1.0 + 1.5 = 2.5 total geometry budget.
-        self.LAM_AUX_SORTED = 1.5
+        # FIX (2026-02-11): Sorted canonical is now the SOLE geometry loss (perm-invariant disabled).
+        # Increased from 1.5 → 2.0 to compensate. Sorted gives deterministic, unambiguous
+        # gradients: slot sorted-0 → leftmost GT, slot sorted-1 → second-leftmost GT, etc.
+        self.LAM_AUX_SORTED = 2.0
 
         # Presence/mask supervision
         #
