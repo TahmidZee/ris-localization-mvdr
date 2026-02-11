@@ -424,14 +424,14 @@ class SysConfig:
                 "lam_peak_contrast": 0.0,
             },
             "joint": {
-                # FIX (2026-02-11): Based on training log analysis:
-                #   epoch 3 (lam_cov=0.2): φ=17.68° ← BEST (low NMSE helps!)
-                #   epoch 7+ (lam_cov=1.0): φ→19.44° ← NMSE drowns geometry
-                # → Cap lam_cov at 0.3 (gentle regularizer, not dominant)
-                # → Disable perm-invariant (sorted-only avoids conflicting assignments)
-                "lam_cov": 0.3,              # Was 1.0 — capped low so NMSE doesn't drown geometry
+                # FIX (2026-02-11): lam_cov capped at 0.3 so NMSE doesn't drown geometry.
+                # FIX (2026-02-11b): lam_aux restored to 1.0 — perm-invariant aux provides
+                #   Hungarian-matched geometry gradient to ALL K slots, not just the 1 slot
+                #   matched by sorted canonical loss. With K_true=1 and K_MAX=5, sorted-only
+                #   leaves 4/5 slots with zero geometry gradient, slowing convergence.
+                "lam_cov": 0.3,              # Capped low so NMSE doesn't drown geometry
                 "lam_subspace_align": 0.0,   # keep off unless explicitly enabled later
-                "lam_aux": 0.0,              # Disabled: sorted canonical is sole geometry loss
+                "lam_aux": 1.0,              # Restored: perm-invariant gives all slots geometry signal
                 "lam_peak_contrast": 0.0,    # off for now
             },
             # SpectrumRefiner-only stage (Option B): freeze backbone, train heatmap head only
@@ -474,7 +474,7 @@ class ModelConfig:
     # With GEOM_ONLY=2, NMSE starts ramping at epoch 3 over 5 epochs (epochs 3-7).
     STRUCTURED_COV_WARMUP_EPOCHS = 5   # Ramp lam_cov from 0→target over 5 epochs after GEOM_ONLY
     # Conditional NMSE ramp: only start when aux_φ_rmse improves below threshold
-    NMSE_RAMP_AUX_PHI_THRESHOLD = 15.0  # FIX: Was 25° (model starts at ~18° from bias, so 25° was trivially met). 15° requires genuine learning.
+    NMSE_RAMP_AUX_PHI_THRESHOLD = 22.0  # FIX: Was 15° which was unreachable with geometry-only loss (model plateaus ~21°), creating deadlock. 22° is achievable and lets NMSE ramp provide the gradient signal needed to push below 15°.
     # Bias LR warmup: keep slot_output_bias at low LR for first few epochs
     BIAS_LR_MULTIPLIER = 0.1  # Bias LR = backbone LR × 0.1 (prevents absorbing dataset mean)
     BIAS_LR_FINAL_MULTIPLIER = 0.1  # FIX: Keep bias slow the ENTIRE run (was 1.0, caused 10× LR jump at epoch 6 → φ regression)
