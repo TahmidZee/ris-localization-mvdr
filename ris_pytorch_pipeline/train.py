@@ -1830,6 +1830,12 @@ class Trainer:
         subspace_evald = 0
         subspace_overlaps = []
         
+        # Diagnostic: collect per-slot prediction values to detect constant-prediction failure
+        _diag_phi_all = []
+        _diag_theta_all = []
+        _diag_r_all = []
+        _diag_mask_all = []
+        
         iters = len(loader) if max_batches is None else min(len(loader), max_batches)
         
         with torch.no_grad():
@@ -1948,6 +1954,14 @@ class Trainer:
                 
                 total_loss += float(loss.detach().item()) * B
                 
+                # ---------- Collect slot prediction stats for diagnostic ----------
+                if "phi_soft" in preds:
+                    _diag_phi_all.append(preds["phi_soft"].float().detach().cpu())
+                    _diag_theta_all.append(preds["theta_soft"].float().detach().cpu())
+                    _diag_r_all.append(preds["r_soft"].float().detach().cpu())
+                if "aux_mask" in preds:
+                    _diag_mask_all.append(preds["aux_mask"].float().detach().cpu())
+
                 # ---------- Aux angle/range metrics (direct head vs GT) ----------
                 if "phi_theta_r" in preds:
                     # IMPORTANT: ptr format is CHUNKED: [phi_pad..., theta_pad..., r_pad...]
@@ -2111,6 +2125,41 @@ class Trainer:
                     except Exception:
                         pass
         
+        # --- DIAGNOSTIC: Prediction variance across validation set ---
+        # This tells us if the model is producing INPUT-DEPENDENT outputs or constant predictions.
+        # If per-slot std is tiny (< 2° for angles, < 0.2m for range), the model is in a
+        # "constant prediction per slot" regime — the cross-attention is not conditioning on inputs.
+        if _diag_phi_all:
+            _phi_cat = torch.cat(_diag_phi_all, dim=0)   # [N_total, K_MAX]
+            _theta_cat = torch.cat(_diag_theta_all, dim=0)
+            _r_cat = torch.cat(_diag_r_all, dim=0)
+            _phi_deg = _phi_cat * (180.0 / math.pi)
+            _theta_deg = _theta_cat * (180.0 / math.pi)
+            n_val_total = _phi_cat.shape[0]
+            n_slots = _phi_cat.shape[1]
+            print(f"\n[PRED STATS] Per-slot prediction variance ({n_val_total} val samples):", flush=True)
+            for sk in range(n_slots):
+                ps = f"  Slot {sk}: "
+                ps += f"φ={float(_phi_deg[:, sk].mean()):+6.1f}°±{float(_phi_deg[:, sk].std()):.2f}°  "
+                ps += f"θ={float(_theta_deg[:, sk].mean()):+5.1f}°±{float(_theta_deg[:, sk].std()):.2f}°  "
+                ps += f"r={float(_r_cat[:, sk].mean()):.2f}m±{float(_r_cat[:, sk].std()):.3f}m"
+                if _diag_mask_all:
+                    _mask_cat = torch.cat(_diag_mask_all, dim=0)
+                    ps += f"  mask={float(_mask_cat[:, sk].mean()):.3f}"
+                print(ps, flush=True)
+            # Cross-sample std averaged over slots (the KEY diagnostic number)
+            phi_batch_std = float(_phi_deg.std(dim=0).mean())
+            theta_batch_std = float(_theta_deg.std(dim=0).mean())
+            r_batch_std = float(_r_cat.std(dim=0).mean())
+            print(f"  CROSS-SAMPLE STD (avg over slots): φ={phi_batch_std:.2f}°  θ={theta_batch_std:.2f}°  r={r_batch_std:.3f}m", flush=True)
+            if phi_batch_std < 3.0:
+                print(f"  ⚠️  LOW φ VARIANCE: predictions are near-constant (constant prediction trap)", flush=True)
+            if theta_batch_std < 2.0:
+                print(f"  ⚠️  LOW θ VARIANCE: predictions are near-constant (constant prediction trap)", flush=True)
+            if r_batch_std < 0.3:
+                print(f"  ⚠️  LOW r VARIANCE: predictions are near-constant (constant prediction trap)", flush=True)
+            print("", flush=True)
+
         # Compute summary metrics
         avg_loss = total_loss / max(1, n_samples)
         
