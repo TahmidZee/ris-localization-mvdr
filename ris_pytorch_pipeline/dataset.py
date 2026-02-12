@@ -458,3 +458,413 @@ def prepare_split_shards(root_dir: Path, n_train: int, n_val: int, n_test: int,
         prepare_shards(root / "test",  n_test,  shard_size, seed+456, eta_perturb, override_L)
 
 
+
+# ============================================================================
+# Wideband OFDM shard generation (v2 path)
+# ============================================================================
+
+def _nearfield_vec_k(cfg, phi, theta, r, k0, h_flat=None, v_flat=None):
+    """
+    Frequency-aware near-field steering vector using custom wavenumber k0.
+    """
+    if h_flat is None or v_flat is None:
+        h_idx = np.arange(-(cfg.N_H - 1)//2, (cfg.N_H + 1)//2) * cfg.d_H
+        v_idx = np.arange(-(cfg.N_V - 1)//2, (cfg.N_V + 1)//2) * cfg.d_V
+        h_mesh, v_mesh = np.meshgrid(h_idx, v_idx, indexing="xy")
+        h_flat = h_mesh.reshape(-1).astype(np.float32)
+        v_flat = v_mesh.reshape(-1).astype(np.float32)
+    a = np.empty(cfg.N, np.complex64)
+    r_eff = max(float(r), 1e-9)
+    sin_phi, cos_theta, sin_theta = math.sin(phi), math.cos(theta), math.sin(theta)
+    for i, (vh, vv) in enumerate(zip(h_flat, v_flat)):
+        dist = r - vh * sin_phi * cos_theta - vv * sin_theta + (vh**2 + vv**2) / (2 * r_eff)
+        a[i] = np.exp(1j * float(k0) * (r - dist))
+    return a / np.sqrt(cfg.N)
+
+
+def _sample_codes_matrix(L: int, phase_bits: int = None, codebook_type: str = "DFT") -> np.ndarray:
+    """
+    Generate RIS code matrix [L, N] with quantization.
+    Uses the same codebook policy as narrowband generation.
+    """
+    M_beams = getattr(cfg, 'M_BEAMS_TARGET', L)
+    if codebook_type == "DFT":
+        if hasattr(cfg, 'RIS_2D_DFT_COLS'):
+            if M_beams > L:
+                stride = max(1, M_beams // L)
+                indices = np.arange(0, M_beams, stride)[:L]
+                cod = cfg.RIS_2D_DFT_COLS[indices]
+            elif M_beams == L:
+                cod = cfg.RIS_2D_DFT_COLS[:L]
+            else:
+                n_repeats = (L + M_beams - 1) // M_beams
+                cod_repeated = np.tile(cfg.RIS_2D_DFT_COLS, (n_repeats, 1))
+                cod = cod_repeated[:L]
+        else:
+            if L <= len(cfg.RIS_CONFIG_DFT_COLS):
+                cod = cfg.RIS_CONFIG_DFT_COLS[:L]
+            else:
+                n_repeats = (L + len(cfg.RIS_CONFIG_DFT_COLS) - 1) // len(cfg.RIS_CONFIG_DFT_COLS)
+                cod_repeated = np.tile(cfg.RIS_CONFIG_DFT_COLS, (n_repeats, 1))
+                cod = cod_repeated[:L]
+    elif codebook_type == "random":
+        cod = np.exp(1j * 2 * np.pi * np.random.rand(L, cfg.N))
+    else:
+        # Mixed fallback
+        half = max(1, L // 2)
+        if hasattr(cfg, 'RIS_2D_DFT_COLS'):
+            cod_2d = cfg.RIS_2D_DFT_COLS[:half]
+        else:
+            cod_2d = cfg.RIS_CONFIG_DFT_COLS[:half]
+        cod = np.vstack([cod_2d, np.exp(1j * 2 * np.pi * np.random.rand(L - half, cfg.N))])
+
+    cod = _apply_grid_offset(cod)
+    return quantise_phase(cod, bits=phase_bits).astype(np.complex64)
+
+
+def _sample_target_snr_db(snr_db_override: float = None) -> float:
+    if snr_db_override is not None:
+        return float(snr_db_override)
+    if SAMPLING_OVERRIDES.use and SAMPLING_OVERRIDES.snr_db_range is not None and cfg.SNR_TARGETED:
+        return float(np.random.uniform(*SAMPLING_OVERRIDES.snr_db_range))
+    if cfg.SNR_TARGETED:
+        return float(np.random.uniform(*cfg.SNR_DB_RANGE))
+    # Legacy fallback if targeted SNR is disabled
+    _, sigma_n = _sample_power_and_noise()
+    return float(10.0 * math.log10(1.0 / max(float(sigma_n**2), 1e-12)))
+
+
+def _make_tap_channel_wideband(
+    M: int,
+    N: int,
+    p_max: int,
+    carrier_hz: float,
+    max_delay_s: float,
+):
+    """
+    Build compact tap-domain BS->RIS channel with per-path delay and low-rank spatial structure.
+    """
+    c0 = 3e8
+    wav = c0 / float(carrier_hz)
+    k0 = 2.0 * np.pi / wav
+    d_bs = 0.5 * wav
+
+    n_paths = int(np.random.randint(2, max(2, p_max) + 1))
+    taus = np.zeros((p_max,), np.float32)
+    if n_paths > 0:
+        taus[:n_paths] = np.sort(np.random.uniform(0.0, max_delay_s, size=(n_paths,)).astype(np.float32))
+
+    path_mask = np.zeros((p_max,), np.bool_)
+    path_mask[:n_paths] = True
+
+    # Exponential power-delay profile + random phases.
+    pdp = np.exp(-np.maximum(taus, 0.0) / max(max_delay_s / 3.0, 1e-9)).astype(np.float32)
+    alphas = np.zeros((p_max,), np.complex64)
+    if n_paths > 0:
+        a = (np.random.randn(n_paths) + 1j * np.random.randn(n_paths)).astype(np.complex64) / np.sqrt(2.0)
+        a = a * np.sqrt(pdp[:n_paths].astype(np.complex64))
+        a = a / max(np.linalg.norm(a), 1e-9)
+        alphas[:n_paths] = a
+
+    # Path angles (for bookkeeping + directional taps).
+    ang = max(float(cfg.ANGLE_RANGE_PHI), float(cfg.ANGLE_RANGE_THETA))
+    aod_az = np.zeros((p_max,), np.float32)
+    aod_el = np.zeros((p_max,), np.float32)
+    aoa_az = np.zeros((p_max,), np.float32)
+    aoa_el = np.zeros((p_max,), np.float32)
+    if n_paths > 0:
+        aod_az[:n_paths] = np.random.uniform(-ang, ang, size=(n_paths,)).astype(np.float32)
+        aod_el[:n_paths] = np.random.uniform(-ang, ang, size=(n_paths,)).astype(np.float32)
+        aoa_az[:n_paths] = np.random.uniform(-ang, ang, size=(n_paths,)).astype(np.float32)
+        aoa_el[:n_paths] = np.random.uniform(-ang, ang, size=(n_paths,)).astype(np.float32)
+
+    H_taps = np.zeros((p_max, M, N), np.complex64)
+    m_idx = (np.arange(M, dtype=np.float32) - (M - 1) / 2.0) * d_bs
+    for p in range(n_paths):
+        a_bs = np.exp(
+            -1j
+            * k0
+            * m_idx
+            * np.sin(float(aod_az[p]))
+            * np.cos(float(aod_el[p]))
+        ).astype(np.complex64)
+        a_bs = a_bs / max(np.linalg.norm(a_bs), 1e-9)
+        # Use a far reference distance for path-angle directional mode on RIS side.
+        a_ris = _nearfield_vec_k(cfg, float(aoa_az[p]), float(aoa_el[p]), 100.0, k0, h_flat_pristine, v_flat_pristine)
+        H_taps[p] = alphas[p] * np.outer(a_bs, np.conjugate(a_ris)).astype(np.complex64)
+
+    return dict(
+        H_taps=H_taps,
+        taus_s=taus,
+        path_mask=path_mask,
+        alphas=alphas,
+        n_paths=int(n_paths),
+        aod_az=aod_az,
+        aod_el=aod_el,
+        aoa_az=aoa_az,
+        aoa_el=aoa_el,
+    )
+
+
+def _synthesize_H_f_from_taps(H_taps: np.ndarray, taus_s: np.ndarray, freq_offsets_hz: np.ndarray) -> np.ndarray:
+    """
+    H_taps: [P, M, N], taus_s: [P], freq_offsets_hz: [F] -> H_f [F, M, N]
+    """
+    phase = np.exp(-1j * 2.0 * np.pi * taus_s[:, None] * freq_offsets_hz[None, :]).astype(np.complex64)  # [P,F]
+    return np.einsum("pmn,pf->fmn", H_taps, phase).astype(np.complex64)
+
+
+def _wideband_scene_sample(
+    L: int,
+    F: int,
+    p_max: int,
+    carrier_hz: float,
+    bw_hz: float,
+    max_delay_ns: float,
+    phase_bits: int = None,
+    K_override: int = None,
+    snr_db_override: float = None,
+):
+    """
+    Generate one wideband OFDM sample with per-tone covariance target.
+    """
+    c0 = 3e8
+    max_delay_s = float(max_delay_ns) * 1e-9
+    K = int(K_override) if K_override is not None else np.random.randint(1, cfg.K_MAX + 1)
+
+    phi = np.zeros((K,), np.float32)
+    theta = np.zeros((K,), np.float32)
+    rr = np.zeros((K,), np.float32)
+    for k in range(K):
+        phi[k], theta[k], rr[k] = _sample_angles_and_range()
+
+    # Source amplitudes
+    p_db, _ = _sample_power_and_noise()
+    base_p = float(10 ** (p_db / 10) / 1e3)
+    src_scale = np.random.uniform(0.7, 1.3, size=(K,)).astype(np.float32)
+    src_pow = (base_p * src_scale).astype(np.float32)
+
+    # Frequency grid for pilot tones (centered around carrier)
+    freq_offsets_hz = np.linspace(-0.5 * float(bw_hz), 0.5 * float(bw_hz), int(F), dtype=np.float32)
+    freqs_hz = float(carrier_hz) + freq_offsets_hz
+
+    # RIS code matrix [L, N]
+    codes = _sample_codes_matrix(L, phase_bits=phase_bits, codebook_type="DFT")
+
+    # Build source steering per tone: A_f [F, N, K]
+    A_f = np.zeros((F, cfg.N, K), np.complex64)
+    for fi in range(F):
+        k_f = 2.0 * np.pi * float(freqs_hz[fi]) / c0
+        lam_f = c0 / float(freqs_hz[fi])
+        for k in range(K):
+            amp = np.sqrt(src_pow[k] * (lam_f**2) / max((4.0 * np.pi * rr[k])**2, 1e-12))
+            A_f[fi, :, k] = amp * _nearfield_vec_k(cfg, float(phi[k]), float(theta[k]), float(rr[k]), k_f, h_flat_pristine, v_flat_pristine)
+
+    # Build tap channel and synthesize per-tone BS->RIS operators H_f [F,M,N]
+    taps = _make_tap_channel_wideband(cfg.M, cfg.N, p_max=int(p_max), carrier_hz=carrier_hz, max_delay_s=max_delay_s)
+    H_taps = taps["H_taps"]  # [P,M,N]
+    H_f = _synthesize_H_f_from_taps(H_taps, taps["taus_s"], freq_offsets_hz)  # [F,M,N]
+
+    # Generate measurements y[L,F,M]
+    SIGNAL_GAIN = 1000.0
+    s_lfk = (np.random.randn(L, F, K) + 1j * np.random.randn(L, F, K)).astype(np.complex64) / np.sqrt(2.0)
+    y_clean = np.zeros((L, F, cfg.M), np.complex64)
+    H_eff = np.zeros((L, F, cfg.M), np.complex64)
+    for ell in range(L):
+        c_ell = codes[ell]  # [N]
+        for fi in range(F):
+            x_lf = A_f[fi] @ s_lfk[ell, fi]  # [N]
+            y_clean[ell, fi] = SIGNAL_GAIN * (H_f[fi] @ (c_ell * x_lf))
+            H_eff[ell, fi] = H_f[fi] @ c_ell
+
+    # Target SNR and additive noise
+    p_sig = float(np.mean(np.abs(y_clean) ** 2))
+    snr_db = _sample_target_snr_db(snr_db_override=snr_db_override)
+    snr_lin = 10.0 ** (float(snr_db) / 10.0)
+    p_noise = max(p_sig / max(snr_lin, 1e-9), 1e-12)
+    sigma_n = math.sqrt(p_noise)
+    noise = (np.random.randn(L, F, cfg.M) + 1j * np.random.randn(L, F, cfg.M)).astype(np.complex64) / np.sqrt(2.0)
+    y_noisy = y_clean + sigma_n * noise
+
+    # Ground-truth covariance per tone and broadband
+    R_f_true = np.zeros((F, cfg.N, cfg.N), np.complex64)
+    for fi in range(F):
+        Rf = A_f[fi] @ A_f[fi].conj().T
+        Rf = 0.5 * (Rf + Rf.conj().T)
+        tr = float(np.trace(Rf).real)
+        if tr > 1e-9:
+            Rf = Rf * (cfg.N / tr)
+        R_f_true[fi] = Rf
+    R_true = np.mean(R_f_true, axis=0).astype(np.complex64)
+    R_true = 0.5 * (R_true + R_true.conj().T)
+    tr = float(np.trace(R_true).real)
+    if tr > 1e-9:
+        R_true = R_true * (cfg.N / tr)
+
+    # Pack target parameters
+    def _pad(v):
+        return np.pad(v.astype(np.float32), (0, cfg.K_MAX - len(v)), mode="constant")
+
+    return dict(
+        y_cplx=y_noisy.astype(np.complex64),     # [L,F,M]
+        H_eff_cplx=H_eff.astype(np.complex64),   # [L,F,M]
+        codes=codes.astype(np.complex64),        # [L,N]
+        H_taps_cplx=H_taps.astype(np.complex64), # [P,M,N]
+        taus_s=taps["taus_s"].astype(np.float32),
+        path_mask=taps["path_mask"].astype(np.bool_),
+        alphas=taps["alphas"].astype(np.complex64),
+        n_paths=int(taps["n_paths"]),
+        aod_az=taps["aod_az"].astype(np.float32),
+        aod_el=taps["aod_el"].astype(np.float32),
+        aoa_az=taps["aoa_az"].astype(np.float32),
+        aoa_el=taps["aoa_el"].astype(np.float32),
+        R_f_true_cplx=R_f_true.astype(np.complex64),  # [F,N,N]
+        R_true_cplx=R_true.astype(np.complex64),      # [N,N]
+        phi_padded=_pad(phi),
+        theta_padded=_pad(theta),
+        r_padded=_pad(rr),
+        phi=phi.astype(np.float32),
+        theta=theta.astype(np.float32),
+        r=rr.astype(np.float32),
+        K=int(K),
+        snr_db=float(np.clip(snr_db, cfg.SNR_DB_RANGE[0], cfg.SNR_DB_RANGE[1])),
+    )
+
+
+def prepare_shards_wideband(
+    out_dir,
+    n_samples: int,
+    shard_size: int = 5000,
+    seed: int = 42,
+    override_L: int = None,
+    override_F: int = 16,
+    p_max: int = 8,
+    carrier_hz: float = 3.5e9,
+    bw_hz: float = 50e6,
+    max_delay_ns: float = 150.0,
+    phase_bits: int = None,
+):
+    """
+    Generate wideband NPZ shards with keys:
+      y[L,F,M,2], H[L,F,M,2], codes[L,N,2], ptr, K, snr, R[N,N,2], R_f[F,N,N,2],
+      H_taps_ri[P,M,N,2], taus_s[P], path_mask[P], alphas[P,2], and per-path angles.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    chosen_L = int(override_L) if override_L is not None else int(cfg.L)
+    chosen_F = int(override_F)
+    n_shards = (n_samples + shard_size - 1) // shard_size
+
+    for s in range(n_shards):
+        n_this = min(shard_size, n_samples - s * shard_size)
+        y = np.zeros((n_this, chosen_L, chosen_F, cfg.M, 2), np.float32)
+        H = np.zeros((n_this, chosen_L, chosen_F, cfg.M, 2), np.float32)
+        codes = np.zeros((n_this, chosen_L, cfg.N, 2), np.float32)
+        ptr = np.zeros((n_this, 3 * cfg.K_MAX), np.float32)
+        Kvec = np.zeros((n_this,), np.int32)
+        snr = np.zeros((n_this,), np.float32)
+        R = np.zeros((n_this, cfg.N, cfg.N, 2), np.float32)
+        R_f = np.zeros((n_this, chosen_F, cfg.N, cfg.N, 2), np.float32)
+
+        H_taps_ri = np.zeros((n_this, int(p_max), cfg.M, cfg.N, 2), np.float32)
+        taus_s = np.zeros((n_this, int(p_max)), np.float32)
+        path_mask = np.zeros((n_this, int(p_max)), np.bool_)
+        alphas = np.zeros((n_this, int(p_max), 2), np.float32)
+        n_paths = np.zeros((n_this,), np.int32)
+        aod_az = np.zeros((n_this, int(p_max)), np.float32)
+        aod_el = np.zeros((n_this, int(p_max)), np.float32)
+        aoa_az = np.zeros((n_this, int(p_max)), np.float32)
+        aoa_el = np.zeros((n_this, int(p_max)), np.float32)
+
+        for i in range(n_this):
+            np.random.seed(int(seed) + s * shard_size + i)
+            sample = _wideband_scene_sample(
+                L=chosen_L,
+                F=chosen_F,
+                p_max=int(p_max),
+                carrier_hz=float(carrier_hz),
+                bw_hz=float(bw_hz),
+                max_delay_ns=float(max_delay_ns),
+                phase_bits=phase_bits if phase_bits is not None else int(getattr(mdl_cfg, "PHASE_BITS", 3)),
+            )
+
+            y[i] = to_ri(sample["y_cplx"])
+            H[i] = to_ri(sample["H_eff_cplx"])
+            codes[i] = to_ri(sample["codes"])
+            ptr[i] = np.concatenate([sample["phi_padded"], sample["theta_padded"], sample["r_padded"]]).astype(np.float32)
+            Kvec[i] = int(sample["K"])
+            snr[i] = float(sample["snr_db"])
+            R[i] = to_ri(sample["R_true_cplx"])
+            R_f[i] = to_ri(sample["R_f_true_cplx"])
+
+            H_taps_ri[i] = to_ri(sample["H_taps_cplx"])
+            taus_s[i] = sample["taus_s"].astype(np.float32)
+            path_mask[i] = sample["path_mask"].astype(np.bool_)
+            alphas[i] = to_ri(sample["alphas"])
+            n_paths[i] = int(sample["n_paths"])
+            aod_az[i] = sample["aod_az"].astype(np.float32)
+            aod_el[i] = sample["aod_el"].astype(np.float32)
+            aoa_az[i] = sample["aoa_az"].astype(np.float32)
+            aoa_el[i] = sample["aoa_el"].astype(np.float32)
+
+        np.savez(
+            out_dir / f"shard_{s:03d}.npz",
+            y=y,
+            H=H,
+            codes=codes,
+            ptr=ptr,
+            K=Kvec,
+            snr=snr,
+            R=R,
+            R_f=R_f,
+            H_taps_ri=H_taps_ri,
+            taus_s=taus_s,
+            path_mask=path_mask,
+            alphas=alphas,
+            n_paths=n_paths,
+            aod_az=aod_az,
+            aod_el=aod_el,
+            aoa_az=aoa_az,
+            aoa_el=aoa_el,
+        )
+
+
+def prepare_split_shards_wideband(
+    root_dir: Path,
+    n_train: int,
+    n_val: int,
+    n_test: int,
+    shard_size: int = 5000,
+    seed: int = 42,
+    override_L: int = None,
+    override_F: int = 16,
+    p_max: int = 8,
+    carrier_hz: float = 3.5e9,
+    bw_hz: float = 50e6,
+    max_delay_ns: float = 150.0,
+    phase_bits: int = None,
+):
+    """
+    Generate wideband {train,val,test} split shards under root_dir.
+    """
+    root = Path(root_dir)
+    (root / "train").mkdir(parents=True, exist_ok=True)
+    (root / "val").mkdir(parents=True, exist_ok=True)
+    (root / "test").mkdir(parents=True, exist_ok=True)
+
+    common = dict(
+        shard_size=shard_size,
+        override_L=override_L,
+        override_F=override_F,
+        p_max=p_max,
+        carrier_hz=carrier_hz,
+        bw_hz=bw_hz,
+        max_delay_ns=max_delay_ns,
+        phase_bits=phase_bits,
+    )
+    if n_train > 0:
+        prepare_shards_wideband(root / "train", n_train, seed=seed, **common)
+    if n_val > 0:
+        prepare_shards_wideband(root / "val", n_val, seed=seed + 123, **common)
+    if n_test > 0:
+        prepare_shards_wideband(root / "test", n_test, seed=seed + 456, **common)

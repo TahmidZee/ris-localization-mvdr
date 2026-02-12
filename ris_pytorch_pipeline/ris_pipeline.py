@@ -1,7 +1,12 @@
 import argparse
 from pathlib import Path
 from .configs import cfg, mdl_cfg, set_seed
-from .dataset import prepare_shards, prepare_split_shards, set_sampling_overrides_from_cfg
+from .dataset import (
+    prepare_shards,
+    prepare_split_shards,
+    prepare_split_shards_wideband,
+    set_sampling_overrides_from_cfg,
+)
 from .train import Trainer
 
 def main():
@@ -46,6 +51,38 @@ def main():
     g1s.add_argument("--out_dir", type=str, default=str(getattr(cfg, "DATA_SHARDS_DIR", "results_final/data/shards")))
     # same robust args
     for g in (g1s,):
+        g.add_argument("--phi-fov-deg", type=float, default=60.0)
+        g.add_argument("--theta-fov-deg", type=float, default=30.0)
+        g.add_argument("--r-min", type=float, default=0.5)
+        g.add_argument("--r-max", type=float, default=10.0)
+        g.add_argument("--snr-min", type=float, default=-5.0)
+        g.add_argument("--snr-max", type=float, default=20.0)
+        g.add_argument("--grid-offset", action="store_true")
+        g.add_argument("--grid-offset-frac", type=float, default=0.5)
+        g.add_argument("--dr", action="store_true")
+        g.add_argument("--dr-phase-sigma", type=float, default=0.04)
+        g.add_argument("--dr-amp-jitter", type=float, default=0.05)
+        g.add_argument("--dr-dropout-p", type=float, default=0.03)
+        g.add_argument("--dr-wav-jitter", type=float, default=0.002)
+        g.add_argument("--dr-dspacing-jitter", type=float, default=0.005)
+
+    # --- wideband split pregen (v2 OFDM path) ---
+    g1w = sub.add_parser("pregen-split-wideband", help="Pre-generate wideband OFDM train/val/test splits with R_f + H_taps")
+    g1w.add_argument("--n-train", type=int, default=20000)
+    g1w.add_argument("--n-val",   type=int, default=4000)
+    g1w.add_argument("--n-test",  type=int, default=4000)
+    g1w.add_argument("--shard", type=int, default=5000)
+    g1w.add_argument("--L", type=int, default=16)
+    g1w.add_argument("--F", type=int, default=16)
+    g1w.add_argument("--p-max", type=int, default=8, help="Maximum tap paths")
+    g1w.add_argument("--carrier-hz", type=float, default=3.5e9)
+    g1w.add_argument("--bw-hz", type=float, default=50e6)
+    g1w.add_argument("--delay-max-ns", type=float, default=150.0)
+    g1w.add_argument("--phase-bits", type=int, default=3)
+    g1w.add_argument("--seed", type=int, default=42)
+    g1w.add_argument("--out_dir", type=str, default="data_shards_ofdm_tr38901")
+    # same robust sampling args
+    for g in (g1w,):
         g.add_argument("--phi-fov-deg", type=float, default=60.0)
         g.add_argument("--theta-fov-deg", type=float, default=30.0)
         g.add_argument("--r-min", type=float, default=0.5)
@@ -124,7 +161,7 @@ def main():
     Path(cfg.RESULTS_DIR, "figs").mkdir(parents=True, exist_ok=True)
 
     # ---- command router ----
-    if args.cmd in ("pregen","pregen-split"):
+    if args.cmd in ("pregen", "pregen-split", "pregen-split-wideband"):
         # Push CLI robust options into mdl_cfg, then enable overrides for *pregen only*
         mdl_cfg.TRAIN_PHI_FOV_DEG   = getattr(args, "phi_fov_deg")
         mdl_cfg.TRAIN_THETA_FOV_DEG = getattr(args, "theta_fov_deg")
@@ -151,11 +188,27 @@ def main():
             prepare_shards(Path(args.out_dir), n_samples=args.n,
                            shard_size=args.shard, seed=args.seed,
                            eta_perturb=args.eta, override_L=args.L)
-        else:
+        elif args.cmd == "pregen-split":
             prepare_split_shards(Path(args.out_dir),
                                  n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
                                  shard_size=args.shard, seed=args.seed,
                                  eta_perturb=args.eta, override_L=args.L)
+        else:
+            prepare_split_shards_wideband(
+                Path(args.out_dir),
+                n_train=args.n_train,
+                n_val=args.n_val,
+                n_test=args.n_test,
+                shard_size=args.shard,
+                seed=args.seed,
+                override_L=args.L,
+                override_F=args.F,
+                p_max=args.p_max,
+                carrier_hz=args.carrier_hz,
+                bw_hz=args.bw_hz,
+                max_delay_ns=args.delay_max_ns,
+                phase_bits=args.phase_bits,
+            )
 
     elif args.cmd == "train":
         t = Trainer(from_hpo=args.from_hpo)
