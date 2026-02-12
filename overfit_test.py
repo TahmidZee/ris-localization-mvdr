@@ -30,6 +30,10 @@ mdl_cfg.HEAD_LR_MULTIPLIER = 4.0      # Higher head LR
 mdl_cfg.BIAS_LR_FINAL_MULTIPLIER = 1.0  # Full LR for bias (no constraint)
 mdl_cfg.CLIP_NORM = 10.0              # Relax gradient clipping
 
+# CRITICAL: Slot head init that allows backbone gradients to flow
+mdl_cfg.SLOT_QUERY_INIT_STD = 1.0     # was 3.0; queries drowned cross-attention signal
+# NOTE: _slot_last_linear init is now std=0.10 in model.py (was 0.01)
+
 # Keep diversity and sorted losses to help differentiate slots
 mdl_cfg.LAM_SLOT_DIVERSITY = 0.5
 mdl_cfg.LAM_AUX_SORTED = 2.0

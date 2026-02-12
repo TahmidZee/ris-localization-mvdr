@@ -569,15 +569,20 @@ class ModelConfig:
         self.SLOT_ATTN_ROUNDS = 3       # Multi-round slot attention (DETR uses 6; 3 is a good start)
 
         # Slot head optimization / stability knobs
-        # - SLOT_QUERY_INIT_STD: larger std helps symmetry breaking across slots early
+        # - SLOT_QUERY_INIT_STD: controls magnitude of slot query vectors
         # - SLOT_QUERY_INIT_ORTHO: initialize slot queries as near-orthogonal vectors
         # 
-        # CRITICAL FIX (2026-02-05): Increased from 0.20 → 1.0 → 3.0.
-        # With D=512, std=0.20 gives queries with ||q||~4.5 (too small vs backbone features).
-        # std=1.0 gives ||q||~22 (better, but still insufficient to break symmetry in full training).
-        # std=3.0 gives ||q||~67, providing STRONG differentiation between slots at init.
-        # This is critical for permutation-invariant losses to escape the symmetric equilibrium.
-        self.SLOT_QUERY_INIT_STD = 3.0
+        # HISTORY:
+        #   v1 (02-05): 0.20 → 1.0 → 3.0  (trying to break symmetry via large queries)
+        #   PROBLEM (02-12): With D=512, std=3.0 gives ||q||~68 vs cross-attention
+        #   output ||attn||~23. The query DROWNS the per-sample signal after the
+        #   residual connection q = LN(attn + query). Only ~32% of the fused vector
+        #   is input-dependent → predictions are nearly constant across samples.
+        #
+        #   v2 (02-12): 1.0 → ||q||~22, comparable to ||attn||~23.
+        #   Per-sample signal is ~72% of the fused vector → model can differentiate
+        #   inputs. Symmetry breaking is handled by slot_output_bias + sorted matching.
+        self.SLOT_QUERY_INIT_STD = 1.0
         self.SLOT_QUERY_INIT_ORTHO = True
 
         # Geometry-only warmup:

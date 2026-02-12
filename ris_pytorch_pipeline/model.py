@@ -355,22 +355,22 @@ class HybridModel(nn.Module):
             slot_hidden = int(getattr(mdl_cfg, "SLOT_HEAD_HIDDEN_DIM", D // 2))
             _slot_last_linear = nn.Linear(slot_hidden, 5)  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
             # -----------------------------------------------------------
-            # CRITICAL FIX (2026-02-10): Small-init the last linear layer (not zero!).
-            # Zero-init blocks gradients: if slot features are small, then
-            # out = W @ slot + b ≈ b (zero weights → zero gradient through W).
-            # This causes d<R_blend>/d(head_param) = 0, preventing backbone learning.
+            # CRITICAL FIX (2026-02-12): Use Kaiming-scale init (std=0.10).
             #
-            # Solution: Use very small random init (std=0.01) instead of zero.
-            # This ensures:
-            #   1. Predictions start near bias (small weights → small corrections)
-            #   2. Gradients can flow (non-zero weights → non-zero dL/dW)
-            #   3. MLP can learn input-dependent corrections from epoch 1
+            # HISTORY:
+            #   v1 (02-10): std=0.01 — intended to keep predictions near bias.
+            #   PROBLEM: With slot_hidden=256, MLP output magnitude ≈ sqrt(256)*0.01 = 0.16
+            #   while bias magnitude is ~1.10. The bias dominates completely, and the
+            #   backward gradient through W_last is attenuated ~10× (dL/dx = W^T @ dL/dout).
+            #   This starves the entire backbone of gradient → constant prediction trap.
             #
-            # Without small-init: random init (std≈0.19) adds ~17% noise to bias,
-            # making Hungarian matching unstable and drowning backbone signals.
+            #   v2 (02-12): std=0.10 — Kaiming-scale for fan_in=256.
+            #   MLP output magnitude ≈ sqrt(256)*0.10 = 1.6, comparable to bias.
+            #   Backbone gradient is 10× stronger. With sorted canonical matching,
+            #   noisy initial predictions are handled gracefully (sorting is deterministic).
             # -----------------------------------------------------------
-            nn.init.normal_(_slot_last_linear.weight, mean=0.0, std=0.01)
-            nn.init.zeros_(_slot_last_linear.bias)  # Bias stays zero (predictions = bias + small correction)
+            nn.init.normal_(_slot_last_linear.weight, mean=0.0, std=0.10)
+            nn.init.zeros_(_slot_last_linear.bias)
             self.slot_head = nn.Sequential(
                 nn.Linear(D, slot_hidden),
                 nn.GELU(),
@@ -394,10 +394,20 @@ class HybridModel(nn.Module):
             # The bias is a learnable [K, 5] parameter that adjusts during training.
             PHI_SCALE_INIT = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))
             self.slot_output_bias = nn.Parameter(torch.zeros(Kmax, 5))
+            # Spread slots across the FOV. The spread fraction controls how much of the
+            # FOV the bias covers. Smaller spread keeps tanh in the linear regime
+            # (better gradients), while larger spread helps sorted matching consistency.
+            #
+            # HISTORY:
+            #   v1 (02-07): 80% FOV (±48°) → atanh(0.8)=1.10, tanh'=0.36 (decent)
+            #   v2 (02-12): 50% FOV (±30°) → atanh(0.5)=0.55, tanh'=0.75 (much better)
+            #   With std=0.10 init on the MLP, the output magnitude (~1.6) is larger
+            #   than the bias (~0.55), so the model can immediately produce input-dependent
+            #   predictions. Sorted matching handles the initial noise.
+            _bias_spread_deg = float(getattr(mdl_cfg, "SLOT_BIAS_SPREAD_DEG", 30.0))
             with torch.no_grad():
                 for k_idx in range(Kmax):
-                    # Spread slots evenly across 80% of the FOV: -48° to +48° for ±60° FOV
-                    target_phi_deg = -48.0 + 96.0 * k_idx / max(1, Kmax - 1)
+                    target_phi_deg = -_bias_spread_deg + 2.0 * _bias_spread_deg * k_idx / max(1, Kmax - 1)
                     target_phi_rad = target_phi_deg * math.pi / 180.0
                     # Inverse of tanh scaling: phi_raw = atanh(target / PHI_SCALE)
                     ratio = target_phi_rad / PHI_SCALE_INIT
@@ -406,8 +416,8 @@ class HybridModel(nn.Module):
                 # power bias: softplus(0) ≈ 0.69 (reasonable signal)
                 # mask bias: sigmoid(0) = 0.5 (balanced start)
                 # theta, r biases: 0 (centered)
-            print(f"[MODEL] Slot output bias initialized: φ targets = "
-                  f"{[f'{-48 + 96*k/(Kmax-1):.0f}°' for k in range(Kmax)]}", flush=True)
+            _targets = [f'{-_bias_spread_deg + 2*_bias_spread_deg*k/(Kmax-1):.0f}°' for k in range(Kmax)]
+            print(f"[MODEL] Slot output bias initialized: φ targets = {_targets}", flush=True)
         else:
             self.slot_queries = None
             self.slot_attn = None
