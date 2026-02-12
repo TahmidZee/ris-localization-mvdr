@@ -13,6 +13,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ..configs import set_seed
+from ..covariance_utils import build_effective_cov_torch
 from .config_v2 import v2_cfg, v2_mdl
 from .dataset_v2 import build_dataloaders_v2
 from .loss_v2 import V2CovarianceLoss
@@ -77,10 +78,12 @@ class V2Trainer:
             K = batch["K"]
             R_true = batch["R"]
             snr = batch.get("snr", batch.get("snr_db", None))
+            H_taps = batch.get("H_taps", None)
         # TensorDataset path, if used later.
         elif isinstance(batch, (list, tuple)):
             y, H, codes, ptr, K, R_true = batch[:6]
             snr = batch[6] if len(batch) > 6 else None
+            H_taps = batch[7] if len(batch) > 7 else None
         else:
             raise TypeError(f"Unsupported batch type: {type(batch)}")
 
@@ -92,16 +95,35 @@ class V2Trainer:
         R_true = R_true.to(self.device, non_blocking=True)
         if snr is not None:
             snr = snr.to(self.device, non_blocking=True).float()
-        return y, H, codes, ptr, K, R_true, snr
+
+        H_taps_dev = None
+        if isinstance(H_taps, dict) and len(H_taps) > 0:
+            H_taps_dev = {}
+            for key, value in H_taps.items():
+                if torch.is_tensor(value):
+                    H_taps_dev[key] = value.to(self.device, non_blocking=True).float()
+
+        return y, H, codes, ptr, K, R_true, snr, H_taps_dev
 
     def _step(self, batch, train_mode: bool = True):
-        y, H, codes, ptr, K, R_true, snr = self._unpack_batch(batch)
+        y, H, codes, ptr, K, R_true, snr, H_taps = self._unpack_batch(batch)
 
         with torch.set_grad_enabled(train_mode):
             with torch.cuda.amp.autocast(enabled=self.use_amp):
-                out = self.model(y, H, codes, snr_db=snr)
+                out = self.model(y, H, codes, snr_db=snr, H_taps=H_taps)
+                R_pred = out["R_pred"]
+                if bool(getattr(v2_cfg, "APPLY_EFFECTIVE_COV_IN_LOSS", False)):
+                    R_pred = build_effective_cov_torch(
+                        R_pred,
+                        snr_db=snr,
+                        R_samp=None,
+                        beta=0.0,
+                        diag_load=True,
+                        apply_shrink=(snr is not None),
+                        target_trace=float(v2_cfg.N),
+                    )
                 loss, info = self.loss_fn(
-                    out["R_pred"],
+                    R_pred,
                     R_true,
                     K_true=K,
                     ptr_gt=ptr,
@@ -128,6 +150,22 @@ class V2Trainer:
         stats = {"loss": float(loss.item())}
         for key, value in info.items():
             stats[key] = float(value)
+
+        # Report physics-aligned effective-cov NMSE as a diagnostic.
+        with torch.no_grad():
+            try:
+                R_eff = build_effective_cov_torch(
+                    out["R_pred"].detach(),
+                    snr_db=snr,
+                    R_samp=None,
+                    beta=0.0,
+                    diag_load=True,
+                    apply_shrink=(snr is not None),
+                    target_trace=float(v2_cfg.N),
+                )
+                stats["nmse_eff"] = float(self.loss_fn._nmse(R_eff, R_true).mean().item())
+            except Exception:
+                pass
         return stats
 
     @staticmethod

@@ -32,11 +32,18 @@ class V2SysConfig:
         self.RANGE_R = base.RANGE_R
         self.SNR_DB_RANGE = base.SNR_DB_RANGE
 
-        # ── data paths (reuse v1 narrowband for Phase 1) ──
+        # ── data paths ──
+        # v2 is OFDM-wideband first. Narrowband paths are fallback only.
         self.DATA_SHARDS_DIR = base.DATA_SHARDS_DIR
         self.DATA_SHARDS_TRAIN = base.DATA_SHARDS_TRAIN
         self.DATA_SHARDS_VAL = base.DATA_SHARDS_VAL
         self.DATA_SHARDS_TEST = base.DATA_SHARDS_TEST
+        self.DATA_SHARDS_WIDEBAND_DIR = "data_shards_ofdm_tr38901"
+        self.DATA_SHARDS_WIDEBAND_TRAIN = f"{self.DATA_SHARDS_WIDEBAND_DIR}/train"
+        self.DATA_SHARDS_WIDEBAND_VAL = f"{self.DATA_SHARDS_WIDEBAND_DIR}/val"
+        self.DATA_SHARDS_WIDEBAND_TEST = f"{self.DATA_SHARDS_WIDEBAND_DIR}/test"
+        self.REQUIRE_WIDEBAND_DATA = True
+        self.ALLOW_NARROWBAND_FALLBACK = False
         self.NUM_WORKERS = 0
         self.PIN_MEMORY = True
 
@@ -45,19 +52,23 @@ class V2SysConfig:
         self.LOGS_DIR = f"{self.RESULTS_DIR}/logs"
         self.CKPT_DIR = f"{self.RESULTS_DIR}/checkpoints"
 
-        # ── wideband knobs (Phase 2+) ──
-        self.F_SUBCARRIERS = 1          # Start narrowband; set > 1 for wideband
-        self.USE_WIDEBAND_INPUT = False
-        self.CARRIER_HZ = 3.5e9         # 3.5 GHz for wideband phases
+        # ── wideband knobs (primary path) ──
+        self.F_SUBCARRIERS = 16         # Start at F=16 (wideband minimal), scale to 64+
+        self.USE_WIDEBAND_INPUT = True
+        self.CARRIER_HZ = 3.5e9         # 3.5 GHz FR1
         self.SUBCARRIER_SPACING_HZ = 30e3  # 30 kHz (3GPP NR)
-        self.D_TAPS = 4                 # Tap-domain channel taps (indoor)
-        self.OFDM_FFT_SIZE = 256
-        self.OFDM_ACTIVE_SC = 200
+        self.D_TAPS = 8                 # Tap-domain channel taps (indoor TR 38.901 style)
+        self.OFDM_FFT_SIZE = 2048
+        self.OFDM_ACTIVE_SC = 1596      # 50 MHz at 30 kHz SCS (NRB~133)
+        self.PILOT_SUBCARRIERS = 256
+        self.WIDEBAND_Y_KEY = "y"
+        self.WIDEBAND_H_TAPS_KEY = "H_taps_ri"
 
         # ── covariance / inference (inherited) ──
         self.C_EPS = getattr(base, "C_EPS", 1.0)
         self.HYBRID_COV_BLEND = False     # v2: no hybrid blend needed (direct NMSE)
         self.HYBRID_COV_BETA = 0.0
+        self.APPLY_EFFECTIVE_COV_IN_LOSS = False
 
         # ── MUSIC / MVDR (inherited as-is) ──
         for attr in [
@@ -78,6 +89,8 @@ class V2SysConfig:
 
         # ── diagnostics ──
         self.COV_SANITY_CHECK = True
+        self.PRIMARY_PLAN_DOC = "OFDM_TR38901_INDOOR_PLAN.md"
+        self.V2_EXEC_PLAN_DOC = "V2_PHYSICS_FIRST_WIDEBAND_EXECUTION_PLAN_20260212.md"
 
 
 class V2ModelConfig:
@@ -107,6 +120,8 @@ class V2ModelConfig:
         self.USE_AMP = True
         self.SEED = 42
         self.LOG_EVERY = 20
+        self.WIDEBAND_START_F = 16
+        self.WIDEBAND_TARGET_F = 64
 
         # ── loss weights ──
         self.LAM_SUBSPACE = 0.0         # off by default (Phase 1a)

@@ -3,7 +3,7 @@
 **Date:** 2026-02-12  
 **Branch:** `v2/physics-first-wideband`  
 **Parent:** `main`  
-**Related:** `CONSTANT_PREDICTION_TRAP_DIAGNOSIS_20260211.md`
+**Related:** `CONSTANT_PREDICTION_TRAP_DIAGNOSIS_20260211.md`, `OFDM_TR38901_INDOOR_PLAN.md`
 
 ---
 
@@ -17,6 +17,11 @@ This section tracks what is actually implemented on `v2/physics-first-wideband` 
 - Not implemented yet: Phase-2 wideband data generator (`F>1` shards), tap-domain `H_tap` ingestion, and production-wideband eval runs.
 
 Practical meaning: Phase-0/Phase-1 code skeleton is in place, but end-to-end validation gates still need to be run on Goose.
+
+**Correction (authoritative direction):**
+- `OFDM_TR38901_INDOOR_PLAN.md` is the primary simulation/system plan to follow.
+- V2 execution is **wideband-first** (start at F=16), not narrowband-first.
+- Narrowband is only an optional fallback for debugging, not the main path.
 
 ---
 
@@ -46,8 +51,8 @@ The model should predict R, and physics-based MUSIC/MVDR should extract geometry
 2. **Single loss objective**: NMSE on covariance dominates training. Optional physics-aligned
    structure losses (subspace, peak-contrast) added only after covariance converges.
 3. **No slots, no permutation matching**: The output is a single matrix R̂, not K slots.
-4. **Wideband-ready**: Architecture accepts F≥1 subcarriers from day 1. Phase 1 uses F=1
-   (narrowband, existing data). Phases 2–3 extend to F=16..64 OFDM.
+4. **Wideband-first**: Architecture trains on OFDM tensors from day 1 (start at F=16,
+   then scale to F=64+). Narrowband is optional fallback only.
 5. **Incremental validation**: Each phase has a hard gate. No proceeding without pass.
 6. **Reuse correct v1 code**: Physics utilities, MUSIC/MVDR backends, data loading,
    covariance utilities, evaluation scripts — all reused.
@@ -445,15 +450,15 @@ Phase 3 (F=64):
 
 **Gate:** All files importable, no runtime errors on `--check`.
 
-### Phase 1: Narrowband Covariance Learning (Day 1–2)
+### Phase 1: Wideband Minimal (F=16) Covariance Learning (Day 1–2)
 
-**Goal:** 200-sample overfit on covariance NMSE → NMSE < 0.01.
+**Goal:** 200-sample overfit on covariance NMSE with OFDM inputs (F=16) → NMSE < 0.01.
 
 **Tasks:**
 - [ ] Implement `CovariancePredictor.forward()` (y-encoder → fusion → factor → R̂)
 - [ ] Implement `V2CovarianceLoss.forward()` (NMSE only)
 - [ ] Implement `V2Trainer` training loop (simple, no curriculum)
-- [ ] Run overfit test with existing narrowband data (F=1)
+- [ ] Run overfit test with wideband data (F=16)
 - [ ] Verify NMSE converges to < 0.01 on 200 samples
 - [ ] Run MUSIC on overfit R̂ predictions → verify φ_rmse < 5°
 
@@ -465,31 +470,31 @@ Phase 3 (F=64):
 - Check R_true data integrity (print norms, Hermiticity)
 - Try removing H/codes features (pure y → R̂) to isolate
 
-### Phase 1b: Structure Losses + Validation (Day 2–3)
+### Phase 1b: Structure Losses + Wideband Validation (Day 2–3)
 
 **Goal:** Val NMSE < 0.1 on full dataset. MUSIC φ_rmse < 10° on validation.
 
 **Tasks:**
 - [ ] Add subspace alignment loss (reuse `_subspace_alignment_loss` from v1 loss.py)
 - [ ] Add peak contrast loss (reuse `_peak_contrast_loss` from v1 loss.py)
-- [ ] Train on full narrowband dataset with NMSE + structure losses
+- [ ] Train on full wideband F=16 dataset with NMSE + structure losses
 - [ ] Evaluate with MUSIC pipeline (reuse v1 eval)
 
 **Gate:** Val NMSE < 0.1. MUSIC φ_rmse < 10° on val set.
 
-### Phase 2: Wideband Minimal F=16 (Day 3–4)
+### Phase 2: Wideband Scale-Up F=64 (Day 3–4)
 
-**Goal:** OFDM data generation + training with 16 pilot subcarriers.
+**Goal:** Full-band pilot subset training with 64 subcarriers.
 
 **Tasks:**
 - [ ] Implement OFDM data generator (extend existing pregen scripts)
 - [ ] Add FreqPool module to model
 - [ ] Update y-encoder for `[B, L, F, M, 2]` input
-- [ ] Generate F=16 training data (20K samples)
-- [ ] Overfit test with F=16 data
-- [ ] Compare range RMSE: narrowband vs. F=16
+- [ ] Generate F=64 training data (20K+ samples)
+- [ ] Overfit test with F=64 data
+- [ ] Compare range RMSE: F=16 vs. F=64
 
-**Gate:** Overfit NMSE < 0.01. Range RMSE improvement over narrowband.
+**Gate:** Overfit NMSE < 0.01. Range RMSE improvement over F=16 baseline.
 
 ### Phase 3: Full Wideband F=64 (Day 4–6)
 

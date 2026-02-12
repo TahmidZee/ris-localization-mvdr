@@ -9,6 +9,7 @@ Main entrypoints:
 """
 
 from .config_v2 import v2_cfg, v2_mdl
+from .infer_v2 import infer_v2_sample
 from .model_v2 import CovariancePredictor
 from .loss_v2 import V2CovarianceLoss
 
@@ -17,4 +18,5 @@ __all__ = [
     "v2_mdl",
     "CovariancePredictor",
     "V2CovarianceLoss",
+    "infer_v2_sample",
 ]

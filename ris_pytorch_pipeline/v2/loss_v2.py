@@ -5,10 +5,10 @@ No permutation matching.  No slot diversity.  No direct geometry loss.
 """
 
 from __future__ import annotations
-import math
 import torch
 import torch.nn as nn
 
+from ..physics import nearfield_vec
 from .config_v2 import v2_cfg, v2_mdl
 
 
@@ -56,6 +56,33 @@ class V2CovarianceLoss(nn.Module):
         return num / den
 
     # ------------------------------------------------------------------ #
+    # Reused physics helper
+    # ------------------------------------------------------------------ #
+    def _build_gt_steering(
+        self,
+        phi_b: torch.Tensor,
+        theta_b: torch.Tensor,
+        r_b: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Build GT steering matrix A_gt [K, N] using v1 near-field physics.
+        """
+        rows = []
+        for i in range(phi_b.numel()):
+            a_np = nearfield_vec(
+                v2_cfg,
+                float(phi_b[i].item()),
+                float(theta_b[i].item()),
+                float(r_b[i].item()),
+            )
+            rows.append(torch.from_numpy(a_np))
+        if not rows:
+            return torch.empty(0, int(v2_cfg.N), device=device, dtype=dtype)
+        return torch.stack(rows, dim=0).to(device=device, dtype=dtype)
+
+    # ------------------------------------------------------------------ #
     # Subspace alignment (reuse v1 idea, simplified)
     # ------------------------------------------------------------------ #
     def _subspace_alignment(
@@ -89,23 +116,11 @@ class V2CovarianceLoss(nn.Module):
         else:
             return torch.tensor(0.0, device=device)
 
-        # Sensor coordinates (centred UPA, meters)
-        N_H, N_V = int(v2_cfg.N_H), int(v2_cfg.N_V)
-        d_h = float(v2_cfg.d_H)
-        d_v = float(v2_cfg.d_V)
-        k0 = float(v2_cfg.k0)
-        h_idx = torch.arange(-(N_H - 1) // 2, (N_H + 1) // 2, device=device, dtype=torch.float32) * d_h
-        v_idx = torch.arange(-(N_V - 1) // 2, (N_V + 1) // 2, device=device, dtype=torch.float32) * d_v
-        x_grid, y_grid = torch.meshgrid(h_idx, v_idx, indexing="xy")
-        x = x_grid.reshape(-1)  # [N]
-        y = y_grid.reshape(-1)  # [N]
-        hv_sq = (x * x + y * y).view(1, -1)  # [1, N]
-
-        # SVD of R_pred for projector (detached — no backprop through SVD)
+        # SVD of R_pred for projector
         eps = float(v2_mdl.EPS_PSD)
         eye = torch.eye(N, device=device, dtype=dtype)
         R_sym = 0.5 * (R_pred_c + R_pred_c.conj().transpose(-2, -1)) + eps * eye
-        U, _, _ = torch.linalg.svd(R_sym.detach(), full_matrices=False)
+        U, _, _ = torch.linalg.svd(R_sym, full_matrices=False)
 
         losses = []
         for b in range(B):
@@ -118,13 +133,7 @@ class V2CovarianceLoss(nn.Module):
             theta_b = theta[b, :K].float()
             r_b = rr[b, :K].float().clamp_min(1e-6)
 
-            planar = (
-                torch.sin(phi_b).unsqueeze(1) * torch.cos(theta_b).unsqueeze(1) * x.view(1, -1)
-                + torch.sin(theta_b).unsqueeze(1) * y.view(1, -1)
-            )
-            curvature = hv_sq / (2.0 * r_b.unsqueeze(1))
-            phase = k0 * (planar - curvature)
-            A_gt = (torch.exp(1j * phase) / math.sqrt(float(N))).to(dtype)  # [K, N]
+            A_gt = self._build_gt_steering(phi_b, theta_b, r_b, device=device, dtype=dtype)
 
             # Signal-subspace projector
             U_sig = U[b, :, :K]  # [N, K]
@@ -180,18 +189,6 @@ class V2CovarianceLoss(nn.Module):
         except Exception:
             return torch.tensor(0.0, device=device)
 
-        # Sensor coordinates
-        N_H, N_V = int(v2_cfg.N_H), int(v2_cfg.N_V)
-        d_h = float(v2_cfg.d_H)
-        d_v = float(v2_cfg.d_V)
-        k0 = float(v2_cfg.k0)
-        h_idx = torch.arange(-(N_H - 1) // 2, (N_H + 1) // 2, device=device, dtype=torch.float32) * d_h
-        v_idx = torch.arange(-(N_V - 1) // 2, (N_V + 1) // 2, device=device, dtype=torch.float32) * d_v
-        x_grid, y_grid = torch.meshgrid(h_idx, v_idx, indexing="xy")
-        x = x_grid.reshape(-1)
-        y = y_grid.reshape(-1)
-        hv_sq = (x * x + y * y).view(1, -1)
-
         total, count = 0.0, 0
         for b in range(B):
             K = int(K_true[b].item())
@@ -202,10 +199,13 @@ class V2CovarianceLoss(nn.Module):
                 theta_k = theta[b, k].float()
                 r_k = rr[b, k].float().clamp_min(1e-6)
 
-                planar = torch.sin(phi_k) * torch.cos(theta_k) * x + torch.sin(theta_k) * y
-                curvature = hv_sq.squeeze(0) / (2.0 * r_k)
-                phase = k0 * (planar - curvature)
-                a = (torch.exp(1j * phase) / math.sqrt(float(N))).to(dtype)  # [N]
+                a = self._build_gt_steering(
+                    phi_k.unsqueeze(0),
+                    theta_k.unsqueeze(0),
+                    r_k.unsqueeze(0),
+                    device=device,
+                    dtype=dtype,
+                )[0]
 
                 # Capon: P = 1 / (aᴴ R⁻¹ a)  — we want this to be large
                 denom = (a.conj() @ R_inv[b] @ a).real.clamp_min(1e-12)

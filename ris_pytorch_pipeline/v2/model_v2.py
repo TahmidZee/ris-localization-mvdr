@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..covariance_utils import hermitize_torch, trace_norm_torch
 from .config_v2 import v2_cfg, v2_mdl
 
 
@@ -114,6 +115,7 @@ class CovariancePredictor(nn.Module):
 
         # ── H path ──
         self.H_proj = nn.Linear(L * M * 2, D // 2)
+        self.H_tap_proj = nn.LazyLinear(D // 2)
 
         # ── codes path ──
         self.codes_conv = nn.Conv1d(N * 2, D // 2, kernel_size=5, padding=2)
@@ -165,14 +167,42 @@ class CovariancePredictor(nn.Module):
         R = A @ A.conj().transpose(-2, -1)  # [B, N, N]
         R = R + self.eps_psd * torch.eye(self.N, device=R.device, dtype=R.dtype).unsqueeze(0)
 
-        # Hermitize (defensive)
-        R = 0.5 * (R + R.conj().transpose(-2, -1))
-
-        # Trace-normalise to N (MUSIC convention)
-        tr = torch.diagonal(R, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)
-        R = R * (float(self.N) / tr).view(B, 1, 1)
+        # Reuse v1 covariance helpers for canonical post-processing.
+        R = hermitize_torch(R)
+        R = trace_norm_torch(R, target_trace=float(self.N))
 
         return R, A
+
+    # ------------------------------------------------------------------
+    def _encode_h(self, H: torch.Tensor) -> torch.Tensor:
+        """
+        Encode H feature tensor.
+
+        Supports:
+          - [B, L, M, 2]
+          - [B, L, F, M, 2] (frequency pooled over F)
+        """
+        if H.dim() == 5:
+            H = H.mean(dim=2)  # [B, L, M, 2]
+        if H.dim() != 4:
+            raise ValueError(f"Unsupported H shape {tuple(H.shape)}")
+        B = H.shape[0]
+        return F.gelu(self.H_proj(H.reshape(B, -1)))  # [B, D/2]
+
+    # ------------------------------------------------------------------
+    def _encode_h_taps(self, H_taps: dict[str, torch.Tensor] | None) -> torch.Tensor | None:
+        """
+        Encode tap-domain channel features when available.
+        Expected primary key: H_taps_ri [B, P, M, N, 2].
+        """
+        if not H_taps:
+            return None
+        h_tap_ri = H_taps.get("H_taps_ri", None)
+        if h_tap_ri is None:
+            return None
+        B = h_tap_ri.shape[0]
+        feat = h_tap_ri.reshape(B, -1).float()
+        return F.gelu(self.H_tap_proj(feat))  # [B, D/2]
 
     # ------------------------------------------------------------------
     def _encode_y_single(self, y_single: torch.Tensor) -> torch.Tensor:
@@ -218,19 +248,16 @@ class CovariancePredictor(nn.Module):
         codes: torch.Tensor,
         snr_db: torch.Tensor | None = None,
         R_samp: torch.Tensor | None = None,
+        H_taps: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         B = y.shape[0]
-        if H.dim() != 4:
-            raise ValueError(
-                f"Phase-1 expects H shape [B,L,M,2]; got {tuple(H.shape)}. "
-                "Tap-domain H support is planned for later wideband phases."
-            )
 
         # ── y features ──
         x = self._encode_y(y)  # [B, D]
 
-        # ── H features ──
-        H_feat = F.gelu(self.H_proj(H.reshape(B, -1)))  # [B, D/2]
+        # ── H features (tap-domain preferred when available) ──
+        H_tap_feat = self._encode_h_taps(H_taps)
+        H_feat = H_tap_feat if H_tap_feat is not None else self._encode_h(H)
 
         # ── codes features ──
         Lc = codes.shape[1]
