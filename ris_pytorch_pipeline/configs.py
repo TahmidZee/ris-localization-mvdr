@@ -7,24 +7,28 @@ class SysConfig:
         # TERMINOLOGY (critical for paper!):
         # - M or M_BS: Base station antennas (hardware, measurements per snapshot)
         # - M_beams: RIS codebook size (spatial beams, set via M_BEAMS_TARGET below)
-        # - M_cov or N: Covariance dimension for MDL/AIC (= RIS elements = 144)
+        # - M_cov or N: Covariance dimension for MDL/AIC (= RIS elements = 256)
         # - L: Temporal snapshots (time budget)
         
-        self.M, self.N_H, self.N_V = 16, 12, 12  # M=M_BS (BS antennas), 12x12 UPA
+        # === Carrier / wavelength (3.5 GHz FR1 mid-band) ===
+        self.CARRIER_HZ = 3.5e9  # 3.5 GHz FR1 mid-band
+        self.WAVEL = 3e8 / self.CARRIER_HZ  # ≈ 0.0857 m
+        self.k0 = 2 * math.pi / self.WAVEL
+        self.d_H = self.d_V = 0.5 * self.WAVEL  # λ/2 spacing
+        
+        # === Array dimensions (upgraded: moderate regime) ===
+        self.M = 64  # BS antennas (8×8 UPA)
+        self.M_H, self.M_V = 8, 8  # BS UPA layout
         self.M_BS = self.M  # Alias for clarity in paper
-        self.N = self.N_H * self.N_V  # N = M_cov = 144 elements
-        self.L = 16  # temporal snapshots (L≤16 for "few-snapshot" story)
+        self.N_H, self.N_V = 16, 16  # RIS elements → N = 256
+        self.N = self.N_H * self.N_V  # N = M_cov = 256 elements
+        self.L = 64  # temporal snapshots
         
         # M_beams: RIS codebook size (spatial beams in 2D DFT)
         # For excellent θ: set to 64 (8×8 balanced)
         # For sub-1° θ: set to 32 (4×8 vertical-tilted)
         # For baseline: set to 16 (4×4 balanced)
         self.M_BEAMS_TARGET = 64  # Options: 16, 24, 30, 32, 36, 48, 64
-
-        # For 1 GHz: wavelength = c/f = 3e8/1e9 = 0.3 m
-        self.WAVEL = 0.3  # 1 GHz frequency 
-        self.k0 = 2 * math.pi / self.WAVEL
-        self.d_H = self.d_V = 0.5 * self.WAVEL  # λ/2 spacing
         # FOV: φ ±60°, θ ±30° for realistic wall-mounted panel (train=inference)
         self.ANGLE_RANGE_PHI = math.pi / 3.0    # ±60° azimuth  
         self.ANGLE_RANGE_THETA = math.pi / 6.0  # ±30° elevation
@@ -100,13 +104,13 @@ class SysConfig:
         # --- 2D separable DFT codebook (RECOMMENDED for training) ---
         self._build_2d_dft_codebook()
 
-        # --- Results / data / HPO paths (L=16 12x12 system) ---
-        self.RESULTS_DIR = "results_final_L16_12x12"
+        # --- Results / data / HPO paths (L=64, 16x16 RIS, M=64 BS system) ---
+        self.RESULTS_DIR = "results_final_L64_16x16_M64"
         self.LOGS_DIR = f"{self.RESULTS_DIR}/logs"
         self.CKPT_DIR = f"{self.RESULTS_DIR}/checkpoints"
 
-        # shards root for L=16 M_beams=64 data; split folders live here
-        self.DATA_SHARDS_DIR = "data_shards_M64_L16"
+        # shards root for L=64 M_beams=64 data; split folders live here
+        self.DATA_SHARDS_DIR = "data_shards_M64_L64"
         self.DATA_SHARDS_TRAIN = f"{self.DATA_SHARDS_DIR}/train"
         self.DATA_SHARDS_VAL   = f"{self.DATA_SHARDS_DIR}/val"
         self.DATA_SHARDS_TEST  = f"{self.DATA_SHARDS_DIR}/test"
@@ -144,10 +148,10 @@ class SysConfig:
         Build 2D separable DFT codebook using Kronecker product.
         
         TERMINOLOGY:
-        - M_BS: Base station antennas (hardware, fixed at 16)
+        - M_BS: Base station antennas (hardware, fixed at 64)
         - M_beams: Number of spatial beams in RIS codebook (this value)
-        - M_cov or N: Covariance dimension (RIS elements = 144)
-        - L: Temporal snapshots (16)
+        - M_cov or N: Covariance dimension (RIS elements = 256)
+        - L: Temporal snapshots (64)
         
         For excellent θ performance, use balanced grid:
         - kH=8, kV=8 → M_beams=64 (recommended for θ<0.5°)
@@ -388,7 +392,7 @@ class ModelConfig:
         self.ETA_PERTURB = 0.05
         self.INFERENCE_GRID_SIZE_COARSE = 61  # For L=16: stable angle resolution
         self.INFERENCE_GRID_SIZE_RANGE = 201  # Dense range grid (was 101)
-        self.NEWTON_ITER = 3              # Reduced for efficiency with 144 elements
+        self.NEWTON_ITER = 3              # Reduced for efficiency with 256 elements
         self.NEWTON_LR = 0.075            # Slightly reduced for stability
         self.SHRINK_BASE_ALPHA = 1e-3
         self.DELTA_GAP = 0.10
@@ -403,7 +407,7 @@ class ModelConfig:
         self.SOFTMAX_TAU = 0.15  # initial temperature, will be annealed during training
         
         # --- subspace alignment loss ---
-        self.LAM_ALIGN = 0.002  # subspace alignment penalty - keep modest for 12x12 (larger eigengap)
+        self.LAM_ALIGN = 0.002  # subspace alignment penalty - keep modest for 16x16 (larger eigengap)
         self.ALIGN_ON_PRED = True  # if True: use shrink(R̂), if False: use R_true (train-test coupling)
 
         # --- covariance factor blending (match loss/infer) ---
