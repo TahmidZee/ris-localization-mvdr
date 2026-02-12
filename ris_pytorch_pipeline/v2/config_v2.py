@@ -61,6 +61,7 @@ class V2SysConfig:
         self.OFDM_FFT_SIZE = 2048
         self.OFDM_ACTIVE_SC = 1596      # 50 MHz at 30 kHz SCS (NRB~133)
         self.PILOT_SUBCARRIERS = 256
+        self.BW_HZ = float(self.OFDM_ACTIVE_SC) * float(self.SUBCARRIER_SPACING_HZ)
         self.WIDEBAND_Y_KEY = "y"
         self.WIDEBAND_H_TAPS_KEY = "H_taps_ri"
         self.WIDEBAND_R_F_KEY = "R_f"
@@ -111,6 +112,7 @@ class V2ModelConfig:
         self.DROPOUT = 0.1              # lighter than v1 (0.20)
         self.FACTOR_RANK = 10           # 2 × K_MAX
         self.USE_TONE_FACTOR_HEAD = True
+        self.USE_OPERATOR_TAP_CONDITIONING = True
 
         # ── training ──
         self.BATCH_SIZE = 64

@@ -65,6 +65,17 @@ class CovariancePredictor(nn.Module):
                 return h
         return 1
 
+    @staticmethod
+    def _ri_to_complex_torch(x: torch.Tensor | None) -> torch.Tensor | None:
+        """Convert RI tensor (...,2) to complex tensor, pass-through if already complex."""
+        if x is None:
+            return None
+        if torch.is_complex(x):
+            return x
+        if x.shape[-1] == 2:
+            return torch.complex(x[..., 0].float(), x[..., 1].float())
+        raise ValueError(f"Expected complex or RI(...,2), got shape={tuple(x.shape)}")
+
     # ------------------------------------------------------------------
     # init
     # ------------------------------------------------------------------
@@ -120,6 +131,9 @@ class CovariancePredictor(nn.Module):
         # ── H path ──
         self.H_proj = nn.Linear(L * M * 2, D // 2)
         self.H_tap_proj = nn.LazyLinear(D // 2)
+        self.Hf_token_proj = nn.Linear(M + N + 1, D)
+        self.Hop_global_proj = nn.Linear(D, D // 2)
+        self.freq_op_fuse = nn.Linear(2 * D, D)
 
         # ── codes path ──
         self.codes_conv = nn.Conv1d(N * 2, D // 2, kernel_size=5, padding=2)
@@ -159,6 +173,12 @@ class CovariancePredictor(nn.Module):
         # Last layer small std keeps initial R close to eps*I and stabilizes early training.
         _init_head(self.factor_head)
         _init_head(self.tone_factor_head)
+
+        for layer in [self.Hf_token_proj, self.Hop_global_proj, self.freq_op_fuse]:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
 
     # ------------------------------------------------------------------
     def _factor_to_cov(self, factor_vec: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -243,6 +263,75 @@ class CovariancePredictor(nn.Module):
         return F.gelu(self.H_tap_proj(feat))  # [B, D/2]
 
     # ------------------------------------------------------------------
+    def _build_hf_from_taps(
+        self,
+        H_taps: dict[str, torch.Tensor] | None,
+        n_freq: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """
+        Build per-tone operator H(f) from tap-domain tensors.
+        Expected H_taps_ri shape: [B, P, M, N, 2] (or complex [B, P, M, N]).
+        """
+        if not H_taps:
+            return None
+        h_taps_ri = H_taps.get(str(getattr(v2_cfg, "WIDEBAND_H_TAPS_KEY", "H_taps_ri")), None)
+        if h_taps_ri is None:
+            h_taps_ri = H_taps.get("H_taps_ri", None)
+        if h_taps_ri is None:
+            return None
+
+        Htap = self._ri_to_complex_torch(h_taps_ri)
+        if Htap.dim() != 4:
+            raise ValueError(f"Expected H_taps shape [B,P,M,N], got {tuple(Htap.shape)}")
+        B, P, _, _ = Htap.shape
+        Htap = Htap.to(device=device, dtype=torch.complex64)
+
+        path_mask = H_taps.get("path_mask", None)
+        if path_mask is not None:
+            if path_mask.dim() == 1:
+                path_mask = path_mask.unsqueeze(0)
+            path_mask = path_mask.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+            Htap = Htap * path_mask.unsqueeze(-1).unsqueeze(-1)
+
+        taus = H_taps.get("taus_s", None)
+        if taus is not None:
+            if taus.dim() == 1:
+                taus = taus.unsqueeze(0)
+            taus = taus.to(device=device, dtype=torch.float32)
+            bw_hz = float(getattr(v2_cfg, "BW_HZ", float(getattr(v2_cfg, "OFDM_ACTIVE_SC", 1596)) * float(getattr(v2_cfg, "SUBCARRIER_SPACING_HZ", 30e3))))
+            freq_offsets = torch.linspace(-0.5 * bw_hz, 0.5 * bw_hz, n_freq, device=device, dtype=torch.float32)
+            phase = torch.exp(-1j * (2.0 * math.pi) * taus.unsqueeze(-1) * freq_offsets.view(1, 1, n_freq))  # [B,P,F]
+            H_f = torch.einsum("bpmn,bpf->bfmn", Htap, phase)
+        else:
+            # Fallback: DFT-style synthesis when explicit delays are unavailable.
+            tap_idx = torch.arange(P, device=device, dtype=torch.float32).view(P, 1)
+            tone_idx = torch.arange(n_freq, device=device, dtype=torch.float32).view(1, n_freq)
+            phase = torch.exp(-1j * (2.0 * math.pi) * tap_idx * tone_idx / float(max(n_freq, 1)))  # [P,F]
+            H_f = torch.einsum("bpmn,pf->bfmn", Htap, phase)
+        return H_f  # [B,F,M,N]
+
+    # ------------------------------------------------------------------
+    def _encode_hf_tokens(self, H_f: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode per-tone operator tokens.
+        Input: H_f [B, F, M, N] complex
+        Returns:
+          tone_tokens [B, F, D]
+          global_token [B, D/2]
+        """
+        mag = torch.abs(H_f)  # [B,F,M,N]
+        bs_profile = mag.mean(dim=-1)  # [B,F,M]
+        ris_profile = mag.mean(dim=-2)  # [B,F,N]
+        power = (mag * mag).mean(dim=(-2, -1)).unsqueeze(-1)  # [B,F,1]
+        token_raw = torch.cat([bs_profile, ris_profile, power], dim=-1)  # [B,F,M+N+1]
+        token_raw = torch.log1p(token_raw.float())
+
+        tone_tokens = F.gelu(self.Hf_token_proj(token_raw))  # [B,F,D]
+        global_token = F.gelu(self.Hop_global_proj(tone_tokens.mean(dim=1)))  # [B,D/2]
+        return tone_tokens, global_token
+
+    # ------------------------------------------------------------------
     def _encode_y_single(self, y_single: torch.Tensor) -> torch.Tensor:
         """
         Encode narrowband y input.
@@ -300,9 +389,29 @@ class CovariancePredictor(nn.Module):
         # ── y features ──
         x_global, x_f, f_attn = self._encode_y(y)  # [B, D], optional per-tone features
 
-        # ── H features (tap-domain preferred when available) ──
-        H_tap_feat = self._encode_h_taps(H_taps)
-        H_feat = H_tap_feat if H_tap_feat is not None else self._encode_h(H)
+        H_f = None
+        hop_applied = False
+        if (
+            x_f is not None
+            and bool(getattr(v2_mdl, "USE_OPERATOR_TAP_CONDITIONING", True))
+            and H_taps is not None
+        ):
+            try:
+                H_f = self._build_hf_from_taps(H_taps, n_freq=x_f.shape[1], device=x_f.device)
+            except Exception:
+                H_f = None
+            if H_f is not None:
+                h_tokens, h_global = self._encode_hf_tokens(H_f)
+                x_f = F.gelu(self.freq_op_fuse(torch.cat([x_f, h_tokens], dim=-1)))  # [B,F,D]
+                x_global, f_attn = self.freq_pool(x_f, return_attn=True)
+                H_feat = h_global
+                hop_applied = True
+            else:
+                H_tap_feat = self._encode_h_taps(H_taps)
+                H_feat = H_tap_feat if H_tap_feat is not None else self._encode_h(H)
+        else:
+            H_tap_feat = self._encode_h_taps(H_taps)
+            H_feat = H_tap_feat if H_tap_feat is not None else self._encode_h(H)
 
         # ── codes features ──
         Lc = codes.shape[1]
@@ -320,6 +429,7 @@ class CovariancePredictor(nn.Module):
             "R_pred": R_pred,      # [B, N, N] complex
             "A_pred": A_pred,      # [B, N, rank] complex
             "factor_vec": factor_vec,
+            "operator_tap_conditioned": torch.tensor(1.0 if hop_applied else 0.0, device=R_pred.device),
         }
 
         # ── per-tone covariance head (wideband supervision path) ──
