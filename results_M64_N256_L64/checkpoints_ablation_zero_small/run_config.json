@@ -1,0 +1,25 @@
+{
+  "timestamp": "2026-02-09 21:00:44",
+  "git_commit": "8015e127",
+  "seed": 42,
+  "epochs": 3,
+  "n_train": 1024,
+  "n_val": 512,
+  "grad_accumulation": 1,
+  "early_stop_patience": 99,
+  "val_primary": "surrogate",
+  "use_music_in_val": false,
+  "model_config": {
+    "D_MODEL": 512,
+    "NUM_HEADS": 8,
+    "DROPOUT": 0.2,
+    "LR_INIT": 0.0003,
+    "BATCH_SIZE": 64
+  },
+  "system_config": {
+    "N_H": 16,
+    "N_V": 16,
+    "K_MAX": 5,
+    "HYBRID_COV_BETA": 0.0
+  }
+}

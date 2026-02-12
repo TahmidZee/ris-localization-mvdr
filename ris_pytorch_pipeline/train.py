@@ -2903,8 +2903,11 @@ class Trainer:
                     # Restore EMA / SWA state (best-effort; safe to skip if mismatched)
                     if bool(rs.get("use_ema", False)) and hasattr(self, "ema_shadow") and ("ema_shadow" in rs) and isinstance(rs["ema_shadow"], dict):
                         try:
-                            # Keep only floating-point tensors
-                            self.ema_shadow = {k: v for k, v in rs["ema_shadow"].items() if hasattr(v, "dtype") and v.dtype.is_floating_point}
+                            # Keep only floating-point tensors and move to model device
+                            self.ema_shadow = {
+                                k: v.to(self.device) for k, v in rs["ema_shadow"].items()
+                                if hasattr(v, "dtype") and v.dtype.is_floating_point
+                            }
                         except Exception:
                             pass
                     if bool(rs.get("use_swa", False)) and hasattr(self, "swa_model") and (self.swa_model is not None):

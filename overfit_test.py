@@ -50,6 +50,14 @@ cfg.TRAIN_PHASE = "joint"
 # Disable early stopping (we WANT to overfit)
 mdl_cfg.PATIENCE = 9999
 
+# Use a separate results dir so we don't resume from / overwrite the real training checkpoint
+cfg.RESULTS_DIR = "results_overfit_test"
+cfg.CKPT_DIR = "results_overfit_test/checkpoints"
+os.makedirs(cfg.CKPT_DIR, exist_ok=True)
+
+# Disable auto-resume (start from scratch every time)
+cfg.AUTO_RESUME_TRAINING = False
+
 print("=" * 70)
 print("OVERFIT TEST: Training on ~200 samples for 200 epochs")
 print("=" * 70)
