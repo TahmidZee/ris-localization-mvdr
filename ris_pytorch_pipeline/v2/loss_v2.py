@@ -32,10 +32,20 @@ class V2CovarianceLoss(nn.Module):
 
     def __init__(
         self,
+        lam_cov_main: float | None = None,
+        lam_cov_f: float | None = None,
+        lam_cov_consistency: float | None = None,
         lam_subspace: float | None = None,
         lam_peak: float | None = None,
     ):
         super().__init__()
+        self.lam_cov_main = lam_cov_main if lam_cov_main is not None else float(getattr(v2_mdl, "LAM_COV_MAIN", 1.0))
+        self.lam_cov_f = lam_cov_f if lam_cov_f is not None else float(getattr(v2_mdl, "LAM_COV_F", 0.0))
+        self.lam_cov_consistency = (
+            lam_cov_consistency
+            if lam_cov_consistency is not None
+            else float(getattr(v2_mdl, "LAM_COV_CONSIST", 0.0))
+        )
         self.lam_subspace = lam_subspace if lam_subspace is not None else v2_mdl.LAM_SUBSPACE
         self.lam_peak = lam_peak if lam_peak is not None else v2_mdl.LAM_PEAK
 
@@ -224,6 +234,9 @@ class V2CovarianceLoss(nn.Module):
         self,
         R_pred: torch.Tensor,
         R_true: torch.Tensor,
+        R_f_pred: torch.Tensor | None = None,
+        R_f_true: torch.Tensor | None = None,
+        R_f_mean_pred: torch.Tensor | None = None,
         K_true: torch.Tensor | None = None,
         ptr_gt: torch.Tensor | None = None,
         snr_db: torch.Tensor | None = None,
@@ -236,17 +249,38 @@ class V2CovarianceLoss(nn.Module):
         loss : scalar
         info : dict of component values (for logging)
         """
-        nmse = self._nmse(R_pred, R_true).mean()
-        loss = nmse
-        info: dict = {"nmse": nmse.item()}
+        nmse_main = self._nmse(R_pred, R_true).mean()
+        loss = self.lam_cov_main * nmse_main
+        info: dict = {
+            "nmse": nmse_main.item(),
+            "nmse_main": nmse_main.item(),
+            "lam_cov_main": float(self.lam_cov_main),
+            "lam_cov_f": float(self.lam_cov_f),
+            "lam_cov_consistency": float(self.lam_cov_consistency),
+        }
+
+        has_rf = (R_f_pred is not None) and (R_f_true is not None) and (R_f_true.numel() > 0)
+        if self.lam_cov_f > 0.0 and has_rf:
+            nmse_f = self._nmse(R_f_pred, R_f_true).mean()
+            loss = loss + self.lam_cov_f * nmse_f
+            info["nmse_f"] = nmse_f.item()
+
+        if self.lam_cov_consistency > 0.0 and (R_f_pred is not None):
+            if R_f_mean_pred is None:
+                R_f_mean_pred = _as_complex(R_f_pred).mean(dim=1)
+            nmse_cons = self._nmse(R_f_mean_pred, R_pred).mean()
+            loss = loss + self.lam_cov_consistency * nmse_cons
+            info["nmse_consistency"] = nmse_cons.item()
+
+        R_struct = R_f_mean_pred if (R_f_mean_pred is not None) else R_pred
 
         if self.lam_subspace > 0 and K_true is not None and ptr_gt is not None:
-            L_sub = self._subspace_alignment(R_pred, K_true, ptr_gt)
+            L_sub = self._subspace_alignment(R_struct, K_true, ptr_gt)
             loss = loss + self.lam_subspace * L_sub
             info["subspace"] = L_sub.item()
 
         if self.lam_peak > 0 and K_true is not None and ptr_gt is not None:
-            L_peak = self._peak_contrast(R_pred, K_true, ptr_gt)
+            L_peak = self._peak_contrast(R_struct, K_true, ptr_gt)
             loss = loss + self.lam_peak * L_peak
             info["peak"] = L_peak.item()
 

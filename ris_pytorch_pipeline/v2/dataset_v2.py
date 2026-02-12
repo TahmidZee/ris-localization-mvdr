@@ -109,6 +109,7 @@ class V2WidebandNPZDataset(Dataset):
         "aoa_az",
         "aoa_el",
     )
+    _OPTIONAL_RF_KEYS_DEFAULT = ("R_f_true", "R_f", "Rf")
 
     def __init__(self, npz_paths_or_dir):
         self.paths: List[str] = []
@@ -195,6 +196,18 @@ class V2WidebandNPZDataset(Dataset):
         else:
             snr = 0.0
         R = z["R"][local_idx]
+        R_f = None
+        rf_key_main = str(getattr(v2_cfg, "WIDEBAND_R_F_KEY", "R_f"))
+        rf_keys = [rf_key_main]
+        rf_keys.extend(list(getattr(v2_cfg, "WIDEBAND_R_F_ALT_KEYS", self._OPTIONAL_RF_KEYS_DEFAULT)))
+        seen = set()
+        for key in rf_keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in z.files:
+                R_f = z[key][local_idx]
+                break
 
         H = z["H"][local_idx] if "H" in z.files else None
         h_taps = {}
@@ -208,6 +221,11 @@ class V2WidebandNPZDataset(Dataset):
             raise ValueError(
                 f"Wideband shard {shard_path} is missing both H and H_taps_ri; "
                 "at least one channel representation is required."
+            )
+        if bool(getattr(v2_cfg, "REQUIRE_R_F_SUPERVISION", False)) and (R_f is None):
+            raise ValueError(
+                f"Wideband shard {shard_path} missing per-tone covariance key "
+                f"({getattr(v2_cfg, 'WIDEBAND_R_F_KEY', 'R_f')})."
             )
 
         if H is None:
@@ -224,6 +242,8 @@ class V2WidebandNPZDataset(Dataset):
             "K": torch.tensor(K, dtype=torch.long),
             "snr": torch.tensor(snr, dtype=torch.float32),
             "R": self._to_tensor(R),
+            # Empty tensor placeholder keeps default collate stable when R_f is absent.
+            "R_f": self._to_tensor(R_f) if R_f is not None else torch.zeros((0,), dtype=torch.float32),
             "H_taps": h_taps,
         }
         return sample

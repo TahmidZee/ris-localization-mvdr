@@ -63,6 +63,9 @@ class V2SysConfig:
         self.PILOT_SUBCARRIERS = 256
         self.WIDEBAND_Y_KEY = "y"
         self.WIDEBAND_H_TAPS_KEY = "H_taps_ri"
+        self.WIDEBAND_R_F_KEY = "R_f"
+        self.WIDEBAND_R_F_ALT_KEYS = ("R_f_true", "R_f", "Rf")
+        self.REQUIRE_R_F_SUPERVISION = False
 
         # ── covariance / inference (inherited) ──
         self.C_EPS = getattr(base, "C_EPS", 1.0)
@@ -107,6 +110,7 @@ class V2ModelConfig:
         self.NUM_LAYERS = 4             # alias for consistency
         self.DROPOUT = 0.1              # lighter than v1 (0.20)
         self.FACTOR_RANK = 10           # 2 × K_MAX
+        self.USE_TONE_FACTOR_HEAD = True
 
         # ── training ──
         self.BATCH_SIZE = 64
@@ -124,6 +128,9 @@ class V2ModelConfig:
         self.WIDEBAND_TARGET_F = 64
 
         # ── loss weights ──
+        self.LAM_COV_MAIN = 1.0
+        self.LAM_COV_F = 0.5
+        self.LAM_COV_CONSIST = 0.1
         self.LAM_SUBSPACE = 0.0         # off by default (Phase 1a)
         self.LAM_PEAK = 0.0             # off by default (Phase 1a)
 

@@ -13,6 +13,7 @@ This section tracks what is actually implemented on `v2/physics-first-wideband` 
 
 - Implemented scaffold files: `ris_pytorch_pipeline/v2/{config_v2.py,model_v2.py,loss_v2.py,dataset_v2.py,train_v2.py,overfit_v2.py,run_v2.py}`.
 - Implemented model objective: covariance-only prediction via low-rank PSD factor (`R_pred = A A^H + eps I`), no slot heads.
+- Implemented wideband hardening: per-tone covariance head (`R_f_pred`) and loss path (`NMSE_f` + mean-to-broadband consistency).
 - Implemented trainer behavior: no curriculum, no permutation loss stack, NMSE-primary loss path.
 - Not implemented yet: Phase-2 wideband data generator (`F>1` shards), tap-domain `H_tap` ingestion, and production-wideband eval runs.
 

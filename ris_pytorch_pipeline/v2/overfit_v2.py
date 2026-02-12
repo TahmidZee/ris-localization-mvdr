@@ -26,6 +26,9 @@ def run_overfit_v2(
     v2_mdl.HEAD_LR_MULT = float(head_lr_mult)
     v2_mdl.WEIGHT_DECAY = 0.0
     v2_mdl.USE_AMP = False
+    v2_mdl.LAM_COV_MAIN = 1.0
+    v2_mdl.LAM_COV_F = 1.0
+    v2_mdl.LAM_COV_CONSIST = 0.05
     v2_mdl.LAM_SUBSPACE = 0.0
     v2_mdl.LAM_PEAK = 0.0
 

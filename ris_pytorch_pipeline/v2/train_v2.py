@@ -77,13 +77,26 @@ class V2Trainer:
             ptr = batch["ptr"]
             K = batch["K"]
             R_true = batch["R"]
+            R_f_true = batch.get("R_f", None)
             snr = batch.get("snr", batch.get("snr_db", None))
             H_taps = batch.get("H_taps", None)
         # TensorDataset path, if used later.
         elif isinstance(batch, (list, tuple)):
             y, H, codes, ptr, K, R_true = batch[:6]
-            snr = batch[6] if len(batch) > 6 else None
-            H_taps = batch[7] if len(batch) > 7 else None
+            R_f_true = None
+            snr = None
+            H_taps = None
+            if len(batch) > 6:
+                cand = batch[6]
+                # If the 7th element looks like per-tone covariance, treat it as R_f_true.
+                if torch.is_tensor(cand) and cand.dim() >= 4:
+                    R_f_true = cand
+                    snr = batch[7] if len(batch) > 7 else None
+                    H_taps = batch[8] if len(batch) > 8 else None
+                else:
+                    # Backward-compatible tuple layout: (.., R_true, snr, H_taps)
+                    snr = cand
+                    H_taps = batch[7] if len(batch) > 7 else None
         else:
             raise TypeError(f"Unsupported batch type: {type(batch)}")
 
@@ -93,6 +106,10 @@ class V2Trainer:
         ptr = ptr.to(self.device, non_blocking=True).float()
         K = K.to(self.device, non_blocking=True).long()
         R_true = R_true.to(self.device, non_blocking=True)
+        if R_f_true is not None and torch.is_tensor(R_f_true):
+            R_f_true = R_f_true.to(self.device, non_blocking=True)
+            if R_f_true.numel() == 0:
+                R_f_true = None
         if snr is not None:
             snr = snr.to(self.device, non_blocking=True).float()
 
@@ -103,10 +120,10 @@ class V2Trainer:
                 if torch.is_tensor(value):
                     H_taps_dev[key] = value.to(self.device, non_blocking=True).float()
 
-        return y, H, codes, ptr, K, R_true, snr, H_taps_dev
+        return y, H, codes, ptr, K, R_true, R_f_true, snr, H_taps_dev
 
     def _step(self, batch, train_mode: bool = True):
-        y, H, codes, ptr, K, R_true, snr, H_taps = self._unpack_batch(batch)
+        y, H, codes, ptr, K, R_true, R_f_true, snr, H_taps = self._unpack_batch(batch)
 
         with torch.set_grad_enabled(train_mode):
             with torch.cuda.amp.autocast(enabled=self.use_amp):
@@ -125,6 +142,9 @@ class V2Trainer:
                 loss, info = self.loss_fn(
                     R_pred,
                     R_true,
+                    R_f_pred=out.get("R_f_pred", None),
+                    R_f_true=R_f_true,
+                    R_f_mean_pred=out.get("R_f_mean_pred", None),
                     K_true=K,
                     ptr_gt=ptr,
                     snr_db=snr,

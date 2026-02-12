@@ -26,12 +26,15 @@ class FreqPool(nn.Module):
         self.query = nn.Parameter(torch.randn(d_model) * 0.02)
         self.key_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x_f: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_f: torch.Tensor, return_attn: bool = False):
         # x_f: [B, F, D]
         keys = self.key_proj(x_f)  # [B, F, D]
         logits = (keys * self.query.view(1, 1, -1)).sum(-1) / math.sqrt(float(keys.shape[-1]))
         attn = torch.softmax(logits, dim=1).unsqueeze(-1)  # [B, F, 1]
-        return (attn * x_f).sum(1)  # [B, D]
+        pooled = (attn * x_f).sum(1)  # [B, D]
+        if return_attn:
+            return pooled, attn.squeeze(-1)  # [B, D], [B, F]
+        return pooled
 
 
 class CovariancePredictor(nn.Module):
@@ -95,6 +98,7 @@ class CovariancePredictor(nn.Module):
         self.L = L
         self.D = D
         self.rank = rank
+        self.use_tone_factor_head = bool(getattr(v2_mdl, "USE_TONE_FACTOR_HEAD", True))
 
         # ── y path: Conv1D stem + Transformer encoder ──
         self.y_conv1 = nn.Conv1d(M * 2, D // 2, kernel_size=5, padding=2)
@@ -129,23 +133,32 @@ class CovariancePredictor(nn.Module):
             nn.GELU(),
             nn.Linear(D, N * rank * 2),
         )
+        self.tone_factor_head = nn.Sequential(
+            nn.Linear(D, D),
+            nn.GELU(),
+            nn.Linear(D, N * rank * 2),
+        )
 
         self._init_weights()
 
     # ------------------------------------------------------------------
     def _init_weights(self):
         """Conservative init for factor head to keep initial R̂ ≈ small."""
-        for m in self.factor_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="linear")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        # Last layer: small std so initial A is near zero → R̂ ≈ ε I
-        last_linear = list(self.factor_head.modules())[-1]
-        if isinstance(last_linear, nn.Linear):
-            nn.init.normal_(last_linear.weight, std=0.01)
-            if last_linear.bias is not None:
-                nn.init.zeros_(last_linear.bias)
+        def _init_head(head: nn.Sequential):
+            for m in head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="linear")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            last_linear = list(head.modules())[-1]
+            if isinstance(last_linear, nn.Linear):
+                nn.init.normal_(last_linear.weight, std=0.01)
+                if last_linear.bias is not None:
+                    nn.init.zeros_(last_linear.bias)
+
+        # Last layer small std keeps initial R close to eps*I and stabilizes early training.
+        _init_head(self.factor_head)
+        _init_head(self.tone_factor_head)
 
     # ------------------------------------------------------------------
     def _factor_to_cov(self, factor_vec: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -172,6 +185,31 @@ class CovariancePredictor(nn.Module):
         R = trace_norm_torch(R, target_trace=float(self.N))
 
         return R, A
+
+    # ------------------------------------------------------------------
+    def _factor_to_cov_f(self, factor_vec_f: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert per-tone factor vectors to PSD per-tone covariance.
+
+        factor_vec_f: [B, F, N*rank*2]
+        Returns:
+            R_f_pred: [B, F, N, N] complex
+            A_f_pred: [B, F, N, rank] complex
+        """
+        B, F_sub = factor_vec_f.shape[:2]
+        fv = factor_vec_f.float().view(B, F_sub, 2, self.N, self.rank)
+        A_f = torch.complex(fv[:, :, 0], fv[:, :, 1])  # [B, F, N, rank]
+
+        R_f = A_f @ A_f.conj().transpose(-2, -1)  # [B, F, N, N]
+        eye = torch.eye(self.N, device=R_f.device, dtype=R_f.dtype).view(1, 1, self.N, self.N)
+        R_f = R_f + self.eps_psd * eye
+
+        # Reuse v1 helpers by flattening B*F.
+        R_f_flat = R_f.reshape(B * F_sub, self.N, self.N)
+        R_f_flat = hermitize_torch(R_f_flat)
+        R_f_flat = trace_norm_torch(R_f_flat, target_trace=float(self.N))
+        R_f = R_f_flat.reshape(B, F_sub, self.N, self.N)
+        return R_f, A_f
 
     # ------------------------------------------------------------------
     def _encode_h(self, H: torch.Tensor) -> torch.Tensor:
@@ -220,16 +258,22 @@ class CovariancePredictor(nn.Module):
         return self.transformer(x).mean(1)  # [B, D]
 
     # ------------------------------------------------------------------
-    def _encode_y(self, y: torch.Tensor) -> torch.Tensor:
+    def _encode_y(self, y: torch.Tensor):
         """
         Encode y for both narrowband and wideband paths.
 
         Supported:
           - [B, L, M, 2]
           - [B, L, F, M, 2] (frequency pooled)
+
+        Returns:
+          x_global: [B, D]
+          x_f: [B, F, D] or None
+          f_attn: [B, F] or None
         """
         if y.dim() == 4:
-            return self._encode_y_single(y)
+            x = self._encode_y_single(y)
+            return x, None, None
         if y.dim() == 5:
             bsz, snapshots, n_freq, n_ant, _ = y.shape
             if n_ant != self.M:
@@ -237,7 +281,8 @@ class CovariancePredictor(nn.Module):
             # Flatten (B, F) and reuse narrowband encoder, then pool over F.
             y_bf = y.permute(0, 2, 1, 3, 4).reshape(bsz * n_freq, snapshots, n_ant, 2)
             x_f = self._encode_y_single(y_bf).reshape(bsz, n_freq, self.D)  # [B, F, D]
-            return self.freq_pool(x_f)
+            x_global, f_attn = self.freq_pool(x_f, return_attn=True)
+            return x_global, x_f, f_attn
         raise ValueError(f"Unsupported y shape {tuple(y.shape)}; expected [B,L,M,2] or [B,L,F,M,2]")
 
     # ------------------------------------------------------------------
@@ -253,7 +298,7 @@ class CovariancePredictor(nn.Module):
         B = y.shape[0]
 
         # ── y features ──
-        x = self._encode_y(y)  # [B, D]
+        x_global, x_f, f_attn = self._encode_y(y)  # [B, D], optional per-tone features
 
         # ── H features (tap-domain preferred when available) ──
         H_tap_feat = self._encode_h_taps(H_taps)
@@ -265,13 +310,27 @@ class CovariancePredictor(nn.Module):
         c_feat = F.gelu(self.codes_conv(c_seq)).mean(2)  # [B, D/2]
 
         # ── fuse ──
-        feats = F.gelu(self.fusion(torch.cat([x, H_feat, c_feat], dim=1)))  # [B, D]
+        feats = F.gelu(self.fusion(torch.cat([x_global, H_feat, c_feat], dim=1)))  # [B, D]
 
-        # ── factor head ──
+        # ── global covariance head ──
         factor_vec = self.factor_head(feats)  # [B, N*rank*2]
         R_pred, A_pred = self._factor_to_cov(factor_vec)
 
-        return {
+        out = {
             "R_pred": R_pred,      # [B, N, N] complex
             "A_pred": A_pred,      # [B, N, rank] complex
+            "factor_vec": factor_vec,
         }
+
+        # ── per-tone covariance head (wideband supervision path) ──
+        if self.use_tone_factor_head and (x_f is not None):
+            Bf, F_sub, _ = x_f.shape
+            factor_vec_f = self.tone_factor_head(x_f.reshape(Bf * F_sub, self.D)).reshape(Bf, F_sub, -1)
+            R_f_pred, A_f_pred = self._factor_to_cov_f(factor_vec_f)
+            out["R_f_pred"] = R_f_pred                # [B, F, N, N]
+            out["A_f_pred"] = A_f_pred                # [B, F, N, rank]
+            out["R_f_mean_pred"] = R_f_pred.mean(dim=1)  # [B, N, N]
+            out["factor_vec_f"] = factor_vec_f
+            if f_attn is not None:
+                out["freq_attn"] = f_attn             # [B, F]
+        return out
