@@ -355,21 +355,18 @@ class HybridModel(nn.Module):
             slot_hidden = int(getattr(mdl_cfg, "SLOT_HEAD_HIDDEN_DIM", D // 2))
             _slot_last_linear = nn.Linear(slot_hidden, 5)  # [phi_raw, theta_raw, r_raw, p_raw, mask_logit]
             # -----------------------------------------------------------
-            # CRITICAL FIX (2026-02-12): Use Kaiming-scale init (std=0.10).
-            #
             # HISTORY:
-            #   v1 (02-10): std=0.01 — intended to keep predictions near bias.
-            #   PROBLEM: With slot_hidden=256, MLP output magnitude ≈ sqrt(256)*0.01 = 0.16
-            #   while bias magnitude is ~1.10. The bias dominates completely, and the
-            #   backward gradient through W_last is attenuated ~10× (dL/dx = W^T @ dL/dout).
-            #   This starves the entire backbone of gradient → constant prediction trap.
-            #
-            #   v2 (02-12): std=0.10 — Kaiming-scale for fan_in=256.
-            #   MLP output magnitude ≈ sqrt(256)*0.10 = 1.6, comparable to bias.
-            #   Backbone gradient is 10× stronger. With sorted canonical matching,
-            #   noisy initial predictions are handled gracefully (sorting is deterministic).
+            #   v1 (02-10): std=0.01 — bias dominated, backbone starved.
+            #   v2 (02-12): std=0.10 + tanh — MLP output ~1.6 pushed tanh into
+            #     saturation (tanh'(2.15)=0.04), causing all slots to lock at ±60°.
+            #   v3 (02-12): std=0.05 + atan — MLP output ~0.8, bias ~1.0 (for ±30°).
+            #     The atan activation means even at total pre-act ~1.8, gradient is
+            #     0.15 (vs tanh's 0.13 at the same point). And the 3-sigma tail at
+            #     ~2.6 has atan grad 0.08 (vs tanh's 0.007). Much more robust.
+            #     Backward gradient: std × atan_grad ≈ 0.05 × 0.32 = 0.016
+            #     (5× better than v1's 0.01 × 0.36 = 0.004).
             # -----------------------------------------------------------
-            nn.init.normal_(_slot_last_linear.weight, mean=0.0, std=0.10)
+            nn.init.normal_(_slot_last_linear.weight, mean=0.0, std=0.05)
             nn.init.zeros_(_slot_last_linear.bias)
             self.slot_head = nn.Sequential(
                 nn.Linear(D, slot_hidden),
@@ -395,24 +392,25 @@ class HybridModel(nn.Module):
             PHI_SCALE_INIT = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))
             self.slot_output_bias = nn.Parameter(torch.zeros(Kmax, 5))
             # Spread slots across the FOV. The spread fraction controls how much of the
-            # FOV the bias covers. Smaller spread keeps tanh in the linear regime
-            # (better gradients), while larger spread helps sorted matching consistency.
+            # FOV the bias covers. With the atan activation, the bias is computed as:
+            #   phi = (2/π) * atan(phi_raw) * PHI_SCALE → phi_raw = tan(ratio * π/2)
+            # where ratio = target_phi / PHI_SCALE ∈ (-1, 1).
             #
             # HISTORY:
-            #   v1 (02-07): 80% FOV (±48°) → atanh(0.8)=1.10, tanh'=0.36 (decent)
-            #   v2 (02-12): 50% FOV (±30°) → atanh(0.5)=0.55, tanh'=0.75 (much better)
-            #   With std=0.10 init on the MLP, the output magnitude (~1.6) is larger
-            #   than the bias (~0.55), so the model can immediately produce input-dependent
-            #   predictions. Sorted matching handles the initial noise.
+            #   v1 (02-07): tanh + 80% FOV (±48°) → atanh(0.8)=1.10, tanh'=0.36
+            #   v2 (02-12): tanh + 50% FOV (±30°) → atanh(0.5)=0.55, tanh'=0.75
+            #   v3 (02-12): atan + 50% FOV (±30°) → tan(0.25π)=1.0, atan'=0.318
+            #   The atan gradient at x=1.0 (outer slot) is 0.318 — adequate. And
+            #   unlike tanh, even at x=5 the gradient is 0.024 (vs tanh's 3.6e-5).
             _bias_spread_deg = float(getattr(mdl_cfg, "SLOT_BIAS_SPREAD_DEG", 30.0))
             with torch.no_grad():
                 for k_idx in range(Kmax):
                     target_phi_deg = -_bias_spread_deg + 2.0 * _bias_spread_deg * k_idx / max(1, Kmax - 1)
                     target_phi_rad = target_phi_deg * math.pi / 180.0
-                    # Inverse of tanh scaling: phi_raw = atanh(target / PHI_SCALE)
+                    # Inverse of atan scaling: phi = (2/π)*atan(x)*S → x = tan(ratio*π/2)
                     ratio = target_phi_rad / PHI_SCALE_INIT
-                    ratio = max(-0.99, min(0.99, ratio))  # clamp for atanh safety
-                    self.slot_output_bias.data[k_idx, 0] = math.atanh(ratio)
+                    ratio = max(-0.95, min(0.95, ratio))  # clamp to avoid tan(±π/2)=±inf
+                    self.slot_output_bias.data[k_idx, 0] = math.tan(ratio * math.pi / 2.0)
                 # power bias: softplus(0) ≈ 0.69 (reasonable signal)
                 # mask bias: sigmoid(0) = 0.5 (balanced start)
                 # theta, r biases: 0 (centered)
@@ -769,8 +767,24 @@ class HybridModel(nn.Module):
 
             PHI_SCALE = float(getattr(cfg, "ANGLE_RANGE_PHI", math.pi / 3.0))      # ±60°
             THETA_SCALE = float(getattr(cfg, "ANGLE_RANGE_THETA", math.pi / 6.0))  # ±30°
-            aux_phi = torch.tanh(phi_raw) * PHI_SCALE
-            aux_theta = torch.tanh(theta_raw) * THETA_SCALE
+            # -----------------------------------------------------------
+            # CRITICAL FIX (2026-02-12): Replace tanh with atan activation.
+            #
+            # PROBLEM: tanh saturates exponentially — at x=2, tanh'=0.07; at x=5,
+            # tanh'=3.6e-5 (effectively zero). With MLP output noise ~1.6 + bias ~0.55,
+            # the pre-activation easily reaches 2+ where the gradient is dead.
+            # Once predictions drift to ±60° (tanh ceiling), there is NO gradient
+            # to pull them back → permanent "constant prediction trap" at ±60°.
+            #
+            # FIX: (2/π)·atan(x) has the same range (-1, +1) as tanh, but its
+            # gradient decays as 1/(1+x²) — polynomially, not exponentially.
+            #   x=2: atan grad=0.127 (vs tanh 0.07)  — 1.8× better
+            #   x=5: atan grad=0.024 (vs tanh 3.6e-5) — 667× better
+            # The model can ALWAYS recover from extreme predictions.
+            # -----------------------------------------------------------
+            _atan_scale = 2.0 / math.pi  # maps atan output from (-π/2,π/2) to (-1,1)
+            aux_phi = _atan_scale * torch.atan(phi_raw) * PHI_SCALE
+            aux_theta = _atan_scale * torch.atan(theta_raw) * THETA_SCALE
 
             # Range: positive + scaled to training regime
             R_MIN = float(getattr(cfg, "RANGE_R", (0.5, 10.0))[0])

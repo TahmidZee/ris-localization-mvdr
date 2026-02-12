@@ -32,17 +32,21 @@ mdl_cfg.CLIP_NORM = 10.0              # Relax gradient clipping
 
 # CRITICAL: Slot head init that allows backbone gradients to flow
 mdl_cfg.SLOT_QUERY_INIT_STD = 1.0     # was 3.0; queries drowned cross-attention signal
-# NOTE: _slot_last_linear init is now std=0.10 in model.py (was 0.01)
+# NOTE: _slot_last_linear init is now std=0.05 in model.py (atan activation, was tanh+0.10)
 
 # Keep diversity and sorted losses to help differentiate slots
 mdl_cfg.LAM_SLOT_DIVERSITY = 0.5
 mdl_cfg.LAM_AUX_SORTED = 2.0
 mdl_cfg.LAM_AUX_MASK_BCE = 0.2
 
-# Phase: joint with reasonable weights
+# Phase: PURE GEOMETRY test (no NMSE)
+# The overfit test isolates geometry learning. NMSE (structural R) adds a second
+# gradient path that can fight geometry gradients and cause divergence (e.g., all
+# slots converging to +60° because NMSE gradient through steering vectors dominates).
+# If geometry works here, we add NMSE back in the full training.
 cfg.PHASE_LOSS = cfg.PHASE_LOSS or {}
 cfg.PHASE_LOSS["joint"] = {
-    "lam_cov": 0.3,   # Include NMSE from start
+    "lam_cov": 0.0,   # NO NMSE — pure geometry learning test
     "lam_aux": 1.0,   # Geometry loss active
     "lam_subspace_align": 0.0,
     "lam_peak_contrast": 0.0,
