@@ -1,0 +1,250 @@
+"""
+V2 CovariancePredictor — predicts low-rank covariance factors from raw inputs.
+
+Design:  y-encoder (Conv1D + Transformer) + H/code projections
+         → fusion → factor head → A [B, N, R] complex
+         → R̂ = A Aᴴ + ε I   (guaranteed PSD)
+
+No angle/range heads.  Geometry comes from MUSIC on R̂.
+"""
+
+from __future__ import annotations
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .config_v2 import v2_cfg, v2_mdl
+
+
+class FreqPool(nn.Module):
+    """Attention pooling over subcarrier features [B, F, D] -> [B, D]."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.key_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x_f: torch.Tensor) -> torch.Tensor:
+        # x_f: [B, F, D]
+        keys = self.key_proj(x_f)  # [B, F, D]
+        logits = (keys * self.query.view(1, 1, -1)).sum(-1) / math.sqrt(float(keys.shape[-1]))
+        attn = torch.softmax(logits, dim=1).unsqueeze(-1)  # [B, F, 1]
+        return (attn * x_f).sum(1)  # [B, D]
+
+
+class CovariancePredictor(nn.Module):
+    """
+    Predict a PSD covariance matrix from received signal + channel/code features.
+
+    Inputs
+    ------
+    y      : [B, L, (F,) M, 2]  received signal (RI)
+    H      : [B, L, M, 2]       direct channel (RI)
+    codes  : [B, L, N, 2]       RIS codebook (RI)
+
+    Output dict
+    -----------
+    R_pred : [B, N, N] complex   predicted covariance (Hermitian, PSD, trace-normalised)
+    A_pred : [B, N, R] complex   low-rank factor (for diagnostics)
+    """
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _choose_heads(D: int, pref: int = 8) -> int:
+        if D % pref == 0 and pref >= 1:
+            return pref
+        for h in [8, 6, 4, 2, 1]:
+            if h <= D and D % h == 0:
+                return h
+        return 1
+
+    # ------------------------------------------------------------------
+    # init
+    # ------------------------------------------------------------------
+    def __init__(
+        self,
+        M: int | None = None,
+        N: int | None = None,
+        L: int | None = None,
+        D: int | None = None,
+        rank: int | None = None,
+        n_heads: int | None = None,
+        n_layers: int | None = None,
+        ff_dim: int | None = None,
+        dropout: float | None = None,
+        eps_psd: float | None = None,
+    ):
+        super().__init__()
+        M = M or v2_cfg.M
+        N = N or v2_cfg.N
+        L = L or v2_cfg.L
+        D = D or v2_mdl.D_MODEL
+        rank = rank or v2_mdl.FACTOR_RANK
+        n_heads = n_heads or v2_mdl.NUM_HEADS
+        n_layers = n_layers or v2_mdl.N_LAYERS
+        ff_dim = ff_dim or v2_mdl.FF_DIM
+        dropout = dropout if dropout is not None else v2_mdl.DROPOUT
+        self.eps_psd = eps_psd if eps_psd is not None else v2_mdl.EPS_PSD
+
+        self.M = M
+        self.N = N
+        self.L = L
+        self.D = D
+        self.rank = rank
+
+        # ── y path: Conv1D stem + Transformer encoder ──
+        self.y_conv1 = nn.Conv1d(M * 2, D // 2, kernel_size=5, padding=2)
+        self.y_dw = nn.Conv1d(D // 2, D // 2, kernel_size=3, padding=1, groups=D // 2)
+        self.y_conv2 = nn.Conv1d(D // 2, D, kernel_size=1)
+
+        nheads = self._choose_heads(D, n_heads)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=D,
+            nhead=nheads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, n_layers)
+        self.freq_pool = FreqPool(D)
+
+        # ── H path ──
+        self.H_proj = nn.Linear(L * M * 2, D // 2)
+
+        # ── codes path ──
+        self.codes_conv = nn.Conv1d(N * 2, D // 2, kernel_size=5, padding=2)
+
+        # ── fusion ──
+        self.fusion = nn.Linear(D + D // 2 + D // 2, D)
+
+        # ── factor head: outputs [B, N * rank * 2] (real/imag interleaved) ──
+        self.factor_head = nn.Sequential(
+            nn.Linear(D, D),
+            nn.GELU(),
+            nn.Linear(D, N * rank * 2),
+        )
+
+        self._init_weights()
+
+    # ------------------------------------------------------------------
+    def _init_weights(self):
+        """Conservative init for factor head to keep initial R̂ ≈ small."""
+        for m in self.factor_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="linear")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        # Last layer: small std so initial A is near zero → R̂ ≈ ε I
+        last_linear = list(self.factor_head.modules())[-1]
+        if isinstance(last_linear, nn.Linear):
+            nn.init.normal_(last_linear.weight, std=0.01)
+            if last_linear.bias is not None:
+                nn.init.zeros_(last_linear.bias)
+
+    # ------------------------------------------------------------------
+    def _factor_to_cov(self, factor_vec: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert raw factor vector to PSD covariance.
+
+        factor_vec: [B, N * rank * 2]  (real/imag interleaved)
+        Returns:
+            R_pred: [B, N, N] complex  (Hermitian, PSD, trace-normalised)
+            A:      [B, N, rank] complex
+        """
+        B = factor_vec.shape[0]
+        # Full precision for complex construction
+        fv = factor_vec.float()
+        fv = fv.view(B, 2, self.N, self.rank)
+        A = torch.complex(fv[:, 0], fv[:, 1])  # [B, N, rank] complex64
+
+        # R̂ = A Aᴴ + ε I  (guaranteed PSD)
+        R = A @ A.conj().transpose(-2, -1)  # [B, N, N]
+        R = R + self.eps_psd * torch.eye(self.N, device=R.device, dtype=R.dtype).unsqueeze(0)
+
+        # Hermitize (defensive)
+        R = 0.5 * (R + R.conj().transpose(-2, -1))
+
+        # Trace-normalise to N (MUSIC convention)
+        tr = torch.diagonal(R, dim1=-2, dim2=-1).real.sum(-1).clamp_min(1e-9)
+        R = R * (float(self.N) / tr).view(B, 1, 1)
+
+        return R, A
+
+    # ------------------------------------------------------------------
+    def _encode_y_single(self, y_single: torch.Tensor) -> torch.Tensor:
+        """
+        Encode narrowband y input.
+
+        y_single: [B, L, M, 2] -> [B, D]
+        """
+        bsz, snapshots = y_single.shape[0], y_single.shape[1]
+        y_flat = y_single.reshape(bsz, snapshots, self.M * 2).permute(0, 2, 1)  # [B, 2M, L]
+        x = F.gelu(self.y_conv1(y_flat))
+        x = self.y_dw(x)
+        x = F.gelu(self.y_conv2(x))  # [B, D, L]
+        x = x.permute(0, 2, 1)  # [B, L, D]
+        return self.transformer(x).mean(1)  # [B, D]
+
+    # ------------------------------------------------------------------
+    def _encode_y(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Encode y for both narrowband and wideband paths.
+
+        Supported:
+          - [B, L, M, 2]
+          - [B, L, F, M, 2] (frequency pooled)
+        """
+        if y.dim() == 4:
+            return self._encode_y_single(y)
+        if y.dim() == 5:
+            bsz, snapshots, n_freq, n_ant, _ = y.shape
+            if n_ant != self.M:
+                raise ValueError(f"Expected M={self.M}, got y.shape[-2]={n_ant}")
+            # Flatten (B, F) and reuse narrowband encoder, then pool over F.
+            y_bf = y.permute(0, 2, 1, 3, 4).reshape(bsz * n_freq, snapshots, n_ant, 2)
+            x_f = self._encode_y_single(y_bf).reshape(bsz, n_freq, self.D)  # [B, F, D]
+            return self.freq_pool(x_f)
+        raise ValueError(f"Unsupported y shape {tuple(y.shape)}; expected [B,L,M,2] or [B,L,F,M,2]")
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        y: torch.Tensor,
+        H: torch.Tensor,
+        codes: torch.Tensor,
+        snr_db: torch.Tensor | None = None,
+        R_samp: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        B = y.shape[0]
+        if H.dim() != 4:
+            raise ValueError(
+                f"Phase-1 expects H shape [B,L,M,2]; got {tuple(H.shape)}. "
+                "Tap-domain H support is planned for later wideband phases."
+            )
+
+        # ── y features ──
+        x = self._encode_y(y)  # [B, D]
+
+        # ── H features ──
+        H_feat = F.gelu(self.H_proj(H.reshape(B, -1)))  # [B, D/2]
+
+        # ── codes features ──
+        Lc = codes.shape[1]
+        c_seq = codes.reshape(B, Lc, self.N * 2).permute(0, 2, 1)  # [B, 2N, Lc]
+        c_feat = F.gelu(self.codes_conv(c_seq)).mean(2)  # [B, D/2]
+
+        # ── fuse ──
+        feats = F.gelu(self.fusion(torch.cat([x, H_feat, c_feat], dim=1)))  # [B, D]
+
+        # ── factor head ──
+        factor_vec = self.factor_head(feats)  # [B, N*rank*2]
+        R_pred, A_pred = self._factor_to_cov(factor_vec)
+
+        return {
+            "R_pred": R_pred,      # [B, N, N] complex
+            "A_pred": A_pred,      # [B, N, rank] complex
+        }
