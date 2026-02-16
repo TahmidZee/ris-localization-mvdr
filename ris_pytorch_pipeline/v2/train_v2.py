@@ -7,6 +7,7 @@ No curriculum. No slot losses. No permutation matching.
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional
+import time
 
 import torch
 from torch.optim import AdamW
@@ -27,6 +28,7 @@ class V2Trainer:
         loss_fn: Optional[V2CovarianceLoss] = None,
         device: Optional[torch.device] = None,
         use_amp: Optional[bool] = None,
+        skip_nmse_eff: bool = False,
     ):
         seed = int(getattr(v2_mdl, "SEED", 42))
         set_seed(seed)
@@ -46,6 +48,9 @@ class V2Trainer:
             T_max=max(1, int(v2_mdl.EPOCHS)),
             eta_min=float(getattr(v2_mdl, "LR_MIN", 1e-6)),
         )
+
+        self.skip_nmse_eff = skip_nmse_eff
+        self._global_step = 0
 
         self.best_val = float("inf")
         Path(v2_cfg.CKPT_DIR).mkdir(parents=True, exist_ok=True)
@@ -179,20 +184,21 @@ class V2Trainer:
             stats[key] = float(value)
 
         # Report physics-aligned effective-cov NMSE as a diagnostic.
-        with torch.no_grad():
-            try:
-                R_eff = build_effective_cov_torch(
-                    out["R_pred"].detach(),
-                    snr_db=snr,
-                    R_samp=None,
-                    beta=0.0,
-                    diag_load=True,
-                    apply_shrink=(snr is not None),
-                    target_trace=float(v2_cfg.N),
-                )
-                stats["nmse_eff"] = float(self.loss_fn._nmse(R_eff, R_true).mean().item())
-            except Exception:
-                pass
+        if not self.skip_nmse_eff:
+            with torch.no_grad():
+                try:
+                    R_eff = build_effective_cov_torch(
+                        out["R_pred"].detach(),
+                        snr_db=snr,
+                        R_samp=None,
+                        beta=0.0,
+                        diag_load=True,
+                        apply_shrink=(snr is not None),
+                        target_trace=float(v2_cfg.N),
+                    )
+                    stats["nmse_eff"] = float(self.loss_fn._nmse(R_eff, R_true).mean().item())
+                except Exception:
+                    pass
         return stats
 
     @staticmethod
@@ -213,7 +219,15 @@ class V2Trainer:
         for bi, batch in enumerate(train_loader):
             if max_batches is not None and bi >= max_batches:
                 break
+            is_first = (self._global_step == 0)
+            if is_first:
+                print("[V2] first batch loaded → forward+backward ...", flush=True)
+            t0 = time.time()
             running.append(self._step(batch, train_mode=True))
+            self._global_step += 1
+            if is_first:
+                dt = time.time() - t0
+                print(f"[V2] first step done in {dt:.2f}s", flush=True)
         return self._avg_stats(running)
 
     @torch.no_grad()

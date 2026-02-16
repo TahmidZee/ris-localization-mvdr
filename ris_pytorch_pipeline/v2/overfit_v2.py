@@ -6,6 +6,7 @@ Goal: verify the covariance model can memorize a fixed tiny subset.
 
 from __future__ import annotations
 import argparse
+import time
 
 from .config_v2 import v2_cfg, v2_mdl
 from .dataset_v2 import build_dataloaders_v2
@@ -90,10 +91,17 @@ def run_overfit_v2(
             flush=True,
         )
 
+    t0 = time.time()
+    print("[OVERFIT V2] creating model …", flush=True)
     model = CovariancePredictor(dropout=0.0)
-    trainer = V2Trainer(model=model, use_amp=False)
+    print(f"[OVERFIT V2] model created ({time.time()-t0:.1f}s), moving to device …", flush=True)
+    trainer = V2Trainer(model=model, use_amp=False, skip_nmse_eff=True)
+    print(f"[OVERFIT V2] trainer ready ({time.time()-t0:.1f}s)", flush=True)
+
     prev_pin_memory = bool(getattr(v2_cfg, "PIN_MEMORY", True))
     v2_cfg.PIN_MEMORY = False
+    print("[OVERFIT V2] building dataloaders (first shard load may be slow) …", flush=True)
+    t1 = time.time()
     tr_loader, va_loader = build_dataloaders_v2(
         n_train=n_samples,
         n_val=n_samples,
@@ -101,7 +109,9 @@ def run_overfit_v2(
         seed=1337,
         shuffle_train=False,
     )
+    print(f"[OVERFIT V2] dataloaders ready ({time.time()-t1:.1f}s)", flush=True)
 
+    print("[OVERFIT V2] starting training …", flush=True)
     try:
         history = trainer.fit(
             tr_loader,

@@ -385,8 +385,8 @@ class CovariancePredictor(nn.Module):
         Encode y for both narrowband and wideband paths.
 
         Supported:
-          - [B, L, M, 2]
-          - [B, L, F, M, 2] (frequency pooled)
+          - [B, L, M, 2]          → narrowband: full transformer over L
+          - [B, L, F, M, 2]       → wideband: conv stem per-tone, transformer over F
 
         Returns:
           x_global: [B, D]
@@ -400,9 +400,22 @@ class CovariancePredictor(nn.Module):
             bsz, snapshots, n_freq, n_ant, _ = y.shape
             if n_ant != self.M:
                 raise ValueError(f"Expected M={self.M}, got y.shape[-2]={n_ant}")
-            # Flatten (B, F) and reuse narrowband encoder, then pool over F.
+            # ── Efficient wideband encoding ──
+            # OLD approach: run B*F sequences through full 4-layer transformer
+            #   → 128 seqs × 64 tokens = massive activation graph, OOM/hang.
+            # NEW approach:
+            #   1) Conv stem per tone, pool over time L  (cheap, no attention)
+            #   2) Transformer over frequency F tokens   (B×F instead of B*F×L)
             y_bf = y.permute(0, 2, 1, 3, 4).reshape(bsz * n_freq, snapshots, n_ant, 2)
-            x_f = self._encode_y_single(y_bf).reshape(bsz, n_freq, self.D)  # [B, F, D]
+            y_flat = y_bf.reshape(bsz * n_freq, snapshots, self.M * 2).permute(0, 2, 1)
+            x = F.gelu(self.y_conv1(y_flat))       # [BF, D/2, L]
+            x = self.y_dw(x)                        # [BF, D/2, L]
+            x = F.gelu(self.y_conv2(x))             # [BF, D,   L]
+            x_f = x.mean(-1).reshape(bsz, n_freq, self.D)  # pool time → [B, F, D]
+
+            # Cross-frequency transformer (F=16 tokens per sample).
+            x_f = self.transformer(x_f)             # [B, F, D]
+
             x_global, f_attn = self.freq_pool(x_f, return_attn=True)
             return x_global, x_f, f_attn
         raise ValueError(f"Unsupported y shape {tuple(y.shape)}; expected [B,L,M,2] or [B,L,F,M,2]")

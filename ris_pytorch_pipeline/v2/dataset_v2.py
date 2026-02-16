@@ -163,7 +163,10 @@ class V2WidebandNPZDataset(Dataset):
     def _get_shard(self, path: str):
         z = self._npz_cache.get(path)
         if z is None:
-            z = np.load(path, allow_pickle=False, mmap_mode="r")
+            # NOTE: mmap_mode is silently IGNORED for .npz files by numpy;
+            # the full array is loaded into RAM on first key access.
+            # We omit it here to avoid false sense of memory safety.
+            z = np.load(path, allow_pickle=False)
             self._npz_cache[path] = z
         return z
 
