@@ -110,6 +110,7 @@ class CovariancePredictor(nn.Module):
         self.D = D
         self.rank = rank
         self.use_tone_factor_head = bool(getattr(v2_mdl, "USE_TONE_FACTOR_HEAD", True))
+        self.tap_count = max(1, int(getattr(v2_cfg, "D_TAPS", 8)))
 
         # ── y path: Conv1D stem + Transformer encoder ──
         self.y_conv1 = nn.Conv1d(M * 2, D // 2, kernel_size=5, padding=2)
@@ -130,7 +131,7 @@ class CovariancePredictor(nn.Module):
 
         # ── H path ──
         self.H_proj = nn.Linear(L * M * 2, D // 2)
-        self.H_tap_proj = nn.LazyLinear(D // 2)
+        self.H_tap_proj = nn.Linear(self.tap_count * M * N * 2, D // 2)
         self.Hf_token_proj = nn.Linear(M + N + 1, D)
         self.Hop_global_proj = nn.Linear(D, D // 2)
         self.freq_op_fuse = nn.Linear(2 * D, D)
@@ -174,7 +175,7 @@ class CovariancePredictor(nn.Module):
         _init_head(self.factor_head)
         _init_head(self.tone_factor_head)
 
-        for layer in [self.Hf_token_proj, self.Hop_global_proj, self.freq_op_fuse]:
+        for layer in [self.H_tap_proj, self.Hf_token_proj, self.Hop_global_proj, self.freq_op_fuse]:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
                 if layer.bias is not None:
@@ -255,10 +256,33 @@ class CovariancePredictor(nn.Module):
         """
         if not H_taps:
             return None
-        h_tap_ri = H_taps.get("H_taps_ri", None)
+        h_tap_key = str(getattr(v2_cfg, "WIDEBAND_H_TAPS_KEY", "H_taps_ri"))
+        h_tap_ri = H_taps.get(h_tap_key, None)
+        if h_tap_ri is None:
+            h_tap_ri = H_taps.get("H_taps_ri", None)
         if h_tap_ri is None:
             return None
-        B = h_tap_ri.shape[0]
+
+        if torch.is_complex(h_tap_ri):
+            h_tap_ri = torch.view_as_real(h_tap_ri)
+        if h_tap_ri.dim() != 5 or h_tap_ri.shape[-1] != 2:
+            raise ValueError(f"Expected H_taps_ri shape [B,P,M,N,2], got {tuple(h_tap_ri.shape)}")
+        if h_tap_ri.shape[2] != self.M or h_tap_ri.shape[3] != self.N:
+            raise ValueError(
+                f"Expected H_taps_ri spatial dims [M,N]=[{self.M},{self.N}], got {tuple(h_tap_ri.shape[2:4])}"
+            )
+
+        B, P = h_tap_ri.shape[0], h_tap_ri.shape[1]
+        if P < self.tap_count:
+            pad = torch.zeros(
+                (B, self.tap_count - P, self.M, self.N, 2),
+                dtype=h_tap_ri.dtype,
+                device=h_tap_ri.device,
+            )
+            h_tap_ri = torch.cat([h_tap_ri, pad], dim=1)
+        elif P > self.tap_count:
+            h_tap_ri = h_tap_ri[:, : self.tap_count]
+
         feat = h_tap_ri.reshape(B, -1).float()
         return F.gelu(self.H_tap_proj(feat))  # [B, D/2]
 
