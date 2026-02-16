@@ -38,12 +38,16 @@ def _estimate_sample_bytes() -> int:
 def _suggest_overfit_batch(n_samples: int) -> tuple[int, float]:
     """
     Suggest a safer overfit batch for wideband settings.
-    Keep raw host batch around ~384 MiB and cap to 32 for optimizer stability.
+    Keep raw host batch modest and account for N^2*F scaling in covariance heads.
     """
     bytes_per = _estimate_sample_bytes()
-    target_raw_batch_bytes = int(384 * 1024 * 1024)
+    target_raw_batch_bytes = int(128 * 1024 * 1024)
     cap = max(1, target_raw_batch_bytes // max(1, bytes_per))
-    cap = min(cap, 32, max(1, int(n_samples)))
+    N = int(getattr(v2_cfg, "N", 144))
+    F = max(1, int(getattr(v2_cfg, "F_SUBCARRIERS", 1)))
+    cov_complexity = N * N * F
+    hard_cap = 8 if cov_complexity >= 1_000_000 else 16
+    cap = min(cap, hard_cap, max(1, int(n_samples)))
     sample_mib = float(bytes_per) / (1024.0 * 1024.0)
     return int(max(1, cap)), sample_mib
 
@@ -88,6 +92,8 @@ def run_overfit_v2(
 
     model = CovariancePredictor(dropout=0.0)
     trainer = V2Trainer(model=model, use_amp=False)
+    prev_pin_memory = bool(getattr(v2_cfg, "PIN_MEMORY", True))
+    v2_cfg.PIN_MEMORY = False
     tr_loader, va_loader = build_dataloaders_v2(
         n_train=n_samples,
         n_val=n_samples,
@@ -96,14 +102,17 @@ def run_overfit_v2(
         shuffle_train=False,
     )
 
-    history = trainer.fit(
-        tr_loader,
-        va_loader,
-        epochs=epochs,
-        train_max_batches=(1 if eff_bs == n_samples else None),
-        val_max_batches=(1 if eff_bs == n_samples else None),
-        save_best=True,
-    )
+    try:
+        history = trainer.fit(
+            tr_loader,
+            va_loader,
+            epochs=epochs,
+            train_max_batches=(1 if eff_bs == n_samples else None),
+            val_max_batches=(1 if eff_bs == n_samples else None),
+            save_best=False,
+        )
+    finally:
+        v2_cfg.PIN_MEMORY = prev_pin_memory
     if history:
         last = history[-1]
         print(

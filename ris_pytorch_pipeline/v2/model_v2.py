@@ -131,7 +131,10 @@ class CovariancePredictor(nn.Module):
 
         # ── H path ──
         self.H_proj = nn.Linear(L * M * 2, D // 2)
-        self.H_tap_proj = nn.Linear(self.tap_count * M * N * 2, D // 2)
+        # Tap encoder uses pooled per-tap descriptors [M + N + power] rather than
+        # flattening [P, M, N, 2], which is prohibitively large at 64x16x256.
+        self.H_tap_feat_dim = M + N + 1
+        self.H_tap_proj = nn.Linear(self.tap_count * self.H_tap_feat_dim, D // 2)
         self.Hf_token_proj = nn.Linear(M + N + 1, D)
         self.Hop_global_proj = nn.Linear(D, D // 2)
         self.freq_op_fuse = nn.Linear(2 * D, D)
@@ -283,7 +286,13 @@ class CovariancePredictor(nn.Module):
         elif P > self.tap_count:
             h_tap_ri = h_tap_ri[:, : self.tap_count]
 
-        feat = h_tap_ri.reshape(B, -1).float()
+        # Compact per-tap descriptor: BS-profile + RIS-profile + tap power.
+        mag = torch.sqrt((h_tap_ri[..., 0] ** 2 + h_tap_ri[..., 1] ** 2).clamp_min(1e-12))  # [B,P,M,N]
+        bs_profile = mag.mean(dim=-1)  # [B,P,M]
+        ris_profile = mag.mean(dim=-2)  # [B,P,N]
+        tap_power = (mag * mag).mean(dim=(-2, -1), keepdim=True)  # [B,P,1]
+        tap_feat = torch.cat([bs_profile, ris_profile, tap_power], dim=-1)  # [B,P,M+N+1]
+        feat = torch.log1p(tap_feat.float()).reshape(B, -1)
         return F.gelu(self.H_tap_proj(feat))  # [B, D/2]
 
     # ------------------------------------------------------------------
