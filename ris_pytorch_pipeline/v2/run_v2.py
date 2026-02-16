@@ -15,6 +15,8 @@ from .train_v2 import run_v2_training
 
 
 def run_check():
+    import torch
+    
     model = CovariancePredictor()
     loss_fn = V2CovarianceLoss()
     print("[V2 CHECK] config loaded", flush=True)
@@ -22,6 +24,34 @@ def run_check():
     print(pformat(vars(v2_cfg)), flush=True)
     print("[V2 CHECK] v2_mdl:", flush=True)
     print(pformat(vars(v2_mdl)), flush=True)
+    
+    # Initialize lazy modules with dummy forward pass
+    B = 2
+    L = v2_cfg.L
+    M = v2_cfg.M
+    N = v2_cfg.N
+    F = getattr(v2_cfg, "F_SUBCARRIERS", 16)
+    
+    # Try wideband path first (most complete)
+    try:
+        y_dummy = torch.randn(B, L, F, M, 2, dtype=torch.float32)
+        H_dummy = torch.randn(B, L, F, M, 2, dtype=torch.float32)
+        codes_dummy = torch.randn(B, L, N, 2, dtype=torch.float32)
+        H_taps_dummy = {
+            "H_taps_ri": torch.randn(B, 8, M, N, 2, dtype=torch.float32),
+            "path_mask": torch.ones(B, 8, dtype=torch.bool),
+            "taus_s": torch.randn(B, 8, dtype=torch.float32) * 1e-9,
+        }
+        with torch.no_grad():
+            _ = model(y_dummy, H_dummy, codes_dummy, H_taps=H_taps_dummy)
+    except Exception:
+        # Fallback to narrowband path
+        y_dummy = torch.randn(B, L, M, 2, dtype=torch.float32)
+        H_dummy = torch.randn(B, L, M, 2, dtype=torch.float32)
+        codes_dummy = torch.randn(B, L, N, 2, dtype=torch.float32)
+        with torch.no_grad():
+            _ = model(y_dummy, H_dummy, codes_dummy)
+    
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[V2 CHECK] model params={n_params}", flush=True)
     print(f"[V2 CHECK] loss={loss_fn.__class__.__name__}", flush=True)
