@@ -72,12 +72,30 @@ def resolve_shards_train_val() -> Tuple[Path, Path, bool]:
     )
 
 
-def fixed_subset(ds, n_cap: Optional[int], seed: int = 1337):
-    """Deterministic subset used for overfit diagnostics."""
+def fixed_subset(
+    ds,
+    n_cap: Optional[int],
+    seed: int = 1337,
+    mode: str = "random",
+    start_idx: int = 0,
+):
+    """
+    Deterministic subset helper.
+
+    mode:
+      - "random": seeded random subset (default).
+      - "head": contiguous local slice [start_idx : start_idx + n_cap].
+    """
     if n_cap is None or int(n_cap) >= len(ds):
         return ds
-    rng = np.random.RandomState(seed)
-    idx = rng.permutation(len(ds))[: int(n_cap)]
+    n_cap = int(n_cap)
+    if mode == "head":
+        start = max(0, int(start_idx))
+        start = min(start, max(0, len(ds) - n_cap))
+        idx = np.arange(start, start + n_cap)
+    else:
+        rng = np.random.RandomState(seed)
+        idx = rng.permutation(len(ds))[:n_cap]
     return Subset(ds, idx.tolist())
 
 
@@ -111,11 +129,14 @@ class V2WidebandNPZDataset(Dataset):
     )
     _OPTIONAL_RF_KEYS_DEFAULT = ("R_f_true", "R_f", "Rf")
 
-    def __init__(self, npz_paths_or_dir):
+    def __init__(self, npz_paths_or_dir, max_cached_shards: Optional[int] = None):
         self.paths: List[str] = []
         self.meta: List[Tuple[str, int]] = []  # (path, n_samples)
         self._npz_cache: Dict[str, Any] = {}
+        self._cache_order: List[str] = []
         self._worker_pid = None
+        cfg_cap = int(getattr(v2_cfg, "MAX_CACHED_SHARDS", 2))
+        self.max_cached_shards = max(1, int(cfg_cap if max_cached_shards is None else max_cached_shards))
 
         def _add_file(p: Path):
             with np.load(p, mmap_mode="r") as z:
@@ -158,16 +179,32 @@ class V2WidebandNPZDataset(Dataset):
         pid = os.getpid()
         if self._worker_pid != pid:
             self._npz_cache = {}
+            self._cache_order = []
             self._worker_pid = pid
 
     def _get_shard(self, path: str):
         z = self._npz_cache.get(path)
+        if z is not None:
+            if path in self._cache_order:
+                self._cache_order.remove(path)
+            self._cache_order.append(path)
+            return z
+
+        if len(self._npz_cache) >= self.max_cached_shards and self._cache_order:
+            old_path = self._cache_order.pop(0)
+            old = self._npz_cache.pop(old_path, None)
+            if old is not None and hasattr(old, "close"):
+                try:
+                    old.close()
+                except Exception:
+                    pass
+
         if z is None:
             # NOTE: mmap_mode is silently IGNORED for .npz files by numpy;
-            # the full array is loaded into RAM on first key access.
-            # We omit it here to avoid false sense of memory safety.
+            # full arrays are materialized on first key access.
             z = np.load(path, allow_pickle=False)
             self._npz_cache[path] = z
+            self._cache_order.append(path)
         return z
 
     @staticmethod
@@ -258,18 +295,21 @@ def build_dataloaders_v2(
     batch_size: Optional[int] = None,
     seed: int = 1337,
     shuffle_train: bool = True,
+    train_subset_mode: str = "random",
+    val_subset_mode: str = "random",
+    max_cached_shards: Optional[int] = None,
 ):
     """Build train/val loaders for v2 (wideband-first)."""
     tr_dir, va_dir, is_wideband = resolve_shards_train_val()
     if is_wideband:
-        ds_tr_full = V2WidebandNPZDataset(tr_dir)
-        ds_va_full = V2WidebandNPZDataset(va_dir)
+        ds_tr_full = V2WidebandNPZDataset(tr_dir, max_cached_shards=max_cached_shards)
+        ds_va_full = V2WidebandNPZDataset(va_dir, max_cached_shards=max_cached_shards)
     else:
         ds_tr_full = ShardNPZDataset(tr_dir)
         ds_va_full = ShardNPZDataset(va_dir)
 
-    ds_tr = fixed_subset(ds_tr_full, n_train, seed=seed)
-    ds_va = fixed_subset(ds_va_full, n_val, seed=seed + 1)
+    ds_tr = fixed_subset(ds_tr_full, n_train, seed=seed, mode=train_subset_mode)
+    ds_va = fixed_subset(ds_va_full, n_val, seed=seed + 1, mode=val_subset_mode)
 
     bs = int(batch_size if batch_size is not None else v2_mdl.BATCH_SIZE)
     num_workers = int(getattr(v2_cfg, "NUM_WORKERS", 0))

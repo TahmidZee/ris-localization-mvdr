@@ -108,8 +108,15 @@ def run_overfit_v2(
         batch_size=eff_bs,
         seed=1337,
         shuffle_train=False,
+        train_subset_mode="head",
+        val_subset_mode="head",
+        max_cached_shards=1,
     )
     print(f"[OVERFIT V2] dataloaders ready ({time.time()-t1:.1f}s)", flush=True)
+    print(
+        "[OVERFIT V2] subset mode=head, max_cached_shards=1 to avoid multi-shard RAM blowups.",
+        flush=True,
+    )
 
     print("[OVERFIT V2] starting training …", flush=True)
     try:
