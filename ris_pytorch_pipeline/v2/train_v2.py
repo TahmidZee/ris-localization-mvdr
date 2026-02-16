@@ -35,7 +35,10 @@ class V2Trainer:
         self.model = (model or CovariancePredictor()).to(self.device)
         self.loss_fn = loss_fn or V2CovarianceLoss()
         self.use_amp = bool(v2_mdl.USE_AMP if use_amp is None else use_amp) and self.device.type == "cuda"
-        self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        else:
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         self.optimizer = self._build_optimizer()
         self.scheduler = CosineAnnealingLR(
@@ -126,7 +129,11 @@ class V2Trainer:
         y, H, codes, ptr, K, R_true, R_f_true, snr, H_taps = self._unpack_batch(batch)
 
         with torch.set_grad_enabled(train_mode):
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+                autocast_ctx = torch.amp.autocast(device_type="cuda", enabled=self.use_amp)
+            else:
+                autocast_ctx = torch.cuda.amp.autocast(enabled=self.use_amp)
+            with autocast_ctx:
                 out = self.model(y, H, codes, snr_db=snr, H_taps=H_taps)
                 R_pred = out["R_pred"]
                 if bool(getattr(v2_cfg, "APPLY_EFFECTIVE_COV_IN_LOSS", False)):

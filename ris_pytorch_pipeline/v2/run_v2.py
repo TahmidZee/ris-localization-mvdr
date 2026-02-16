@@ -80,6 +80,7 @@ def _parse_args():
     parser.add_argument("--epochs", type=int, default=None, help="Override training epochs.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size.")
     parser.add_argument("--overfit-n", type=int, default=200, help="Overfit subset size.")
+    parser.add_argument("--overfit-batch", type=int, default=None, help="Overfit batch size (default: auto-safe).")
     parser.add_argument("--overfit-epochs", type=int, default=200, help="Overfit epochs.")
     parser.add_argument("--overfit-lr", type=float, default=1e-3, help="Overfit backbone LR.")
     parser.add_argument("--overfit-head-lr-mult", type=float, default=4.0, help="Overfit head LR multiplier.")
@@ -103,6 +104,7 @@ def main():
             epochs=args.overfit_epochs,
             lr_backbone=args.overfit_lr,
             head_lr_mult=args.overfit_head_lr_mult,
+            batch_size=args.overfit_batch,
         )
         return
 
