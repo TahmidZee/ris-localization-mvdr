@@ -5,6 +5,7 @@ from .dataset import (
     prepare_shards,
     prepare_split_shards,
     prepare_split_shards_wideband,
+    convert_wideband_npz_to_mmap,
     set_sampling_overrides_from_cfg,
 )
 from .train import Trainer
@@ -71,7 +72,7 @@ def main():
     g1w.add_argument("--n-train", type=int, default=20000)
     g1w.add_argument("--n-val",   type=int, default=4000)
     g1w.add_argument("--n-test",  type=int, default=4000)
-    g1w.add_argument("--shard", type=int, default=5000)
+    g1w.add_argument("--shard", type=int, default=256)
     g1w.add_argument("--L", type=int, default=16)
     g1w.add_argument("--F", type=int, default=16)
     g1w.add_argument("--p-max", type=int, default=8, help="Maximum tap paths")
@@ -79,8 +80,10 @@ def main():
     g1w.add_argument("--bw-hz", type=float, default=50e6)
     g1w.add_argument("--delay-max-ns", type=float, default=150.0)
     g1w.add_argument("--phase-bits", type=int, default=3)
+    g1w.add_argument("--format", type=str, choices=["npz", "mmap"], default="mmap",
+                     help="Shard output format (mmap recommended for large wideband datasets).")
     g1w.add_argument("--seed", type=int, default=42)
-    g1w.add_argument("--out_dir", type=str, default="data_shards_ofdm_tr38901")
+    g1w.add_argument("--out_dir", type=str, default="data_shards_ofdm_tr38901_mmap")
     # same robust sampling args
     for g in (g1w,):
         g.add_argument("--phi-fov-deg", type=float, default=60.0)
@@ -97,6 +100,14 @@ def main():
         g.add_argument("--dr-dropout-p", type=float, default=0.03)
         g.add_argument("--dr-wav-jitter", type=float, default=0.002)
         g.add_argument("--dr-dspacing-jitter", type=float, default=0.005)
+
+    # --- convert existing wideband npz -> mmap shards ---
+    g1c = sub.add_parser("convert-wideband-npz-to-mmap", help="Convert existing wideband NPZ shards to mmap shard dirs")
+    g1c.add_argument("--src-dir", type=str, required=True, help="Source root containing wideband NPZ shards")
+    g1c.add_argument("--dst-dir", type=str, default="data_shards_ofdm_tr38901_mmap", help="Destination mmap shard root")
+    g1c.add_argument("--no-splits", action="store_true", help="Treat src as flat *.npz folder (not train/val/test)")
+    g1c.add_argument("--overwrite", action="store_true", help="Overwrite destination shard dirs if they exist")
+    g1c.add_argument("--max-shards-per-split", type=int, default=0, help="0 means all shards; >0 limits for test conversion")
 
     # --- train ---
     g2 = sub.add_parser("train", help="Train model")
@@ -208,7 +219,17 @@ def main():
                 bw_hz=args.bw_hz,
                 max_delay_ns=args.delay_max_ns,
                 phase_bits=args.phase_bits,
+                output_format=args.format,
             )
+
+    elif args.cmd == "convert-wideband-npz-to-mmap":
+        convert_wideband_npz_to_mmap(
+            src_root=Path(args.src_dir),
+            dst_root=Path(args.dst_dir),
+            include_splits=(not bool(args.no_splits)),
+            overwrite=bool(args.overwrite),
+            max_shards_per_split=int(args.max_shards_per_split),
+        )
 
     elif args.cmd == "train":
         t = Trainer(from_hpo=args.from_hpo)

@@ -1,4 +1,5 @@
 # ris_pytorch_pipeline/dataset.py
+import json
 import numpy as np, math, os
 from torch.utils.data import Dataset
 import torch
@@ -261,6 +262,27 @@ class RISDataset(Dataset):
                     K=int(K), snr_db=snr_db)
 
 def to_ri(z): return np.stack([z.real, z.imag], axis=-1).astype(np.float32)
+
+
+def _write_wideband_shard_npz(out_path: Path, payload: dict):
+    np.savez(out_path, **payload)
+
+
+def _write_wideband_shard_mmap(out_dir: Path, payload: dict):
+    """
+    Write one wideband shard as per-field .npy arrays (mmap-friendly).
+    This avoids NPZ behavior where first key access can materialize huge arrays.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, arr in payload.items():
+        np.save(out_dir / f"{key}.npy", np.asarray(arr), allow_pickle=False)
+    meta = {
+        "n_samples": int(payload["y"].shape[0]),
+        "format": "wideband_mmap_v1",
+        "keys": sorted(list(payload.keys())),
+    }
+    with open(out_dir / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f)
 
 
 def prepare_shards(out_dir, n_samples: int, shard_size: int = 25000,
@@ -743,16 +765,24 @@ def prepare_shards_wideband(
     bw_hz: float = 50e6,
     max_delay_ns: float = 150.0,
     phase_bits: int = None,
+    output_format: str = "npz",
 ):
     """
-    Generate wideband NPZ shards with keys:
+    Generate wideband shards with keys:
       y[L,F,M,2], H[L,F,M,2], codes[L,N,2], ptr, K, snr, R[N,N,2], R_f[F,N,N,2],
       H_taps_ri[P,M,N,2], taus_s[P], path_mask[P], alphas[P,2], and per-path angles.
+
+    output_format:
+      - "npz"  : one shard file per block (legacy).
+      - "mmap" : one shard directory per block, per-field .npy files (recommended).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     chosen_L = int(override_L) if override_L is not None else int(cfg.L)
     chosen_F = int(override_F)
+    output_format = str(output_format).strip().lower()
+    if output_format not in ("npz", "mmap"):
+        raise ValueError(f"Unsupported output_format={output_format}. Use 'npz' or 'mmap'.")
     n_shards = (n_samples + shard_size - 1) // shard_size
 
     for s in range(n_shards):
@@ -807,8 +837,7 @@ def prepare_shards_wideband(
             aoa_az[i] = sample["aoa_az"].astype(np.float32)
             aoa_el[i] = sample["aoa_el"].astype(np.float32)
 
-        np.savez(
-            out_dir / f"shard_{s:03d}.npz",
+        payload = dict(
             y=y,
             H=H,
             codes=codes,
@@ -827,6 +856,10 @@ def prepare_shards_wideband(
             aoa_az=aoa_az,
             aoa_el=aoa_el,
         )
+        if output_format == "mmap":
+            _write_wideband_shard_mmap(out_dir / f"shard_{s:03d}", payload)
+        else:
+            _write_wideband_shard_npz(out_dir / f"shard_{s:03d}.npz", payload)
 
 
 def prepare_split_shards_wideband(
@@ -843,6 +876,7 @@ def prepare_split_shards_wideband(
     bw_hz: float = 50e6,
     max_delay_ns: float = 150.0,
     phase_bits: int = None,
+    output_format: str = "npz",
 ):
     """
     Generate wideband {train,val,test} split shards under root_dir.
@@ -861,6 +895,7 @@ def prepare_split_shards_wideband(
         bw_hz=bw_hz,
         max_delay_ns=max_delay_ns,
         phase_bits=phase_bits,
+        output_format=output_format,
     )
     if n_train > 0:
         prepare_shards_wideband(root / "train", n_train, seed=seed, **common)
@@ -868,3 +903,70 @@ def prepare_split_shards_wideband(
         prepare_shards_wideband(root / "val", n_val, seed=seed + 123, **common)
     if n_test > 0:
         prepare_shards_wideband(root / "test", n_test, seed=seed + 456, **common)
+
+
+def convert_wideband_npz_to_mmap(
+    src_root: Path,
+    dst_root: Path,
+    include_splits: bool = True,
+    overwrite: bool = False,
+    max_shards_per_split: int = 0,
+):
+    """
+    Convert wideband NPZ shards to mmap-friendly shard directories.
+
+    src layout supported:
+      - split dirs: src_root/{train,val,test}/*.npz
+      - flat dir  : src_root/*.npz
+
+    dst layout:
+      - split dirs: dst_root/{train,val,test}/shard_xxx/{field}.npy
+      - flat dir  : dst_root/shard_xxx/{field}.npy
+    """
+    src_root = Path(src_root)
+    dst_root = Path(dst_root)
+    max_shards = int(max_shards_per_split)
+    if max_shards < 0:
+        raise ValueError("max_shards_per_split must be >= 0")
+
+    if include_splits and all((src_root / s).exists() for s in ("train", "val", "test")):
+        split_pairs = [("train", src_root / "train", dst_root / "train"),
+                       ("val", src_root / "val", dst_root / "val"),
+                       ("test", src_root / "test", dst_root / "test")]
+    else:
+        split_pairs = [("all", src_root, dst_root)]
+
+    for split_name, src_dir, dst_dir in split_pairs:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        npz_files = sorted(src_dir.glob("*.npz"))
+        if max_shards > 0:
+            npz_files = npz_files[:max_shards]
+        print(f"[CONVERT] split={split_name} files={len(npz_files)} src={src_dir} -> dst={dst_dir}", flush=True)
+
+        for src_npz in npz_files:
+            shard_name = src_npz.stem
+            out_shard_dir = dst_dir / shard_name
+            if out_shard_dir.exists() and (not overwrite):
+                print(f"[CONVERT] skip existing {out_shard_dir}", flush=True)
+                continue
+            if out_shard_dir.exists() and overwrite:
+                for p in out_shard_dir.glob("*"):
+                    if p.is_file():
+                        p.unlink()
+            out_shard_dir.mkdir(parents=True, exist_ok=True)
+
+            print(f"[CONVERT] reading {src_npz}", flush=True)
+            with np.load(src_npz, allow_pickle=False) as z:
+                keys = list(z.files)
+                for key in keys:
+                    arr = z[key]
+                    np.save(out_shard_dir / f"{key}.npy", np.asarray(arr), allow_pickle=False)
+                meta = {
+                    "n_samples": int(z[keys[0]].shape[0]) if keys else 0,
+                    "format": "wideband_mmap_v1",
+                    "keys": sorted(keys),
+                    "source_npz": str(src_npz),
+                }
+                with open(out_shard_dir / "meta.json", "w", encoding="utf-8") as f:
+                    json.dump(meta, f)
+            print(f"[CONVERT] wrote {out_shard_dir}", flush=True)

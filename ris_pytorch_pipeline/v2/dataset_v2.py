@@ -26,6 +26,19 @@ def _list_npz_files(path: Path) -> List[Path]:
     return []
 
 
+def _is_memmap_shard_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "y.npy").exists() and (path / "codes.npy").exists()
+
+
+def _list_memmap_shard_dirs(path: Path) -> List[Path]:
+    if _is_memmap_shard_dir(path):
+        return [path]
+    if path.is_dir():
+        out = [p for p in sorted(path.iterdir()) if _is_memmap_shard_dir(p)]
+        return out
+    return []
+
+
 def resolve_shards_train_val() -> Tuple[Path, Path, bool]:
     """
     Resolve train/val shard locations.
@@ -33,26 +46,45 @@ def resolve_shards_train_val() -> Tuple[Path, Path, bool]:
     Returns:
       train_path, val_path, is_wideband
     """
-    # 1) Preferred: wideband split dirs
+    prefer_memmap = bool(getattr(v2_cfg, "PREFER_MEMMAP_SHARDS", True))
+
+    # 1) Preferred: mmap shard directories (true O(1) sample access).
+    wb_mm_root = Path(getattr(v2_cfg, "DATA_SHARDS_WIDEBAND_MEMMAP_DIR", "data_shards_ofdm_tr38901_mmap"))
+    wb_mm_train = Path(getattr(v2_cfg, "DATA_SHARDS_WIDEBAND_MEMMAP_TRAIN", wb_mm_root / "train"))
+    wb_mm_val = Path(getattr(v2_cfg, "DATA_SHARDS_WIDEBAND_MEMMAP_VAL", wb_mm_root / "val"))
+    if prefer_memmap:
+        if _list_memmap_shard_dirs(wb_mm_train) and _list_memmap_shard_dirs(wb_mm_val):
+            return wb_mm_train, wb_mm_val, True
+        if _list_memmap_shard_dirs(wb_mm_root):
+            return wb_mm_root, wb_mm_root, True
+
+    # 2) NPZ wideband split dirs (legacy fallback).
     wb_root = Path(getattr(v2_cfg, "DATA_SHARDS_WIDEBAND_DIR", "data_shards_ofdm_tr38901"))
     wb_train = Path(getattr(v2_cfg, "DATA_SHARDS_WIDEBAND_TRAIN", wb_root / "train"))
     wb_val = Path(getattr(v2_cfg, "DATA_SHARDS_WIDEBAND_VAL", wb_root / "val"))
     if _list_npz_files(wb_train) and _list_npz_files(wb_val):
         return wb_train, wb_val, True
 
-    # 2) Wideband flat dir fallback
+    # 3) NPZ flat dir fallback
     if _list_npz_files(wb_root):
         return wb_root, wb_root, True
 
-    # 3) Explicitly fail if wideband is required
+    # 4) If memmap not preferred, try memmap after NPZ.
+    if (not prefer_memmap):
+        if _list_memmap_shard_dirs(wb_mm_train) and _list_memmap_shard_dirs(wb_mm_val):
+            return wb_mm_train, wb_mm_val, True
+        if _list_memmap_shard_dirs(wb_mm_root):
+            return wb_mm_root, wb_mm_root, True
+
+    # 5) Explicitly fail if wideband is required
     if bool(getattr(v2_cfg, "REQUIRE_WIDEBAND_DATA", True)):
         raise FileNotFoundError(
             "Wideband shards were not found. "
-            f"Expected under {wb_root} (or train/val subdirs). "
-            "Generate OFDM shards first or disable REQUIRE_WIDEBAND_DATA for fallback."
+            f"Checked mmap root={wb_mm_root} and npz root={wb_root}. "
+            "Generate/convert OFDM shards first or disable REQUIRE_WIDEBAND_DATA for fallback."
         )
 
-    # 4) Optional narrowband fallback (v1 format)
+    # 6) Optional narrowband fallback (v1 format)
     if not bool(getattr(v2_cfg, "ALLOW_NARROWBAND_FALLBACK", False)):
         raise FileNotFoundError(
             "Wideband shards missing and ALLOW_NARROWBAND_FALLBACK is False."
@@ -68,7 +100,7 @@ def resolve_shards_train_val() -> Tuple[Path, Path, bool]:
 
     raise FileNotFoundError(
         "No shard dataset found for v2. "
-        f"Checked wideband root={wb_root} and narrowband root={nb_root}."
+        f"Checked mmap root={wb_mm_root}, npz root={wb_root}, and narrowband root={nb_root}."
     )
 
 
@@ -97,6 +129,65 @@ def fixed_subset(
         rng = np.random.RandomState(seed)
         idx = rng.permutation(len(ds))[:n_cap]
     return Subset(ds, idx.tolist())
+
+
+def _to_tensor(x):
+    if x is None:
+        return None
+    # Copy to writable ndarray: np.memmap slices are read-only and trigger
+    # a PyTorch warning/undefined behavior if converted directly.
+    arr = np.array(x, copy=True)
+    return torch.from_numpy(arr)
+
+
+def _pack_wideband_sample(
+    shard_path: str,
+    y,
+    codes,
+    ptr,
+    K: int,
+    snr: float,
+    R,
+    R_f,
+    H,
+    h_taps: Dict[str, Any],
+):
+    if y.ndim != 4:
+        raise ValueError(
+            f"Expected wideband sample y shape [L,F,M,2], got {y.shape} from {shard_path}"
+        )
+
+    has_h_feature = H is not None
+    has_tap_feature = "H_taps_ri" in h_taps
+    if bool(getattr(v2_cfg, "REQUIRE_WIDEBAND_DATA", True)) and (not has_h_feature) and (not has_tap_feature):
+        raise ValueError(
+            f"Wideband shard {shard_path} is missing both H and H_taps_ri; "
+            "at least one channel representation is required."
+        )
+    if bool(getattr(v2_cfg, "REQUIRE_R_F_SUPERVISION", False)) and (R_f is None):
+        raise ValueError(
+            f"Wideband shard {shard_path} missing per-tone covariance key "
+            f"({getattr(v2_cfg, 'WIDEBAND_R_F_KEY', 'R_f')})."
+        )
+
+    if H is None:
+        # Keep dataloader collation stable: always provide tensor for H.
+        # y is [L, F, M, 2] for wideband, so use [L, M, 2] zeros as fallback.
+        l_dim, _, m_dim, _ = y.shape
+        H = np.zeros((l_dim, m_dim, 2), dtype=np.float32)
+
+    return {
+        "y": _to_tensor(y),
+        "H": _to_tensor(H),
+        "codes": _to_tensor(codes),
+        "ptr": _to_tensor(np.asarray(ptr, dtype=np.float32)),
+        "K": torch.tensor(int(K), dtype=torch.long),
+        "snr": torch.tensor(float(snr), dtype=torch.float32),
+        "R": _to_tensor(R),
+        # Empty tensor placeholder keeps default collate stable when R_f is absent.
+        "R_f": _to_tensor(R_f) if R_f is not None else torch.zeros((0,), dtype=torch.float32),
+        "H_taps": {k: _to_tensor(v) for k, v in h_taps.items()},
+    }
 
 
 class V2WidebandNPZDataset(Dataset):
@@ -140,9 +231,12 @@ class V2WidebandNPZDataset(Dataset):
 
         def _add_file(p: Path):
             with np.load(p, mmap_mode="r") as z:
-                if "y" not in z.files:
-                    raise ValueError(f"Shard missing required key 'y': {p}")
-                n = int(z["y"].shape[0])
+                if "K" in z.files:
+                    n = int(z["K"].shape[0])
+                elif "y" in z.files:
+                    n = int(z["y"].shape[0])
+                else:
+                    raise ValueError(f"Shard missing both 'K' and 'y': {p}")
             self.paths.append(str(p))
             self.meta.append((str(p), n))
 
@@ -207,12 +301,6 @@ class V2WidebandNPZDataset(Dataset):
             self._cache_order.append(path)
         return z
 
-    @staticmethod
-    def _to_tensor(x):
-        if x is None:
-            return None
-        return torch.from_numpy(x)
-
     def __getitem__(self, idx):
         self._ensure_worker_cache()
         shard_idx, local_idx = self.index_map[idx]
@@ -221,10 +309,6 @@ class V2WidebandNPZDataset(Dataset):
 
         y_key = str(getattr(v2_cfg, "WIDEBAND_Y_KEY", "y"))
         y = z[y_key][local_idx]
-        if y.ndim != 4:
-            raise ValueError(
-                f"Expected wideband sample y shape [L,F,M,2], got {y.shape} from {shard_path}"
-            )
 
         codes = z["codes"][local_idx]
         ptr = z["ptr"][local_idx]
@@ -253,40 +337,179 @@ class V2WidebandNPZDataset(Dataset):
         h_taps = {}
         for key in self._OPTIONAL_TAP_KEYS:
             if key in z.files:
-                h_taps[key] = self._to_tensor(z[key][local_idx])
+                h_taps[key] = z[key][local_idx]
 
-        has_h_feature = H is not None
-        has_tap_feature = "H_taps_ri" in h_taps
-        if bool(getattr(v2_cfg, "REQUIRE_WIDEBAND_DATA", True)) and (not has_h_feature) and (not has_tap_feature):
-            raise ValueError(
-                f"Wideband shard {shard_path} is missing both H and H_taps_ri; "
-                "at least one channel representation is required."
-            )
-        if bool(getattr(v2_cfg, "REQUIRE_R_F_SUPERVISION", False)) and (R_f is None):
-            raise ValueError(
-                f"Wideband shard {shard_path} missing per-tone covariance key "
-                f"({getattr(v2_cfg, 'WIDEBAND_R_F_KEY', 'R_f')})."
-            )
+        return _pack_wideband_sample(
+            shard_path=shard_path,
+            y=y,
+            codes=codes,
+            ptr=ptr,
+            K=K,
+            snr=snr,
+            R=R,
+            R_f=R_f,
+            H=H,
+            h_taps=h_taps,
+        )
 
-        if H is None:
-            # Keep dataloader collation stable: always provide tensor for H.
-            # y is [L, F, M, 2] for wideband, so use [L, M, 2] zeros as fallback.
-            l_dim, _, m_dim, _ = y.shape
-            H = np.zeros((l_dim, m_dim, 2), dtype=np.float32)
 
-        sample = {
-            "y": self._to_tensor(y),
-            "H": self._to_tensor(H),
-            "codes": self._to_tensor(codes),
-            "ptr": self._to_tensor(ptr.astype(np.float32)),
-            "K": torch.tensor(K, dtype=torch.long),
-            "snr": torch.tensor(snr, dtype=torch.float32),
-            "R": self._to_tensor(R),
-            # Empty tensor placeholder keeps default collate stable when R_f is absent.
-            "R_f": self._to_tensor(R_f) if R_f is not None else torch.zeros((0,), dtype=torch.float32),
-            "H_taps": h_taps,
-        }
-        return sample
+class V2WidebandMemmapDataset(Dataset):
+    """
+    Wideband mmap shard dataset.
+
+    Expected layout:
+      root_or_split/
+        shard_000/
+          y.npy, H.npy, codes.npy, ptr.npy, K.npy, snr.npy, R.npy, R_f.npy, ...
+        shard_001/
+          ...
+    """
+
+    _OPTIONAL_TAP_KEYS = V2WidebandNPZDataset._OPTIONAL_TAP_KEYS
+    _OPTIONAL_RF_KEYS_DEFAULT = V2WidebandNPZDataset._OPTIONAL_RF_KEYS_DEFAULT
+
+    def __init__(self, shard_dirs_or_root, max_cached_shards: Optional[int] = None):
+        self.shard_dirs: List[Path] = []
+        self.meta: List[Tuple[str, int, set[str]]] = []  # (dir, n_samples, keys)
+        self._shard_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_order: List[str] = []
+        self._worker_pid = None
+
+        cfg_cap = int(getattr(v2_cfg, "MAX_CACHED_SHARDS", 1))
+        self.max_cached_shards = max(1, int(cfg_cap if max_cached_shards is None else max_cached_shards))
+
+        def _add_dir(p: Path):
+            if _is_memmap_shard_dir(p):
+                self.shard_dirs.append(p)
+                return
+            if p.is_dir():
+                for d in _list_memmap_shard_dirs(p):
+                    self.shard_dirs.append(d)
+                return
+            raise ValueError(f"Expected memmap shard dir/root, got: {p}")
+
+        if isinstance(shard_dirs_or_root, (list, tuple)):
+            for item in shard_dirs_or_root:
+                _add_dir(Path(item))
+        else:
+            _add_dir(Path(shard_dirs_or_root))
+
+        if not self.shard_dirs:
+            raise FileNotFoundError("No mmap wideband shard directories found.")
+
+        for d in self.shard_dirs:
+            y_file = d / "y.npy"
+            if not y_file.exists():
+                raise FileNotFoundError(f"Missing required file: {y_file}")
+            y_arr = np.load(y_file, mmap_mode="r", allow_pickle=False)
+            n_samples = int(y_arr.shape[0])
+            keys = {p.stem for p in d.glob("*.npy")}
+            self.meta.append((str(d), n_samples, keys))
+
+        self.index_map = []
+        for shard_idx, (_, n_samples, _) in enumerate(self.meta):
+            for local_idx in range(n_samples):
+                self.index_map.append((shard_idx, local_idx))
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def _ensure_worker_cache(self):
+        import os
+
+        pid = os.getpid()
+        if self._worker_pid != pid:
+            self._shard_cache = {}
+            self._cache_order = []
+            self._worker_pid = pid
+
+    @staticmethod
+    def _close_cache_entry(cache_entry: Dict[str, Any]):
+        for arr in cache_entry.values():
+            mm = getattr(arr, "_mmap", None)
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+
+    def _get_arr(self, shard_dir: str, key: str):
+        entry = self._shard_cache.get(shard_dir)
+        if entry is None:
+            if len(self._shard_cache) >= self.max_cached_shards and self._cache_order:
+                old_dir = self._cache_order.pop(0)
+                old_entry = self._shard_cache.pop(old_dir, None)
+                if old_entry is not None:
+                    self._close_cache_entry(old_entry)
+            entry = {}
+            self._shard_cache[shard_dir] = entry
+        if shard_dir in self._cache_order:
+            self._cache_order.remove(shard_dir)
+        self._cache_order.append(shard_dir)
+
+        arr = entry.get(key)
+        if arr is None:
+            file_path = Path(shard_dir) / f"{key}.npy"
+            if not file_path.exists():
+                raise FileNotFoundError(f"Missing mmap field file: {file_path}")
+            arr = np.load(file_path, mmap_mode="r", allow_pickle=False)
+            entry[key] = arr
+        return arr
+
+    def __getitem__(self, idx):
+        self._ensure_worker_cache()
+        shard_idx, local_idx = self.index_map[idx]
+        shard_dir, _, keys = self.meta[shard_idx]
+
+        y_key = str(getattr(v2_cfg, "WIDEBAND_Y_KEY", "y"))
+        if y_key not in keys and "y" in keys:
+            y_key = "y"
+        y = self._get_arr(shard_dir, y_key)[local_idx]
+
+        codes = self._get_arr(shard_dir, "codes")[local_idx]
+        ptr = self._get_arr(shard_dir, "ptr")[local_idx]
+        K = int(self._get_arr(shard_dir, "K")[local_idx])
+
+        if "snr_db" in keys:
+            snr = float(self._get_arr(shard_dir, "snr_db")[local_idx])
+        elif "snr" in keys:
+            snr = float(self._get_arr(shard_dir, "snr")[local_idx])
+        else:
+            snr = 0.0
+
+        R = self._get_arr(shard_dir, "R")[local_idx]
+        H = self._get_arr(shard_dir, "H")[local_idx] if "H" in keys else None
+
+        R_f = None
+        rf_key_main = str(getattr(v2_cfg, "WIDEBAND_R_F_KEY", "R_f"))
+        rf_keys = [rf_key_main]
+        rf_keys.extend(list(getattr(v2_cfg, "WIDEBAND_R_F_ALT_KEYS", self._OPTIONAL_RF_KEYS_DEFAULT)))
+        seen = set()
+        for key in rf_keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in keys:
+                R_f = self._get_arr(shard_dir, key)[local_idx]
+                break
+
+        h_taps: Dict[str, Any] = {}
+        for key in self._OPTIONAL_TAP_KEYS:
+            if key in keys:
+                h_taps[key] = self._get_arr(shard_dir, key)[local_idx]
+
+        return _pack_wideband_sample(
+            shard_path=shard_dir,
+            y=y,
+            codes=codes,
+            ptr=ptr,
+            K=K,
+            snr=snr,
+            R=R,
+            R_f=R_f,
+            H=H,
+            h_taps=h_taps,
+        )
 
 
 def build_dataloaders_v2(
@@ -302,8 +525,13 @@ def build_dataloaders_v2(
     """Build train/val loaders for v2 (wideband-first)."""
     tr_dir, va_dir, is_wideband = resolve_shards_train_val()
     if is_wideband:
-        ds_tr_full = V2WidebandNPZDataset(tr_dir, max_cached_shards=max_cached_shards)
-        ds_va_full = V2WidebandNPZDataset(va_dir, max_cached_shards=max_cached_shards)
+        has_memmap = bool(_list_memmap_shard_dirs(Path(tr_dir))) and bool(_list_memmap_shard_dirs(Path(va_dir)))
+        if has_memmap:
+            ds_tr_full = V2WidebandMemmapDataset(tr_dir, max_cached_shards=max_cached_shards)
+            ds_va_full = V2WidebandMemmapDataset(va_dir, max_cached_shards=max_cached_shards)
+        else:
+            ds_tr_full = V2WidebandNPZDataset(tr_dir, max_cached_shards=max_cached_shards)
+            ds_va_full = V2WidebandNPZDataset(va_dir, max_cached_shards=max_cached_shards)
     else:
         ds_tr_full = ShardNPZDataset(tr_dir)
         ds_va_full = ShardNPZDataset(va_dir)

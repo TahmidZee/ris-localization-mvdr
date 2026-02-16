@@ -42,10 +42,16 @@ class V2SysConfig:
         self.DATA_SHARDS_WIDEBAND_TRAIN = f"{self.DATA_SHARDS_WIDEBAND_DIR}/train"
         self.DATA_SHARDS_WIDEBAND_VAL = f"{self.DATA_SHARDS_WIDEBAND_DIR}/val"
         self.DATA_SHARDS_WIDEBAND_TEST = f"{self.DATA_SHARDS_WIDEBAND_DIR}/test"
+        self.DATA_SHARDS_WIDEBAND_MEMMAP_DIR = "data_shards_ofdm_tr38901_mmap"
+        self.DATA_SHARDS_WIDEBAND_MEMMAP_TRAIN = f"{self.DATA_SHARDS_WIDEBAND_MEMMAP_DIR}/train"
+        self.DATA_SHARDS_WIDEBAND_MEMMAP_VAL = f"{self.DATA_SHARDS_WIDEBAND_MEMMAP_DIR}/val"
+        self.DATA_SHARDS_WIDEBAND_MEMMAP_TEST = f"{self.DATA_SHARDS_WIDEBAND_MEMMAP_DIR}/test"
+        self.PREFER_MEMMAP_SHARDS = True
         self.REQUIRE_WIDEBAND_DATA = True
         self.ALLOW_NARROWBAND_FALLBACK = False
         self.NUM_WORKERS = 0
         self.PIN_MEMORY = True
+        self.MAX_CACHED_SHARDS = 1
 
         # ── v2-specific results ──
         self.RESULTS_DIR = "results_v2"
