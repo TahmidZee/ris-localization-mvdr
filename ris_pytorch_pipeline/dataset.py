@@ -714,14 +714,20 @@ def _wideband_scene_sample(
         Rf = A_f[fi] @ A_f[fi].conj().T
         Rf = 0.5 * (Rf + Rf.conj().T)
         tr = float(np.trace(Rf).real)
-        if tr > 1e-9:
+        # Always trace-normalize to keep supervision scale stable across
+        # low-power scenes; skipping this causes near-zero targets and NMSE blow-ups.
+        if tr > 0.0:
             Rf = Rf * (cfg.N / tr)
+        else:
+            Rf = np.eye(cfg.N, dtype=np.complex64)
         R_f_true[fi] = Rf
     R_true = np.mean(R_f_true, axis=0).astype(np.complex64)
     R_true = 0.5 * (R_true + R_true.conj().T)
     tr = float(np.trace(R_true).real)
-    if tr > 1e-9:
+    if tr > 0.0:
         R_true = R_true * (cfg.N / tr)
+    else:
+        R_true = np.eye(cfg.N, dtype=np.complex64)
 
     # Pack target parameters
     def _pad(v):

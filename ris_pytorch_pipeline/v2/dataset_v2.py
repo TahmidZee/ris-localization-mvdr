@@ -190,6 +190,87 @@ def _pack_wideband_sample(
     }
 
 
+def _cov_trace_real_scalar(R: Any) -> float:
+    """
+    Real trace helper for one covariance matrix in complex or RI format.
+    """
+    if R is None:
+        return float("nan")
+
+    if torch.is_tensor(R):
+        if R.numel() == 0:
+            return float("nan")
+        if torch.is_complex(R):
+            return float(torch.diagonal(R, dim1=-2, dim2=-1).real.sum().item())
+        if R.dim() >= 3 and R.shape[-1] == 2:
+            return float(torch.diagonal(R[..., 0], dim1=-2, dim2=-1).sum().item())
+        return float(torch.diagonal(R, dim1=-2, dim2=-1).sum().item())
+
+    arr = np.asarray(R)
+    if arr.size == 0:
+        return float("nan")
+    if np.iscomplexobj(arr):
+        return float(np.trace(arr, axis1=-2, axis2=-1).real.sum())
+    if arr.ndim >= 3 and arr.shape[-1] == 2:
+        return float(np.trace(arr[..., 0], axis1=-2, axis2=-1).sum())
+    return float(np.trace(arr, axis1=-2, axis2=-1).sum())
+
+
+def _run_cov_trace_sanity(ds, split_name: str):
+    """
+    Fail fast if too many shard samples have near-zero covariance trace.
+    This catches stale/broken wideband shards before training starts.
+    """
+    if not bool(getattr(v2_cfg, "COV_TRACE_SANITY_ENABLE", True)):
+        return
+    n_scan_max = int(getattr(v2_cfg, "COV_TRACE_SANITY_MAX_SAMPLES", 64))
+    n_scan = min(max(0, n_scan_max), len(ds))
+    if n_scan <= 0:
+        return
+
+    min_trace = float(getattr(v2_cfg, "COV_TRACE_SANITY_MIN_TRACE", 1e-8))
+    max_bad_ratio = float(getattr(v2_cfg, "COV_TRACE_SANITY_MAX_BAD_RATIO", 0.05))
+
+    n_eval = 0
+    n_bad = 0
+    traces = []
+    for i in range(n_scan):
+        sample = ds[i]
+        if not isinstance(sample, dict) or ("R" not in sample):
+            continue
+        n_eval += 1
+        tr = _cov_trace_real_scalar(sample["R"])
+        if np.isfinite(tr):
+            traces.append(float(tr))
+        if (not np.isfinite(tr)) or (float(tr) <= min_trace):
+            n_bad += 1
+
+    if n_eval <= 0:
+        return
+
+    bad_ratio = float(n_bad) / float(n_eval)
+    if traces:
+        print(
+            f"[V2 DATA] trace-sanity split={split_name} scanned={n_eval} bad={n_bad} "
+            f"ratio={bad_ratio:.3f} min={min(traces):.3e} median={float(np.median(traces)):.3e} "
+            f"max={max(traces):.3e}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[V2 DATA] trace-sanity split={split_name} scanned={n_eval} bad={n_bad} ratio={bad_ratio:.3f}",
+            flush=True,
+        )
+
+    if bad_ratio > max_bad_ratio:
+        raise RuntimeError(
+            "Covariance trace sanity check failed: "
+            f"split={split_name}, bad_ratio={bad_ratio:.3f} > {max_bad_ratio:.3f}, "
+            f"min_trace={min_trace:.1e}. "
+            "Regenerate wideband shards with the patched generator."
+        )
+
+
 class V2WidebandNPZDataset(Dataset):
     """
     Wideband shard dataset for OFDM/TR38.901 pipeline.
@@ -538,6 +619,9 @@ def build_dataloaders_v2(
 
     ds_tr = fixed_subset(ds_tr_full, n_train, seed=seed, mode=train_subset_mode)
     ds_va = fixed_subset(ds_va_full, n_val, seed=seed + 1, mode=val_subset_mode)
+
+    _run_cov_trace_sanity(ds_tr, split_name="train")
+    _run_cov_trace_sanity(ds_va, split_name="val")
 
     bs = int(batch_size if batch_size is not None else v2_mdl.BATCH_SIZE)
     num_workers = int(getattr(v2_cfg, "NUM_WORKERS", 0))

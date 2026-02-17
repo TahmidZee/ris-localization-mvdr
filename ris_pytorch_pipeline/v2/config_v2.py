@@ -74,6 +74,16 @@ class V2SysConfig:
         self.WIDEBAND_R_F_ALT_KEYS = ("R_f_true", "R_f", "Rf")
         self.REQUIRE_R_F_SUPERVISION = False
 
+        # ── covariance target sanity / guardrails ──
+        # Fail fast when shard covariances are mostly near-zero (prevents NMSE blow-ups).
+        self.COV_TRACE_SANITY_ENABLE = True
+        self.COV_TRACE_SANITY_MAX_SAMPLES = 64
+        self.COV_TRACE_SANITY_MIN_TRACE = 1e-8
+        self.COV_TRACE_SANITY_MAX_BAD_RATIO = 0.05
+        # Normalize target covariances in trainer as a safety net, even if shard quality drifts.
+        self.NORMALIZE_TARGET_COV = True
+        self.TARGET_COV_MIN_TRACE = 1e-8
+
         # ── covariance / inference (inherited) ──
         self.C_EPS = getattr(base, "C_EPS", 1.0)
         self.HYBRID_COV_BLEND = False     # v2: no hybrid blend needed (direct NMSE)

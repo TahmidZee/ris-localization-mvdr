@@ -51,6 +51,7 @@ class V2Trainer:
 
         self.skip_nmse_eff = skip_nmse_eff
         self._global_step = 0
+        self._warned_bad_targets = False
 
         self.best_val = float("inf")
         Path(v2_cfg.CKPT_DIR).mkdir(parents=True, exist_ok=True)
@@ -130,8 +131,63 @@ class V2Trainer:
 
         return y, H, codes, ptr, K, R_true, R_f_true, snr, H_taps_dev
 
+    @staticmethod
+    def _to_complex_cov(R: torch.Tensor) -> torch.Tensor:
+        if torch.is_complex(R):
+            return R
+        if R.dim() >= 3 and R.shape[-1] == 2:
+            return torch.complex(R[..., 0].float(), R[..., 1].float())
+        return R.to(torch.complex64)
+
+    @staticmethod
+    def _normalize_target_cov_flat(R: torch.Tensor, min_trace: float) -> tuple[torch.Tensor, float]:
+        """
+        Normalize [B,N,N] covariance targets to trace=N with fail-safe identity fallback.
+        """
+        R = 0.5 * (R + R.conj().transpose(-2, -1))
+        B, N, _ = R.shape
+        target_trace = float(N)
+        tr = torch.diagonal(R, dim1=-2, dim2=-1).real.sum(-1)
+        ok = torch.isfinite(tr) & (tr > float(min_trace))
+        scale = (target_trace / tr.clamp_min(float(min_trace))).view(B, 1, 1)
+        Rn = R * scale
+        if (~ok).any():
+            eye = torch.eye(N, device=R.device, dtype=R.dtype).unsqueeze(0).expand(B, N, N)
+            Rn = Rn.clone()
+            Rn[~ok] = eye[~ok]
+        bad_ratio = float((~ok).float().mean().item())
+        return Rn, bad_ratio
+
+    def _normalize_target_cov(self, R: torch.Tensor, min_trace: float) -> tuple[torch.Tensor, float]:
+        """
+        Normalize covariance targets in [B,N,N] or [B,F,N,N] format.
+        """
+        Rc = self._to_complex_cov(R)
+        if Rc.dim() == 4:
+            B, F, N, _ = Rc.shape
+            Rf, bad = self._normalize_target_cov_flat(Rc.reshape(B * F, N, N), min_trace=min_trace)
+            return Rf.reshape(B, F, N, N), bad
+        if Rc.dim() == 3:
+            return self._normalize_target_cov_flat(Rc, min_trace=min_trace)
+        raise ValueError(f"Unsupported covariance target shape: {tuple(Rc.shape)}")
+
     def _step(self, batch, train_mode: bool = True):
         y, H, codes, ptr, K, R_true, R_f_true, snr, H_taps = self._unpack_batch(batch)
+        bad_ratio_main = 0.0
+        bad_ratio_tone = 0.0
+        if bool(getattr(v2_cfg, "NORMALIZE_TARGET_COV", True)):
+            min_trace = float(getattr(v2_cfg, "TARGET_COV_MIN_TRACE", 1e-8))
+            R_true, bad_ratio_main = self._normalize_target_cov(R_true, min_trace=min_trace)
+            if R_f_true is not None:
+                R_f_true, bad_ratio_tone = self._normalize_target_cov(R_f_true, min_trace=min_trace)
+            if (bad_ratio_main > 0.0 or bad_ratio_tone > 0.0) and (not self._warned_bad_targets):
+                print(
+                    "[V2 WARN] Detected low-trace covariance targets in batch and applied "
+                    f"safe normalization (main_bad_ratio={bad_ratio_main:.3f}, tone_bad_ratio={bad_ratio_tone:.3f}). "
+                    "Regenerate wideband shards if this persists.",
+                    flush=True,
+                )
+                self._warned_bad_targets = True
 
         with torch.set_grad_enabled(train_mode):
             if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
@@ -182,6 +238,8 @@ class V2Trainer:
         stats = {"loss": float(loss.item())}
         for key, value in info.items():
             stats[key] = float(value)
+        stats["target_bad_ratio_main"] = float(bad_ratio_main)
+        stats["target_bad_ratio_tone"] = float(bad_ratio_tone)
 
         # Report physics-aligned effective-cov NMSE as a diagnostic.
         if not self.skip_nmse_eff:
